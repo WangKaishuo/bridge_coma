@@ -32,8 +32,10 @@ class SubgameConfig:
     """子博弈训练配置."""
     # Training
     num_steps: int = 5000
-    deals_per_step: int = 32          # 32 deals × ~4 bids/player × 4 players ≈ 512 transitions
-    lr: float = 3e-4
+    deals_per_step: int = 32          # 32 deals per collection step
+    accumulate_steps: int = 4         # collect N steps before 1 PPO update
+                                      # effective: 32×4=128 deals/update ≈ 256-512 transitions/player
+    lr: float = 1e-4                  # lower lr for stability
     belief_lr: float = 1e-3
 
     # Info bonus
@@ -169,7 +171,10 @@ class SubgameTrainer:
 
                 obs = obs_next
 
-            final_reward = info.get('imp', reward)
+            # Use the reward from the final step (this is the training reward).
+            # For Stayman: scaled score. For Competitive: dual-table IMP.
+            # info['imp'] is kept separate for evaluation purposes.
+            final_reward = reward
             for p, traj in player_trajs.items():
                 if traj:
                     r = final_reward if p % 2 == 0 else -final_reward
@@ -385,27 +390,40 @@ class SubgameTrainer:
         active_str = ','.join(str(p) for p in self.active_players)
         print(f"SubgameTrainer: {cfg.num_steps} steps, "
               f"info_bonus={cfg.use_info_bonus}, beta={cfg.beta}, "
-              f"active_players=[{active_str}]")
+              f"active_players=[{active_str}], "
+              f"accumulate={cfg.accumulate_steps}, "
+              f"effective_deals/update={cfg.deals_per_step * cfg.accumulate_steps}")
+
+        all_episodes_window = []  # for logging across accumulation window
 
         for step in range(1, cfg.num_steps + 1):
+            # 1. Collect episodes
             episodes = self.collect_episodes(cfg.deals_per_step)
+            all_episodes_window.extend(episodes)
 
+            # 2. Train belief every step (belief benefits from frequent updates)
             belief_loss = 0.0
             if cfg.use_info_bonus:
                 belief_loss = self.train_belief_step(episodes)
 
+            # 3. Store to buffer (accumulate)
             self.store_episodes(episodes)
-            update_stats = self.safe_update()
 
+            # 4. PPO update only every accumulate_steps
+            update_stats = {}
+            if step % cfg.accumulate_steps == 0:
+                update_stats = self.safe_update()
+
+            # 5. Logging
             if step % cfg.log_interval == 0:
-                rewards = [ep['final_reward'] for ep in episodes]
+                rewards = [ep['final_reward'] for ep in all_episodes_window]
                 info_metrics = self.compute_info_bonus_for_episodes(episodes) \
                     if cfg.use_info_bonus else {}
 
                 entry = {
                     'step': step,
-                    'mean_reward': float(np.mean(rewards)),
-                    'std_reward': float(np.std(rewards)),
+                    'mean_reward': float(np.mean(rewards)) if rewards else 0,
+                    'std_reward': float(np.std(rewards)) if rewards else 0,
                     'belief_loss': float(belief_loss),
                     'lambda': self.get_lambda(step),
                     **info_metrics,
@@ -415,9 +433,11 @@ class SubgameTrainer:
 
                 if step % cfg.eval_interval == 0:
                     print(f"  [Step {step}/{cfg.num_steps}] "
-                          f"reward={entry['mean_reward']:+.2f} "
+                          f"reward={entry['mean_reward']:+.2f}±{entry['std_reward']:.2f} "
                           f"belief_loss={belief_loss:.4f} "
                           f"info_ratio={entry.get('info_ratio', 'N/A')}")
+
+                all_episodes_window = []  # reset window for next logging period
 
         return self.log
 

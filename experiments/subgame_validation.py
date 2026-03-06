@@ -58,8 +58,8 @@ class Phase2Config:
     device: str = "cpu"
     output_dir: str = "results/"
 
-    # Stayman (action space ~3-7, converges fast)
-    stayman_steps: int = 3000
+    # Stayman (action space ~3-7, accumulate_steps=4 → 1250 PPO updates)
+    stayman_steps: int = 5000
     stayman_deals_per_step: int = 32
     stayman_eval_deals: int = 200
 
@@ -264,6 +264,9 @@ def run_competitive_experiment(config: Phase2Config) -> dict:
             trainer.agent, bc_dataset,
             epochs=config.bc_epochs,
         )
+        # Safety: ensure model is in train mode after BC (LSTM backward requires it)
+        trainer.agent.model.train()
+
         pass_rate = evaluate_pass_rate(trainer.agent, BridgeBiddingEnv())
         print(f"  Post-BC pass rate: {pass_rate:.2%}")
 

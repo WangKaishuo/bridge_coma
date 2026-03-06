@@ -145,6 +145,8 @@ class StaymanSubgameEnv:
             if done:
                 break
 
+        # 用 Stayman-specific mask 替换 legal_actions
+        obs['legal_actions'] = self._get_stayman_mask()
         return obs
 
     def step(self, action: int) -> Tuple[Dict, float, bool, Dict]:
@@ -153,14 +155,16 @@ class StaymanSubgameEnv:
 
         Returns:
             (obs, reward, done, info)
-            reward: 叫牌结束时 = single_table_imp, 中间步 = 0
+            reward: 训练用 (scaled actual score), 中间步 = 0
+            info['imp']: 评估用 (actual vs optimal → IMP)
         """
         # 当前玩家的行动
         obs, _, done, info = self.env.step(action)
 
         if done:
             reward = self._compute_terminal_reward()
-            info['imp'] = reward
+            info['imp'] = self._compute_eval_imp()
+            info['scaled_score'] = reward
             return obs, reward, done, info
 
         # 如果下一个决策者是 EW, 自动 Pass
@@ -168,21 +172,109 @@ class StaymanSubgameEnv:
             obs, _, done, _ = self.env.step(BID_PASS)
             if done:
                 reward = self._compute_terminal_reward()
-                info['imp'] = reward
+                info['imp'] = self._compute_eval_imp()
+                info['scaled_score'] = reward
                 return obs, reward, done, info
+
+        # 用 Stayman-specific mask 替换 legal_actions
+        if not done:
+            obs['legal_actions'] = self._get_stayman_mask()
 
         return obs, 0.0, done, info
 
+    def _get_stayman_mask(self) -> np.ndarray:
+        """
+        Stayman 子博弈专用 action mask.
+
+        前缀后的决策只允许桥牌上合理的叫品, 大幅缩小探索空间.
+
+        进程 (fixed prefix = 1NT Pass 2C Pass):
+          Round 1 — N 回应 2C (history len = 4, N's turn):
+            2D = 没有 4 张高花 (否定应叫)
+            2H = 有 4 张红心
+            2S = 有 4 张黑桃
+          Round 2 — EW auto pass, S 再叫 (history len = 6, S's turn):
+            Pass = 签退 (弱牌/低花配合)
+            2NT = 邀请 3NT (不够局力)
+            3NT = 成局
+            3H  = 邀请 4H (有配合)
+            3S  = 邀请 4S (有配合)
+            4H  = 直接 4H 成局
+            4S  = 直接 4S 成局
+          Round 3+ — N 再叫 (如果 S 发出邀请):
+            Pass = 最低限度, 拒绝邀请
+            3NT = 接受, 打 NT
+            4H  = 接受, 打 H
+            4S  = 接受, 打 S
+        """
+        mask = np.zeros(NUM_BIDS, dtype=np.float32)
+        history = self.env.state.history
+        prefix_len = len(self.FIXED_PREFIX)  # 4
+        rounds_after = len(history) - prefix_len
+
+        if rounds_after == 0:
+            # Round 1: N responds to 2C → 2D / 2H / 2S
+            mask[string_to_bid("2D")] = 1.0
+            mask[string_to_bid("2H")] = 1.0
+            mask[string_to_bid("2S")] = 1.0
+
+        elif rounds_after == 2:
+            # Round 2: S rebids (after N's response + E pass)
+            mask[BID_PASS] = 1.0
+            mask[string_to_bid("2NT")] = 1.0
+            mask[string_to_bid("3NT")] = 1.0
+            mask[string_to_bid("3H")] = 1.0
+            mask[string_to_bid("3S")] = 1.0
+            mask[string_to_bid("4H")] = 1.0
+            mask[string_to_bid("4S")] = 1.0
+
+        elif rounds_after == 4:
+            # Round 3: N decides on invitation
+            mask[BID_PASS] = 1.0
+            mask[string_to_bid("3NT")] = 1.0
+            mask[string_to_bid("4H")] = 1.0
+            mask[string_to_bid("4S")] = 1.0
+
+        else:
+            # Later rounds (should rarely reach): just pass
+            mask[BID_PASS] = 1.0
+
+        # 与 env legal actions 取交集
+        env_legal = self.env._get_legal_actions()
+        mask = mask * env_legal
+
+        # 保底: 至少有 Pass
+        if mask.sum() < 0.5:
+            mask[BID_PASS] = 1.0
+
+        return mask
+
     def _compute_terminal_reward(self) -> float:
         """
-        单桌评估: actual score vs DDS optimal → IMP.
+        Stayman 训练 reward: 缩放后的实际得分.
 
-        IMP 在此表示 agent 叫品质量与理论最优的差距:
-        0 = 完美, 负 = 较差, 极少为正 (因为 DDS 是上界)
+        用 actual_score / 100 作为 reward, 让 PPO 有清晰的正负信号:
+          - 叫到 4H 做成 (非局) = +420 → reward ≈ +4.2
+          - 叫到 3NT 做成       = +400 → reward ≈ +4.0
+          - 叫到 2NT 做成       = +120 → reward ≈ +1.2
+          - Pass-out            = 0    → reward = 0
+          - 叫太高宕了          = -50  → reward ≈ -0.5
+
+        这比 (actual - optimal) → IMP 好得多, 因为:
+        1. 有正向 reward 激励 agent 叫到成局
+        2. reward 方差适中 (~±5), 适合 PPO
+        3. 不需要 DDS optimal 作为 baseline (避免全负 reward)
         """
         contract = self.env.state.final_contract
         dd_table = self._current_dd
-        hands = self._current_hands
+
+        actual_score = self._compute_score(contract, dd_table, is_ns=True)
+        return float(actual_score) / 100.0
+
+    def _compute_eval_imp(self) -> float:
+        """评估用: actual vs DDS optimal → IMP (用于 Go/No-Go 指标)."""
+        contract = self.env.state.final_contract
+        dd_table = self._current_dd
 
         actual_score = self._compute_score(contract, dd_table, is_ns=True)
         optimal = self._get_optimal_contract_ns(dd_table)

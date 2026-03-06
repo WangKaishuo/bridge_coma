@@ -362,7 +362,7 @@ def behavioral_cloning_warmup(
 
         print(f"  BC Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}, acc={avg_acc:.3f}")
 
-    model.eval()
+    model.train()  # Restore train mode (critical: LSTM backward requires train mode)
     return {
         'final_loss': stats['losses'][-1] if stats['losses'] else 0,
         'final_acc': stats['accs'][-1] if stats['accs'] else 0,
