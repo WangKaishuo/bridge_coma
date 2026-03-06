@@ -146,10 +146,70 @@ class CompetitiveSubgameEnv:
         return obs, reward, done, info
 
     def _compute_terminal_reward(self) -> float:
-        """单桌得分 (NS 视角), 用于 self-play 训练."""
-        contract = self.env.state.final_contract
-        score = self._compute_score_ns(contract, self._current_dd, self._vulnerability)
-        return float(score)  # 原始分, 不转 IMP (self-play 时由 cross_evaluate 负责双桌 IMP)
+        """
+        双桌 IMP (NS 视角), 用于 self-play 训练.
+
+        桌 1 已经打完 (当前 env 状态).
+        桌 2: 同一副牌, NS↔EW 互换位置, 用当前 agent 策略再叫一次.
+        IMP = score_to_imp(score_1 - score_2)
+        """
+        contract_1 = self.env.state.final_contract
+        score_1 = self._compute_score_ns(contract_1, self._current_dd, self._vulnerability)
+
+        # 桌 2: 互换位置叫牌
+        score_2 = self._play_swapped_table()
+
+        return float(score_to_imp(score_1 - score_2))
+
+    def _play_swapped_table(self) -> int:
+        """
+        桌 2: NS↔EW 互换位置, 随机策略快速叫牌, 返回 NS 视角得分.
+        """
+        hands = self._current_hands
+        dd_table = self._current_dd
+
+        # 互换: N↔E, S↔W
+        swapped_hands = np.zeros_like(hands)
+        swapped_hands[0] = hands[1]  # new N = old E
+        swapped_hands[1] = hands[0]  # new E = old N
+        swapped_hands[2] = hands[3]  # new S = old W
+        swapped_hands[3] = hands[2]  # new W = old S
+
+        swapped_dd = np.zeros_like(dd_table)
+        swapped_dd[:, 0] = dd_table[:, 1]
+        swapped_dd[:, 1] = dd_table[:, 0]
+        swapped_dd[:, 2] = dd_table[:, 3]
+        swapped_dd[:, 3] = dd_table[:, 2]
+
+        # 用一个临时 env 快速叫牌 (随机策略, 只需要最终分数)
+        from env import BridgeBiddingEnv
+        tmp_env = BridgeBiddingEnv(self.max_history_len)
+        obs = tmp_env.reset(swapped_hands, dealer=NORTH, vulnerability=self._vulnerability)
+
+        # 执行固定前缀 (互换后可能不符合约束, 但没关系 — 只需要对称评估)
+        prefix_ok = True
+        for bid_str in self.FIXED_PREFIX:
+            bid = string_to_bid(bid_str)
+            if not tmp_env._is_valid_action(bid):
+                prefix_ok = False
+                break
+            obs, _, done, _ = tmp_env.step(bid)
+            if done:
+                break
+
+        if not prefix_ok or done:
+            # 前缀无法执行, 用随机策略从头叫
+            obs = tmp_env.reset(swapped_hands, dealer=NORTH, vulnerability=self._vulnerability)
+            done = False
+
+        # 随机策略走完
+        while not done:
+            legal = obs['legal_actions']
+            action = np.random.choice(np.where(legal > 0.5)[0])
+            obs, _, done, _ = tmp_env.step(action)
+
+        contract_2 = tmp_env.state.final_contract
+        return self._compute_score_ns(contract_2, swapped_dd, self._vulnerability)
 
     def _compute_score_ns(self, contract: Optional[Contract],
                           dd_table: np.ndarray,

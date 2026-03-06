@@ -32,7 +32,7 @@ class SubgameConfig:
     """子博弈训练配置."""
     # Training
     num_steps: int = 5000
-    deals_per_step: int = 8
+    deals_per_step: int = 32          # 32 deals × ~4 bids/player × 4 players ≈ 512 transitions
     lr: float = 3e-4
     belief_lr: float = 1e-3
 
@@ -53,7 +53,7 @@ class SubgameConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     num_epochs: int = 4
-    batch_size: int = 256
+    batch_size: int = 64              # smaller batch → more gradient steps per update
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
