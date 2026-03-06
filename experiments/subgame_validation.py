@@ -58,14 +58,14 @@ class Phase2Config:
     device: str = "cpu"
     output_dir: str = "results/"
 
-    # Stayman
+    # Stayman (action space ~3-7, converges fast)
     stayman_steps: int = 3000
-    stayman_deals_per_step: int = 8
+    stayman_deals_per_step: int = 32
     stayman_eval_deals: int = 200
 
-    # Competitive
+    # Competitive (action space ~38, needs more data)
     competitive_steps: int = 5000
-    competitive_deals_per_step: int = 8
+    competitive_deals_per_step: int = 32
     competitive_eval_deals: int = 500
 
     # BC (uses competitive_data for BC dataset)
