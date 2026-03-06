@@ -45,8 +45,22 @@ class CompetitiveSubgameEnv:
         self.env = BridgeBiddingEnv(max_history_len)
         self.max_history_len = max_history_len
 
-        self._filtered_deals = []
-        self._prefetch(min_deals=500, max_attempts=50000)
+        self._is_constrained_data = self._check_if_constrained()
+        if not self._is_constrained_data:
+            self._filtered_deals = []
+            self._prefetch(min_deals=500, max_attempts=50000)
+        else:
+            self._filtered_deals = None
+            print(f"CompetitiveSubgameEnv: using pre-generated constrained data "
+                  f"({len(self.loader)} samples)")
+
+    def _check_if_constrained(self, sample_size: int = 20) -> bool:
+        passed = 0
+        for _ in range(sample_size):
+            hands, _ = self.loader.sample_one()
+            if self._satisfies_constraints(hands):
+                passed += 1
+        return passed >= sample_size * 0.9
 
     def _prefetch(self, min_deals: int, max_attempts: int):
         attempts = 0
@@ -79,6 +93,9 @@ class CompetitiveSubgameEnv:
         return 8 <= hcp <= 16 and s >= 5
 
     def generate_deal(self) -> Tuple[np.ndarray, np.ndarray]:
+        if self._is_constrained_data:
+            return self.loader.sample_one()
+
         if self._filtered_deals:
             idx = np.random.randint(len(self._filtered_deals))
             return self._filtered_deals[idx]

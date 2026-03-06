@@ -3,8 +3,8 @@ Subgame Trainer
 ===============
 
 通用子博弈训练框架, 支持:
-- Stayman (纯合作, 单桌 IMP)
-- Competitive (合作-对抗, self-play)
+- Stayman (纯合作, 单桌 IMP) — 只训练 NS
+- Competitive (合作-对抗, self-play) — 训练所有 4 方
 
 支持可选的 Dual-Info Bonus:
 - use_info_bonus=False → 纯 MAPPO (control)
@@ -31,17 +31,17 @@ from utils.running_stats import RunningStats
 class SubgameConfig:
     """子博弈训练配置."""
     # Training
-    num_steps: int = 5000           # 总训练步数 (iterations)
-    deals_per_step: int = 8         # 每步采样的牌副数
+    num_steps: int = 5000
+    deals_per_step: int = 8
     lr: float = 3e-4
     belief_lr: float = 1e-3
 
     # Info bonus
     use_info_bonus: bool = False
-    beta: float = 0.5               # opponent penalty weight
-    lambda_start: float = 0.5       # info bonus 初始权重
-    lambda_end: float = 0.1         # info bonus 最终权重 (退火)
-    belief_warmup_steps: int = 500  # 前 N 步只训练 Belief (不用 info bonus)
+    beta: float = 0.5
+    lambda_start: float = 0.5
+    lambda_end: float = 0.1
+    belief_warmup_steps: int = 500
 
     # Network
     hand_dim: int = 256
@@ -58,6 +58,13 @@ class SubgameConfig:
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
 
+    # Which players does the agent control?
+    # None = all 4 (Competitive), [0,2] = NS only (Stayman)
+    active_players: Optional[List[int]] = None
+
+    # Minimum buffer size before PPO update (prevents NaN from std of 1 element)
+    min_buffer_size: int = 4
+
     # Eval
     eval_interval: int = 200
     eval_deals: int = 100
@@ -68,26 +75,14 @@ class SubgameConfig:
 
 
 class SubgameTrainer:
-    """
-    通用子博弈训练器.
-
-    同时管理:
-    - MAPPOAgent (policy + value)
-    - BeliefNetwork (推断手牌)
-    - DualInfoComputer (r_info)
-    """
+    """通用子博弈训练器."""
 
     def __init__(self, env, config: SubgameConfig):
-        """
-        Args:
-            env: StaymanSubgameEnv or CompetitiveSubgameEnv
-            config: SubgameConfig
-        """
         self.env = env
         self.config = config
         self.device = config.device
+        self.active_players = config.active_players or list(range(NUM_PLAYERS))
 
-        # MAPPO agent
         mappo_config = MAPPOConfig(
             hand_dim=config.hand_dim,
             history_dim=config.history_dim,
@@ -105,7 +100,6 @@ class SubgameTrainer:
         )
         self.agent = MAPPOAgent(mappo_config)
 
-        # Belief network (optional, for info bonus)
         self.belief_net = None
         self.dual_info = None
         self.belief_optimizer = None
@@ -116,24 +110,19 @@ class SubgameTrainer:
                 history_dim=config.history_dim,
                 hidden_dim=config.hidden_dim,
             ).to(self.device)
-
             self.dual_info = DualInfoComputer(self.belief_net, beta=config.beta)
             self.belief_optimizer = torch.optim.Adam(
                 self.belief_net.parameters(), lr=config.belief_lr
             )
-
-            # Running stats for normalization
             self.partner_stats = RunningStats()
             self.opponent_stats = RunningStats()
 
-        # Training log
         self.log = []
 
     def get_lambda(self, step: int) -> float:
-        """Info bonus 权重退火: 线性从 lambda_start → lambda_end."""
         cfg = self.config
         if step < cfg.belief_warmup_steps:
-            return 0.0  # warmup 阶段不用 info bonus
+            return 0.0
         progress = min(1.0, (step - cfg.belief_warmup_steps) /
                        max(1, cfg.num_steps - cfg.belief_warmup_steps))
         return cfg.lambda_start + (cfg.lambda_end - cfg.lambda_start) * progress
@@ -143,58 +132,46 @@ class SubgameTrainer:
     # ====================================================================
 
     def collect_episodes(self, num_deals: int) -> List[Dict]:
-        """
-        在子博弈环境中采样 episode.
-
-        每个 episode 记录:
-        - 标准 MAPPO 轨迹 (obs, action, reward, ...)
-        - belief 数据: 每步的 history_before/after (用于 info bonus)
-        """
+        """采样 episode, 只记录 active_players 的轨迹."""
         episodes = []
 
         for _ in range(num_deals):
             hands, dd_table = self.env.generate_deal()
             obs = self.env.reset(hands, dd_table)
 
-            player_trajs = {p: [] for p in range(NUM_PLAYERS)}
+            player_trajs = {p: [] for p in self.active_players}
             done = False
 
             while not done:
                 player = self.env.current_player
-
-                # 保存 history before action
                 history_before = self.env.history.copy()
 
-                # Get action from agent
                 all_hands = self.env._current_hands
                 action, extra = self.agent.get_action(obs, all_hands=all_hands)
                 extra['_all_hands'] = all_hands
 
                 obs_next, reward, done, info = self.env.step(action)
-
-                # 保存 history after action
                 history_after = self.env.history.copy()
 
-                step_data = {
-                    'obs': obs,
-                    'action': action,
-                    'reward': reward,
-                    'done': done,
-                    'player': player,
-                    'hands': all_hands.copy(),
-                    'history_before': history_before,
-                    'history_after': history_after,
-                    **extra,
-                }
-                player_trajs[player].append(step_data)
+                if player in self.active_players:
+                    step_data = {
+                        'obs': obs,
+                        'action': action,
+                        'reward': reward,
+                        'done': done,
+                        'player': player,
+                        'hands': all_hands.copy(),
+                        'history_before': history_before,
+                        'history_after': history_after,
+                        **extra,
+                    }
+                    player_trajs[player].append(step_data)
 
                 obs = obs_next
 
-            # 终局: 回填 reward 到最后一步
             final_reward = info.get('imp', reward)
             for p, traj in player_trajs.items():
                 if traj:
-                    # NS 得正分, EW 得负分
                     r = final_reward if p % 2 == 0 else -final_reward
                     traj[-1]['reward'] = float(r)
 
@@ -208,9 +185,11 @@ class SubgameTrainer:
         return episodes
 
     def store_episodes(self, episodes: List[Dict]):
-        """将 episode 数据存入 agent buffer."""
+        """将 episode 数据存入 agent buffer. 只存 active players."""
         for ep in episodes:
             for player, traj in ep['player_trajectories'].items():
+                if player not in self.active_players:
+                    continue
                 for step in traj:
                     self.agent.store_transition(
                         player,
@@ -223,16 +202,27 @@ class SubgameTrainer:
                         all_hands=step.get('_all_hands'),
                     )
 
+    def safe_update(self) -> Dict[str, float]:
+        """
+        安全的 PPO update.
+
+        1. 清空非 active players 的 buffer
+        2. 跳过 action 数量 < min_buffer_size 的 buffer (防止 std() NaN)
+        """
+        min_size = self.config.min_buffer_size
+
+        for p in range(NUM_PLAYERS):
+            buf = self.agent.buffers[p]
+            if p not in self.active_players or len(buf.actions) < min_size:
+                buf.reset()
+
+        return self.agent.update()
+
     # ====================================================================
     # Belief training
     # ====================================================================
 
     def train_belief_step(self, episodes: List[Dict]) -> float:
-        """
-        一步 Belief Network 训练.
-
-        从 episode 中提取 (observer_hand, history, target_hand) 数据.
-        """
         if self.belief_net is None:
             return 0.0
 
@@ -240,7 +230,6 @@ class SubgameTrainer:
         if not belief_data:
             return 0.0
 
-        # Batch training
         total_loss = 0.0
         n = 0
 
@@ -264,14 +253,12 @@ class SubgameTrainer:
         return total_loss / max(1, n)
 
     def _extract_belief_data(self, episodes: List[Dict]) -> List[Dict]:
-        """从 episode 提取 belief 训练数据."""
         data = []
         for ep in episodes:
-            hands = ep['hands']  # (4, 52)
+            hands = ep['hands']
             for player, traj in ep['player_trajectories'].items():
                 for step in traj:
                     hist = step['history_after']
-                    # observer → target pairs (all other players)
                     for target in range(NUM_PLAYERS):
                         if target == player:
                             continue
@@ -285,7 +272,6 @@ class SubgameTrainer:
         return data
 
     def _encode_history(self, history: List[int]) -> np.ndarray:
-        """将 history (list of bid ints) 编码为 one-hot 序列."""
         max_len = self.env.max_history_len
         encoded = np.zeros((max_len, NUM_BIDS), dtype=np.float32)
         for i, bid in enumerate(history[-max_len:]):
@@ -293,7 +279,6 @@ class SubgameTrainer:
         return encoded
 
     def _iter_belief_batches(self, data: List[Dict], batch_size: int):
-        """迭代 belief 训练 batch."""
         indices = np.random.permutation(len(data))
 
         for start in range(0, len(data), batch_size):
@@ -325,16 +310,10 @@ class SubgameTrainer:
             }
 
     # ====================================================================
-    # Compute info bonus (stub — actual integration with advantage)
+    # Info bonus monitoring
     # ====================================================================
 
     def compute_info_bonus_for_episodes(self, episodes: List[Dict]) -> Dict[str, float]:
-        """
-        计算 episode 中每步的 info bonus 指标 (用于监控, 不直接改 advantage).
-
-        Returns:
-            metrics dict: partner_gain_mean, opponent_leak_mean, info_ratio
-        """
         if self.belief_net is None:
             return {'partner_gain': 0, 'opponent_leak': 0, 'info_ratio': 1.0}
 
@@ -346,7 +325,7 @@ class SubgameTrainer:
             for ep in episodes:
                 hands = ep['hands']
                 for player, traj in ep['player_trajectories'].items():
-                    if player % 2 == 1:  # 只看 NS
+                    if player % 2 == 1:
                         continue
                     partner = (player + 2) % 4
                     opponent = (player + 1) % 4
@@ -355,14 +334,12 @@ class SubgameTrainer:
                         h_before = self._encode_history(step['history_before'])
                         h_after = self._encode_history(step['history_after'])
 
-                        # Partner's info gain
                         pg = self._compute_single_info_gain(
                             hands[partner], h_before, h_after,
                             partner, player, hands[player]
                         )
                         partner_gains.append(pg)
 
-                        # Opponent's info leak
                         ol = self._compute_single_info_gain(
                             hands[opponent], h_before, h_after,
                             opponent, player, hands[player]
@@ -373,24 +350,17 @@ class SubgameTrainer:
 
         pg_mean = np.mean(partner_gains) if partner_gains else 0.0
         ol_mean = np.mean(opponent_leaks) if opponent_leaks else 1e-8
-        ratio = pg_mean / (ol_mean + 1e-8)
+        ratio = pg_mean / (abs(ol_mean) + 1e-8)
 
         return {
-            'partner_gain': pg_mean,
-            'opponent_leak': ol_mean,
-            'info_ratio': ratio,
+            'partner_gain': float(pg_mean),
+            'opponent_leak': float(ol_mean),
+            'info_ratio': float(ratio),
         }
 
-    def _compute_single_info_gain(
-        self,
-        observer_hand: np.ndarray,
-        history_before: np.ndarray,
-        history_after: np.ndarray,
-        observer_pos: int,
-        target_pos: int,
-        target_hand: np.ndarray,
-    ) -> float:
-        """计算单个观察者的信息增益."""
+    def _compute_single_info_gain(self, observer_hand, history_before,
+                                   history_after, observer_pos, target_pos,
+                                   target_hand) -> float:
         oh = torch.tensor(observer_hand, dtype=torch.float32).unsqueeze(0).to(self.device)
         hb = torch.tensor(history_before, dtype=torch.float32).unsqueeze(0).to(self.device)
         ha = torch.tensor(history_after, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -398,8 +368,8 @@ class SubgameTrainer:
         tp = torch.tensor([target_pos], dtype=torch.long).to(self.device)
         th = torch.tensor(target_hand, dtype=torch.float32).unsqueeze(0).to(self.device)
 
-        belief_before = self.belief_net(oh, hb, op, tp)
-        belief_after = self.belief_net(oh, ha, op, tp)
+        belief_before = self.belief_net(oh, hb, op, tp).clamp(1e-7, 1 - 1e-7)
+        belief_after = self.belief_net(oh, ha, op, tp).clamp(1e-7, 1 - 1e-7)
 
         ce_before = F.binary_cross_entropy(belief_before, th, reduction='none').sum(dim=-1)
         ce_after = F.binary_cross_entropy(belief_after, th, reduction='none').sum(dim=-1)
@@ -411,30 +381,22 @@ class SubgameTrainer:
     # ====================================================================
 
     def train(self) -> List[Dict]:
-        """
-        主训练循环.
-
-        Returns:
-            training log (list of dicts)
-        """
         cfg = self.config
+        active_str = ','.join(str(p) for p in self.active_players)
         print(f"SubgameTrainer: {cfg.num_steps} steps, "
-              f"info_bonus={cfg.use_info_bonus}, beta={cfg.beta}")
+              f"info_bonus={cfg.use_info_bonus}, beta={cfg.beta}, "
+              f"active_players=[{active_str}]")
 
         for step in range(1, cfg.num_steps + 1):
-            # 1. Collect episodes
             episodes = self.collect_episodes(cfg.deals_per_step)
 
-            # 2. Train belief (if using info bonus)
             belief_loss = 0.0
             if cfg.use_info_bonus:
                 belief_loss = self.train_belief_step(episodes)
 
-            # 3. Store to MAPPO buffer and update
             self.store_episodes(episodes)
-            update_stats = self.agent.update()
+            update_stats = self.safe_update()
 
-            # 4. Logging
             if step % cfg.log_interval == 0:
                 rewards = [ep['final_reward'] for ep in episodes]
                 info_metrics = self.compute_info_bonus_for_episodes(episodes) \
@@ -442,9 +404,9 @@ class SubgameTrainer:
 
                 entry = {
                     'step': step,
-                    'mean_reward': np.mean(rewards),
-                    'std_reward': np.std(rewards),
-                    'belief_loss': belief_loss,
+                    'mean_reward': float(np.mean(rewards)),
+                    'std_reward': float(np.std(rewards)),
+                    'belief_loss': float(belief_loss),
                     'lambda': self.get_lambda(step),
                     **info_metrics,
                     **(update_stats or {}),
@@ -460,11 +422,6 @@ class SubgameTrainer:
         return self.log
 
     def evaluate_belief_accuracy(self, num_deals: int = 50) -> float:
-        """
-        评估 Belief Network 的准确率.
-
-        准确率 = 对 target 手中确实有的牌, belief > 0.5 的比例.
-        """
         if self.belief_net is None:
             return 0.0
 
@@ -475,9 +432,7 @@ class SubgameTrainer:
         with torch.no_grad():
             for _ in range(num_deals):
                 hands, dd_table = self.env.generate_deal()
-                # 简单测试: N 看完整 history 后预测 S 的手牌
                 obs = self.env.reset(hands, dd_table)
-                # 用随机策略走几步
                 done = False
                 while not done:
                     legal = obs['legal_actions']
@@ -490,7 +445,7 @@ class SubgameTrainer:
                 op = torch.tensor([NORTH], dtype=torch.long).to(self.device)
                 tp = torch.tensor([SOUTH], dtype=torch.long).to(self.device)
 
-                belief = self.belief_net(oh, h, op, tp)  # (1, 52)
+                belief = self.belief_net(oh, h, op, tp)
                 target = torch.tensor(hands[SOUTH], dtype=torch.float32).unsqueeze(0).to(self.device)
 
                 pred = (belief > 0.5).float()

@@ -13,7 +13,15 @@ Go/No-Go 决策点:
 
 Usage:
     cd bridge-coma/
-    python experiments/subgame_validation.py --data_path data/ --device cuda
+
+    # 先生成约束数据 (只需一次)
+    python -m utils.generate_subgame_data --type both --num_workers 4
+
+    # 运行实验
+    python experiments/subgame_validation.py \\
+        --stayman_data data/stayman_50k.npz \\
+        --competitive_data data/competitive_100k.npz \\
+        --device cuda
 """
 
 import argparse
@@ -35,7 +43,7 @@ from subgames.subgame_trainer import SubgameTrainer, SubgameConfig
 from algorithms.behavioral_cloning import (
     create_bc_dataset_for_competitive, behavioral_cloning_warmup, evaluate_pass_rate,
 )
-from env import BridgeBiddingEnv
+from env import BridgeBiddingEnv, NORTH, SOUTH
 
 
 # ============================================================================
@@ -45,7 +53,8 @@ from env import BridgeBiddingEnv
 @dataclass
 class Phase2Config:
     """Phase 2 全局配置."""
-    data_path: str = "data/"
+    stayman_data: str = "data/stayman_50k.npz"
+    competitive_data: str = "data/competitive_100k.npz"
     device: str = "cpu"
     output_dir: str = "results/"
 
@@ -59,7 +68,7 @@ class Phase2Config:
     competitive_deals_per_step: int = 8
     competitive_eval_deals: int = 500
 
-    # BC
+    # BC (uses competitive_data for BC dataset)
     bc_num_samples: int = 30000
     bc_epochs: int = 10
 
@@ -87,7 +96,7 @@ def run_stayman_experiment(config: Phase2Config) -> dict:
     print("Phase 2a: Stayman Subgame (Pure Cooperative)")
     print("=" * 60)
 
-    env = StaymanSubgameEnv(config.data_path)
+    env = StaymanSubgameEnv(config.stayman_data)
 
     results = {}
 
@@ -102,6 +111,7 @@ def run_stayman_experiment(config: Phase2Config) -> dict:
             use_info_bonus=use_info,
             beta=beta,
             device=config.device,
+            active_players=[NORTH, SOUTH],  # Stayman: only NS decide
         )
         trainer = SubgameTrainer(env, sub_config)
 
@@ -223,12 +233,12 @@ def run_competitive_experiment(config: Phase2Config) -> dict:
     print("Phase 2b: Competitive Subgame (1H-1S)")
     print("=" * 60)
 
-    env = CompetitiveSubgameEnv(config.data_path)
+    env = CompetitiveSubgameEnv(config.competitive_data)
 
     # BC dataset (shared across all agents)
     print("\n--- Creating BC dataset ---")
     bc_dataset = create_bc_dataset_for_competitive(
-        config.data_path, num_samples=config.bc_num_samples
+        config.competitive_data, num_samples=config.bc_num_samples
     )
 
     agents = {}
@@ -455,7 +465,10 @@ def _print_summary(report: dict):
 
 def main():
     p = argparse.ArgumentParser(description="Phase 2: Subgame Validation")
-    p.add_argument('--data_path', required=True, help='DDS data path')
+    p.add_argument('--stayman_data', default='data/stayman_50k.npz',
+                   help='Stayman constrained DDS data (.npz)')
+    p.add_argument('--competitive_data', default='data/competitive_100k.npz',
+                   help='Competitive constrained DDS data (.npz)')
     p.add_argument('--device', default=None, help='Device (default: auto)')
     p.add_argument('--output_dir', default='results/')
     p.add_argument('--stayman_steps', type=int, default=3000)
@@ -468,7 +481,8 @@ def main():
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
     config = Phase2Config(
-        data_path=args.data_path,
+        stayman_data=args.stayman_data,
+        competitive_data=args.competitive_data,
         device=device,
         output_dir=args.output_dir,
         stayman_steps=args.stayman_steps,

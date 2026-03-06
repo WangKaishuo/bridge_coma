@@ -44,9 +44,26 @@ class StaymanSubgameEnv:
         self.env = BridgeBiddingEnv(max_history_len)
         self.max_history_len = max_history_len
 
-        # 预筛选缓存
-        self._filtered_deals = []
-        self._prefetch(min_deals=500, max_attempts=50000)
+        # 检查数据是否已经是约束数据 (所有牌都符合约束)
+        # 如果是, 就直接用; 如果不是, 进行预筛选
+        self._is_constrained_data = self._check_if_constrained()
+        if not self._is_constrained_data:
+            self._filtered_deals = []
+            self._prefetch(min_deals=500, max_attempts=50000)
+        else:
+            self._filtered_deals = None
+            print(f"StaymanSubgameEnv: using pre-generated constrained data "
+                  f"({len(self.loader)} samples)")
+
+    def _check_if_constrained(self, sample_size: int = 20) -> bool:
+        """检查数据是否全部符合约束 (抽样检查)."""
+        passed = 0
+        for _ in range(sample_size):
+            hands, _ = self.loader.sample_one()
+            if self._satisfies_constraints(hands):
+                passed += 1
+        # 如果 90%+ 符合, 认为是约束数据
+        return passed >= sample_size * 0.9
 
     def _prefetch(self, min_deals: int, max_attempts: int):
         """预筛选符合约束的牌."""
@@ -86,8 +103,12 @@ class StaymanSubgameEnv:
         """
         生成一副符合约束的牌.
 
-        优先从缓存取; 如果缓存空了, 实时筛选。
+        如果用预生成约束数据, 直接 sample;
+        否则从预筛选缓存或实时筛选获取。
         """
+        if self._is_constrained_data:
+            return self.loader.sample_one()
+
         if self._filtered_deals:
             idx = np.random.randint(len(self._filtered_deals))
             return self._filtered_deals[idx]
