@@ -2,14 +2,14 @@
 Subgame Trainer
 ===============
 
-通用子博弈训练框架, 支持:
-- Stayman (纯合作, 单桌 IMP) — 只训练 NS
-- Competitive (合作-对抗, self-play) — 训练所有 4 方
+通用子博弈训练框架.
 
-支持可选的 Dual-Info Bonus:
-- use_info_bonus=False → 纯 MAPPO (control)
-- use_info_bonus=True, beta=0.0 → partner-only
-- use_info_bonus=True, beta=0.5 → dual-info
+关键设计:
+- active_players: 只训练指定玩家 (e.g., [SOUTH] for Stage 1)
+- accumulate_steps: 累积 N 步数据后做 1 次 PPO update
+- safe_update: 完全自主的 PPO update (不调 agent.update()),
+  有稳健 advantage 归一化 (防 std=0 NaN)
+- 可选 Dual-Info Bonus (BeliefNetwork + DualInfoComputer)
 """
 
 import numpy as np
@@ -32,10 +32,9 @@ class SubgameConfig:
     """子博弈训练配置."""
     # Training
     num_steps: int = 5000
-    deals_per_step: int = 32          # 32 deals per collection step
+    deals_per_step: int = 32
     accumulate_steps: int = 4         # collect N steps before 1 PPO update
-                                      # effective: 32×4=128 deals/update ≈ 256-512 transitions/player
-    lr: float = 1e-4                  # lower lr for stability
+    lr: float = 1e-4
     belief_lr: float = 1e-3
 
     # Info bonus
@@ -55,21 +54,19 @@ class SubgameConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     num_epochs: int = 4
-    batch_size: int = 64              # smaller batch → more gradient steps per update
+    batch_size: int = 64
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
 
     # Which players does the agent control?
-    # None = all 4 (Competitive), [0,2] = NS only (Stayman)
     active_players: Optional[List[int]] = None
 
-    # Minimum buffer size before PPO update (prevents NaN from std of 1 element)
+    # Minimum buffer size before PPO update
     min_buffer_size: int = 4
 
     # Eval
-    eval_interval: int = 200
-    eval_deals: int = 100
+    eval_interval: int = 500
     log_interval: int = 50
 
     # Device
@@ -102,6 +99,7 @@ class SubgameTrainer:
         )
         self.agent = MAPPOAgent(mappo_config)
 
+        # Belief network (optional)
         self.belief_net = None
         self.dual_info = None
         self.belief_optimizer = None
@@ -134,7 +132,12 @@ class SubgameTrainer:
     # ====================================================================
 
     def collect_episodes(self, num_deals: int) -> List[Dict]:
-        """采样 episode, 只记录 active_players 的轨迹."""
+        """
+        采样 episode.
+
+        env.step() 可能内部自动执行规则玩家 (e.g., north_rule in Stayman).
+        trainer 只记录 active_players 中由 agent 做出的决策.
+        """
         episodes = []
 
         for _ in range(num_deals):
@@ -146,6 +149,16 @@ class SubgameTrainer:
 
             while not done:
                 player = self.env.current_player
+
+                # 检查是否是 agent 决策的 player
+                if player not in self.active_players:
+                    # 不该到这里 — env 应该已经自动处理了非 active 玩家
+                    # 保险: 用随机合法动作
+                    legal = obs.get('legal_actions', np.ones(NUM_BIDS))
+                    action = np.random.choice(np.where(legal > 0.5)[0])
+                    obs, _, done, info = self.env.step(action)
+                    continue
+
                 history_before = self.env.history.copy()
 
                 all_hands = self.env._current_hands
@@ -155,25 +168,22 @@ class SubgameTrainer:
                 obs_next, reward, done, info = self.env.step(action)
                 history_after = self.env.history.copy()
 
-                if player in self.active_players:
-                    step_data = {
-                        'obs': obs,
-                        'action': action,
-                        'reward': reward,
-                        'done': done,
-                        'player': player,
-                        'hands': all_hands.copy(),
-                        'history_before': history_before,
-                        'history_after': history_after,
-                        **extra,
-                    }
-                    player_trajs[player].append(step_data)
+                step_data = {
+                    'obs': obs,
+                    'action': action,
+                    'reward': reward,
+                    'done': done,
+                    'player': player,
+                    'hands': all_hands.copy(),
+                    'history_before': history_before,
+                    'history_after': history_after,
+                    **extra,
+                }
+                player_trajs[player].append(step_data)
 
                 obs = obs_next
 
-            # Use the reward from the final step (this is the training reward).
-            # For Stayman: scaled score. For Competitive: dual-table IMP.
-            # info['imp'] is kept separate for evaluation purposes.
+            # Backfill terminal reward
             final_reward = reward
             for p, traj in player_trajs.items():
                 if traj:
@@ -190,7 +200,7 @@ class SubgameTrainer:
         return episodes
 
     def store_episodes(self, episodes: List[Dict]):
-        """将 episode 数据存入 agent buffer. 只存 active players."""
+        """存入 agent buffer, 只存 active players."""
         for ep in episodes:
             for player, traj in ep['player_trajectories'].items():
                 if player not in self.active_players:
@@ -207,21 +217,96 @@ class SubgameTrainer:
                         all_hands=step.get('_all_hands'),
                     )
 
+    # ====================================================================
+    # Safe PPO Update (replaces agent.update())
+    # ====================================================================
+
     def safe_update(self) -> Dict[str, float]:
         """
-        安全的 PPO update.
+        稳健的 PPO update.
 
-        1. 清空非 active players 的 buffer
-        2. 跳过 action 数量 < min_buffer_size 的 buffer (防止 std() NaN)
+        完全替代 agent.update(), 增加:
+        - 只更新 active_players
+        - 稳健 advantage 归一化 (防 std=0 NaN)
         """
+        agent = self.agent
         min_size = self.config.min_buffer_size
 
-        for p in range(NUM_PLAYERS):
-            buf = self.agent.buffers[p]
-            if p not in self.active_players or len(buf.actions) < min_size:
-                buf.reset()
+        total_loss = total_policy = total_value = total_entropy = num_updates = 0
 
-        return self.agent.update()
+        for player in range(NUM_PLAYERS):
+            buffer = agent.buffers[player]
+
+            if player not in self.active_players or len(buffer.actions) < min_size:
+                buffer.reset()
+                continue
+
+            with torch.no_grad():
+                last_obs = {k: v.unsqueeze(0).to(self.device)
+                            for k, v in buffer.observations[-1].items()}
+                last_hands = (buffer.all_hands[-1].unsqueeze(0).to(self.device)
+                              if buffer.all_hands else None)
+                last_value = agent.model.critic(last_obs, last_hands).item()
+
+            buffer.compute_returns_and_advantages(
+                last_value, agent.config.gamma, agent.config.gae_lambda
+            )
+
+            for _ in range(agent.config.num_epochs):
+                for batch in buffer.get_batches(agent.config.batch_size):
+                    log_probs, entropy = agent.model.actor.evaluate_actions(
+                        batch['obs'], batch['actions']
+                    )
+                    values = agent.model.critic(batch['obs'], batch.get('all_hands'))
+
+                    ratio = torch.exp(log_probs - batch['old_log_probs'])
+
+                    # 稳健 advantage 归一化
+                    adv = batch['advantages']
+                    if adv.numel() > 1:
+                        adv_std = adv.std()
+                        if torch.isfinite(adv_std) and adv_std > 1e-6:
+                            adv = (adv - adv.mean()) / (adv_std + 1e-8)
+                        else:
+                            adv = adv - adv.mean()
+
+                    policy_loss = -torch.min(
+                        ratio * adv,
+                        torch.clamp(ratio,
+                                    1 - agent.config.clip_ratio,
+                                    1 + agent.config.clip_ratio) * adv
+                    ).mean()
+
+                    value_loss = F.mse_loss(values, batch['returns'])
+
+                    loss = (policy_loss
+                            + agent.config.value_coef * value_loss
+                            - agent.config.entropy_coef * entropy.mean())
+
+                    agent.optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        agent.model.parameters(), agent.config.max_grad_norm
+                    )
+                    agent.optimizer.step()
+
+                    total_loss += loss.item()
+                    total_policy += policy_loss.item()
+                    total_value += value_loss.item()
+                    total_entropy += entropy.mean().item()
+                    num_updates += 1
+
+            buffer.reset()
+
+        if num_updates == 0:
+            return {}
+
+        return {
+            'loss': total_loss / num_updates,
+            'policy_loss': total_policy / num_updates,
+            'value_loss': total_value / num_updates,
+            'entropy': total_entropy / num_updates,
+        }
 
     # ====================================================================
     # Belief training
@@ -240,18 +325,14 @@ class SubgameTrainer:
 
         for batch in self._iter_belief_batches(belief_data, batch_size=256):
             loss = self.belief_net.compute_loss(
-                batch['observer_hand'],
-                batch['history'],
-                batch['observer_pos'],
-                batch['target_pos'],
+                batch['observer_hand'], batch['history'],
+                batch['observer_pos'], batch['target_pos'],
                 batch['target_hand'],
             )
-
             self.belief_optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.belief_net.parameters(), 1.0)
             self.belief_optimizer.step()
-
             total_loss += loss.item()
             n += 1
 
@@ -285,33 +366,26 @@ class SubgameTrainer:
 
     def _iter_belief_batches(self, data: List[Dict], batch_size: int):
         indices = np.random.permutation(len(data))
-
         for start in range(0, len(data), batch_size):
             batch_idx = indices[start:start + batch_size]
             if len(batch_idx) < 2:
                 continue
-
             yield {
                 'observer_hand': torch.tensor(
                     np.array([data[i]['observer_hand'] for i in batch_idx]),
-                    dtype=torch.float32
-                ).to(self.device),
+                    dtype=torch.float32).to(self.device),
                 'history': torch.tensor(
                     np.array([data[i]['history'] for i in batch_idx]),
-                    dtype=torch.float32
-                ).to(self.device),
+                    dtype=torch.float32).to(self.device),
                 'observer_pos': torch.tensor(
                     [data[i]['observer_pos'] for i in batch_idx],
-                    dtype=torch.long
-                ).to(self.device),
+                    dtype=torch.long).to(self.device),
                 'target_pos': torch.tensor(
                     [data[i]['target_pos'] for i in batch_idx],
-                    dtype=torch.long
-                ).to(self.device),
+                    dtype=torch.long).to(self.device),
                 'target_hand': torch.tensor(
                     np.array([data[i]['target_hand'] for i in batch_idx]),
-                    dtype=torch.float32
-                ).to(self.device),
+                    dtype=torch.float32).to(self.device),
             }
 
     # ====================================================================
@@ -334,23 +408,17 @@ class SubgameTrainer:
                         continue
                     partner = (player + 2) % 4
                     opponent = (player + 1) % 4
-
                     for step in traj:
                         h_before = self._encode_history(step['history_before'])
                         h_after = self._encode_history(step['history_after'])
-
                         pg = self._compute_single_info_gain(
                             hands[partner], h_before, h_after,
-                            partner, player, hands[player]
-                        )
+                            partner, player, hands[player])
                         partner_gains.append(pg)
-
                         ol = self._compute_single_info_gain(
                             hands[opponent], h_before, h_after,
-                            opponent, player, hands[player]
-                        )
+                            opponent, player, hands[player])
                         opponent_leaks.append(ol)
-
         self.belief_net.train()
 
         pg_mean = np.mean(partner_gains) if partner_gains else 0.0
@@ -388,33 +456,31 @@ class SubgameTrainer:
     def train(self) -> List[Dict]:
         cfg = self.config
         active_str = ','.join(str(p) for p in self.active_players)
+        eff_deals = cfg.deals_per_step * cfg.accumulate_steps
         print(f"SubgameTrainer: {cfg.num_steps} steps, "
               f"info_bonus={cfg.use_info_bonus}, beta={cfg.beta}, "
               f"active_players=[{active_str}], "
               f"accumulate={cfg.accumulate_steps}, "
-              f"effective_deals/update={cfg.deals_per_step * cfg.accumulate_steps}")
+              f"effective_deals/update={eff_deals}")
 
-        all_episodes_window = []  # for logging across accumulation window
+        all_episodes_window = []
 
         for step in range(1, cfg.num_steps + 1):
-            # 1. Collect episodes
             episodes = self.collect_episodes(cfg.deals_per_step)
             all_episodes_window.extend(episodes)
 
-            # 2. Train belief every step (belief benefits from frequent updates)
             belief_loss = 0.0
             if cfg.use_info_bonus:
                 belief_loss = self.train_belief_step(episodes)
 
-            # 3. Store to buffer (accumulate)
             self.store_episodes(episodes)
 
-            # 4. PPO update only every accumulate_steps
+            # PPO update every accumulate_steps
             update_stats = {}
             if step % cfg.accumulate_steps == 0:
                 update_stats = self.safe_update()
 
-            # 5. Logging
+            # Logging
             if step % cfg.log_interval == 0:
                 rewards = [ep['final_reward'] for ep in all_episodes_window]
                 info_metrics = self.compute_info_bonus_for_episodes(episodes) \
@@ -437,7 +503,7 @@ class SubgameTrainer:
                           f"belief_loss={belief_loss:.4f} "
                           f"info_ratio={entry.get('info_ratio', 'N/A')}")
 
-                all_episodes_window = []  # reset window for next logging period
+                all_episodes_window = []
 
         return self.log
 
@@ -446,8 +512,7 @@ class SubgameTrainer:
             return 0.0
 
         self.belief_net.eval()
-        correct = 0
-        total = 0
+        correct = total = 0
 
         with torch.no_grad():
             for _ in range(num_deals):
