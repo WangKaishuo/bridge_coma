@@ -83,6 +83,69 @@ def north_stayman_rule(hands: np.ndarray, history: list) -> int:
     return BID_PASS
 
 
+def south_stayman_rule(hands: np.ndarray, history: list) -> int:
+    """
+    S 的 Stayman 规则策略.
+
+    1NT-Pass-2C-Pass-{N回应}-Pass 后, S 根据 N 的回应 + 自身手牌决策:
+
+    N 叫 2H (有 4+H):
+      S 有 4+H:  10+ HCP → 4H, 8-9 HCP → 3H (邀请)
+      S 无 4H:   10+ HCP → 3NT, 8-9 HCP → 2NT (邀请)
+    N 叫 2S (有 4+S):
+      S 有 4+S:  10+ HCP → 4S, 8-9 HCP → 3S (邀请)
+      S 无 4S:   10+ HCP → 3NT, 8-9 HCP → 2NT (邀请)
+    N 叫 2D (否认高花):
+      10+ HCP → 3NT, 8-9 HCP → 2NT (邀请)
+
+    Args:
+        hands: (4, 52) — 需要 hands[SOUTH]
+        history: 当前叫牌历史 (list of bid ints)
+    Returns:
+        bid index
+    """
+    s_hand = hands[SOUTH]
+    hcp = count_hcp(s_hand)
+    s_h = count_suit_length(s_hand, 2)  # hearts
+    s_s = count_suit_length(s_hand, 3)  # spades
+
+    prefix_len = 4  # 1NT Pass 2C Pass
+    rounds_after = len(history) - prefix_len
+
+    if rounds_after != 2:
+        # 不是 S 的 Round 2 决策点, Pass
+        return BID_PASS
+
+    # N 的回应是 history[-2] (跳过 E 的 Pass)
+    n_response = history[-2]
+    n_bid_str = bid_to_string(n_response)
+
+    game_values = hcp >= 10  # 10+ HCP → 成局力
+    invite = (8 <= hcp <= 9)  # 8-9 HCP → 邀请力
+
+    if n_bid_str == "2♥" or n_bid_str == "2H":
+        # N 有 4+H
+        if s_h >= 4:
+            # 找到配合
+            return string_to_bid("4H") if game_values else string_to_bid("3H")
+        else:
+            # 无配合, 根据点力选 NT
+            return string_to_bid("3NT") if game_values else string_to_bid("2NT")
+
+    elif n_bid_str == "2♠" or n_bid_str == "2S":
+        # N 有 4+S
+        if s_s >= 4:
+            # 找到配合
+            return string_to_bid("4S") if game_values else string_to_bid("3S")
+        else:
+            # 无配合, 根据点力选 NT
+            return string_to_bid("3NT") if game_values else string_to_bid("2NT")
+
+    else:
+        # N 叫 2D, 否认高花
+        return string_to_bid("3NT") if game_values else string_to_bid("2NT")
+
+
 class StaymanSubgameEnv:
     """
     Stayman 子博弈环境.
@@ -284,40 +347,59 @@ class StaymanSubgameEnv:
 
         return mask
 
-    # Shifted IMP reward 参数
-    # -13 IMP 对应有局小满贯奖分 (750 分差 → 13 IMP), 覆盖 >95% Stayman 牌局
-    IMP_FLOOR = -13.0
-    IMP_EPSILON = 0.01  # 极端负值仍有微弱梯度, 避免零梯度死区
+    # Action mask 的最高阶数 — DDS baseline 也应受此限制
+    MAX_LEVEL = 4
 
     def _compute_terminal_reward(self) -> float:
         """
-        训练 reward: Shifted IMP → [ε, 1.0]
+        训练 reward: Piecewise linear, 映射 IMP regret → [0.01, 1.0]
 
-        r = clamp((IMP_diff - IMP_FLOOR) / (-IMP_FLOOR), ε, 1.0)
+        分段设计 (breakpoints 对应桥牌计分的自然不连续点):
+          IMP =  0  → 1.00  完美匹配受限 DDS 最优
+          IMP = -1  → 0.70  错选花色 (3NT vs 4M), 陡峭惩罚 (Δ=0.30)
+          IMP = -6  → 0.25  漏局 (Part-score vs Game)
+          IMP ≤ -13 → 0.01  灾难 (clamp, 保留微弱梯度)
 
-        数学含义: IMP regret 的线性补集.
-          IMP_diff =  0 → r = 1.0  (完美匹配 DDS 最优)
-          IMP_diff = -6 → r ≈ 0.54 (漏局, 中等惩罚)
-          IMP_diff = -13 → r = ε   (极大失误, 接近零但保留梯度)
-          IMP_diff < -13 → r = ε   (超极端, soft clamp)
+        关键: 0→-1 段斜率 (0.30/IMP) 远大于 -1→-6 段 (0.09/IMP),
+        迫使模型优先区分 N 的应叫 (2H vs 2D vs 2S), 而非恐惧大错.
         """
         imp_diff = self._compute_imp_diff()
-        r = (imp_diff - self.IMP_FLOOR) / (-self.IMP_FLOOR)
-        r = max(r, self.IMP_EPSILON)
-        r = min(r, 1.0)
-        return float(r)
+        return float(self._piecewise_reward(imp_diff))
+
+    @staticmethod
+    def _piecewise_reward(imp_diff: float) -> float:
+        """Piecewise linear reward mapping."""
+        if imp_diff >= 0:
+            return 1.0
+        elif imp_diff >= -1:
+            # 陡峭段: 0 → -1 映射到 1.0 → 0.7  (slope = 0.30/IMP)
+            return 1.0 + imp_diff * 0.3
+        elif imp_diff >= -6:
+            # 中等段: -1 → -6 映射到 0.7 → 0.25  (slope = 0.09/IMP)
+            return 0.7 + (imp_diff + 1) * 0.09
+        elif imp_diff >= -13:
+            # 平缓段: -6 → -13 映射到 0.25 → 0.01
+            return 0.25 + (imp_diff + 6) * (0.24 / 7)
+        else:
+            return 0.01
 
     def _compute_imp_diff(self) -> float:
-        """计算 actual vs DDS optimal 的 IMP 差值 (≤ 0)."""
+        """
+        计算 actual vs DDS optimal (受限) 的 IMP 差值 (≤ 0).
+
+        DDS baseline 受 MAX_LEVEL 限制, 与 action mask 对齐.
+        确保模型不会因叫不到满贯而被不公平地惩罚.
+        """
         contract = self.env.state.final_contract
         dd_table = self._current_dd
         actual_score = self._compute_score(contract, dd_table, is_ns=True)
-        optimal = self._get_optimal_contract_ns(dd_table)
+        optimal = self._get_optimal_contract_ns(dd_table,
+                                                max_level=self.MAX_LEVEL)
         optimal_score = self._compute_score(optimal, dd_table, is_ns=True)
         return float(score_to_imp(actual_score - optimal_score))
 
     def _compute_eval_imp(self) -> float:
-        """评估用 IMP: actual vs DDS optimal."""
+        """评估用 IMP: actual vs DDS optimal (受限)."""
         return self._compute_imp_diff()
 
     def _compute_score(self, contract: Optional[Contract],
@@ -332,13 +414,22 @@ class StaymanSubgameEnv:
         return score
 
     @staticmethod
-    def _get_optimal_contract_ns(dd_table: np.ndarray) -> Optional[Contract]:
+    def _get_optimal_contract_ns(dd_table: np.ndarray,
+                                 max_level: int = 7) -> Optional[Contract]:
+        """
+        计算 NS 方的 DDS 最优定约.
+
+        Args:
+            dd_table: (5, 4) DDS 赢墩表
+            max_level: 最高阶数限制 (默认 7=无限制,
+                       设为 4 时与 Stayman action mask 对齐)
+        """
         best_score = 0
         best_contract = None
         for declarer in [NORTH, SOUTH]:
             for suit in range(5):
                 tricks = int(dd_table[suit, declarer])
-                for level in range(1, 8):
+                for level in range(1, max_level + 1):
                     required = 6 + level
                     if tricks >= required:
                         c = Contract(level=level, suit=suit, doubled=0,
@@ -356,3 +447,124 @@ class StaymanSubgameEnv:
     @property
     def history(self) -> List[int]:
         return self.env.state.history.copy()
+
+
+# ============================================================================
+# BC Dataset for Stayman
+# ============================================================================
+
+def create_bc_dataset_for_stayman(
+    data_path: str,
+    num_samples: int = 10000,
+    max_history_len: int = 60,
+    players: str = 'south',
+) -> list:
+    """
+    为 Stayman 子博弈生成 BC 训练数据.
+
+    对每副牌, 模拟完整 Stayman 序列 (N 规则 + S 规则),
+    采集指定玩家的决策: (obs, target_action) 对.
+
+    Args:
+        data_path: DDS 数据路径
+        num_samples: 目标样本数
+        max_history_len: 历史编码长度
+        players: 'south' = 只采 S, 'north' = 只采 N, 'both' = 采 N+S
+
+    Returns:
+        list of {'obs': dict, 'action': int}
+    """
+    loader = create_loader(data_path)
+    env = BridgeBiddingEnv(max_history_len)
+    data = []
+    collect_north = players in ('north', 'both')
+    collect_south = players in ('south', 'both')
+
+    for _ in range(num_samples * 2):
+        if len(data) >= num_samples:
+            break
+
+        hands, dd_table = loader.sample_one()
+
+        # 验证约束
+        n_hand, s_hand = hands[NORTH], hands[SOUTH]
+        n_hcp = count_hcp(n_hand)
+        s_hcp = count_hcp(s_hand)
+        if not (15 <= n_hcp <= 17 and is_balanced(n_hand)):
+            continue
+        s_h = count_suit_length(s_hand, 2)
+        s_s = count_suit_length(s_hand, 3)
+        if not (s_hcp >= 8 and (s_h >= 4 or s_s >= 4)):
+            continue
+
+        # 模拟叫牌
+        obs = env.reset(hands, dealer=NORTH, vulnerability=(False, False))
+
+        # 固定前缀: 1NT - Pass - 2C - Pass
+        done = False
+        for bid_str in ["1NT", "Pass", "2C", "Pass"]:
+            bid = string_to_bid(bid_str)
+            obs, _, done, _ = env.step(bid)
+            if done:
+                break
+        if done:
+            continue
+
+        # --- N Round 1: 回应 2C (2D/2H/2S) ---
+        n_target = north_stayman_rule(hands, env.state.history)
+        if not env._is_valid_action(n_target):
+            n_target = BID_PASS
+
+        if collect_north:
+            # N 的 Stayman mask: 只允许 2D/2H/2S
+            n_mask = np.zeros(NUM_BIDS, dtype=np.float32)
+            n_mask[string_to_bid("2D")] = 1.0
+            n_mask[string_to_bid("2H")] = 1.0
+            n_mask[string_to_bid("2S")] = 1.0
+            env_legal = env._get_legal_actions()
+            n_mask = n_mask * env_legal
+            if n_mask.sum() < 0.5:
+                n_mask[BID_PASS] = 1.0
+
+            if n_mask[n_target] > 0.5:
+                n_obs = {k: v.copy() for k, v in obs.items()}
+                n_obs['legal_actions'] = n_mask
+                data.append({'obs': n_obs, 'action': int(n_target)})
+
+        # 执行 N 的叫品
+        obs, _, done, _ = env.step(n_target)
+        if done:
+            continue
+
+        # E Pass
+        obs, _, done, _ = env.step(BID_PASS)
+        if done:
+            continue
+
+        # --- S Round 2: 再叫 ---
+        if collect_south:
+            s_target = south_stayman_rule(hands, env.state.history)
+
+            s_mask = np.zeros(NUM_BIDS, dtype=np.float32)
+            s_mask[BID_PASS] = 1.0
+            s_mask[string_to_bid("2NT")] = 1.0
+            s_mask[string_to_bid("3NT")] = 1.0
+            s_mask[string_to_bid("3H")] = 1.0
+            s_mask[string_to_bid("3S")] = 1.0
+            s_mask[string_to_bid("4H")] = 1.0
+            s_mask[string_to_bid("4S")] = 1.0
+            env_legal = env._get_legal_actions()
+            s_mask = s_mask * env_legal
+            if s_mask.sum() < 0.5:
+                s_mask[BID_PASS] = 1.0
+
+            if s_mask[s_target] > 0.5:
+                s_obs = {k: v.copy() for k, v in obs.items()}
+                s_obs['legal_actions'] = s_mask
+                data.append({'obs': s_obs, 'action': int(s_target)})
+
+    n_count = sum(1 for d in data if d['obs']['position'].argmax() == NORTH) if collect_north else 0
+    s_count = sum(1 for d in data if d['obs']['position'].argmax() == SOUTH) if collect_south else 0
+    print(f"Stayman BC dataset: {len(data)} samples "
+          f"(N={n_count}, S={s_count})")
+    return data

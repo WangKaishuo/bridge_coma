@@ -38,8 +38,10 @@ from subgames.competitive_env import (
 )
 from subgames.subgame_trainer import SubgameTrainer, SubgameConfig
 from subgames.action_mask import count_suit_length, count_hcp
+from subgames.stayman_env import create_bc_dataset_for_stayman
 from algorithms.behavioral_cloning import (
-    create_bc_dataset_for_competitive, behavioral_cloning_warmup, evaluate_pass_rate,
+    BCDataset, behavioral_cloning_warmup,
+    create_bc_dataset_for_competitive, evaluate_pass_rate,
 )
 from env import BridgeBiddingEnv, NORTH, SOUTH, string_to_bid, bid_to_string
 
@@ -76,7 +78,11 @@ class Phase2Config:
     competitive_deals_per_step: int = 32
     competitive_eval_deals: int = 500
 
-    # BC
+    # BC (Stayman)
+    stayman_bc_samples: int = 10000
+    stayman_bc_epochs: int = 15
+
+    # BC (Competitive)
     bc_num_samples: int = 30000
     bc_epochs: int = 10
 
@@ -92,21 +98,25 @@ class Phase2Config:
 
 
 # ============================================================================
-# Stage 1: Train S_base with N=rule
+# Stage 1: BC warmup + RL fine-tune (N+S jointly)
 # ============================================================================
 
 def run_stage1(config: Phase2Config) -> dict:
     """
-    Stage 1: N 硬编码规则, 只训练 S.
+    Stage 1: 联合训练 N+S base agent.
 
-    环境完全 stationary (N 的行为固定),
-    S 面对的是一个标准 contextual bandit.
+    流程:
+      1. BC warmup: 用 north/south_stayman_rule 生成 N+S 联合监督数据
+      2. RL fine-tune: N+S 联合 PPO 微调 (north_rule=False)
+
+    BC 保证 N 和 S 都从合理策略出发 (避免随机初始化导致的乱叫),
+    RL 允许 N+S 在规则覆盖不到的边界情况上联合优化.
     """
     print("=" * 60)
-    print("Stage 1: Train S_base (N=rule, S learns)")
+    print("Stage 1: Train N+S base (BC warmup + RL fine-tune)")
     print("=" * 60)
 
-    env = StaymanSubgameEnv(config.stayman_data, north_rule=True)
+    env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
 
     sub_config = SubgameConfig(
         num_steps=config.stage1_steps,
@@ -115,10 +125,34 @@ def run_stage1(config: Phase2Config) -> dict:
         use_info_bonus=False,
         lr=1e-4,
         device=config.device,
-        active_players=[SOUTH],  # Only S learns
+        active_players=[NORTH, SOUTH],  # Both learn
     )
     trainer = SubgameTrainer(env, sub_config)
 
+    # --- BC Warmup (N+S) ---
+    print("\n--- BC Warmup (N+S rules) ---")
+    bc_data = create_bc_dataset_for_stayman(
+        config.stayman_data,
+        num_samples=config.stayman_bc_samples,
+        players='both',
+    )
+    bc_dataset = BCDataset(bc_data)
+    bc_stats = behavioral_cloning_warmup(
+        trainer.agent,
+        bc_dataset,
+        epochs=config.stayman_bc_epochs,
+        lr=1e-3,
+        batch_size=256,
+    )
+    print(f"  BC result: loss={bc_stats['final_loss']:.4f}, "
+          f"acc={bc_stats['final_acc']:.3f}")
+
+    # BC 后诊断
+    print("\n--- Post-BC Diagnostics ---")
+    post_bc_diag = _run_diagnostics(env, trainer, config.diag_deals)
+
+    # --- RL Fine-tune ---
+    print("\n--- RL Fine-tune ---")
     t0 = time.time()
     log = trainer.train()
     train_time = time.time() - t0
@@ -130,6 +164,7 @@ def run_stage1(config: Phase2Config) -> dict:
         'mean_imp': eval_results['mean_imp'],
         'std_imp': eval_results['std_imp'],
         'train_time_sec': train_time,
+        'bc_stats': bc_stats,
         'final_log': log[-1] if log else {},
     }
 
@@ -148,7 +183,7 @@ def run_stage1(config: Phase2Config) -> dict:
 # Stage 1.5: Belief Network Pre-training
 # ============================================================================
 
-def run_belief_pretrain(config: Phase2Config, s_base_trainer: SubgameTrainer) -> dict:
+def run_belief_pretrain(config: Phase2Config, base_trainer: SubgameTrainer) -> dict:
     """
     Stage 1.5: 用 Stage 1 的 rollout 数据预训练 Belief Network.
 
@@ -160,11 +195,11 @@ def run_belief_pretrain(config: Phase2Config, s_base_trainer: SubgameTrainer) ->
     print("Stage 1.5: Belief Network Pre-training")
     print("=" * 60)
 
-    env = StaymanSubgameEnv(config.stayman_data, north_rule=True)
+    env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
 
-    # 收集大量 rollout 数据 (用 S_base 的策略)
+    # 收集大量 rollout 数据 (用 base agent 的策略)
     print(f"  Collecting {config.belief_pretrain_deals} rollout episodes...")
-    episodes = s_base_trainer.collect_episodes(config.belief_pretrain_deals)
+    episodes = base_trainer.collect_episodes(config.belief_pretrain_deals)
 
     # 创建一个临时 trainer 来训练 belief (带 info bonus 配置)
     sub_config = SubgameConfig(
@@ -215,10 +250,12 @@ def run_belief_pretrain(config: Phase2Config, s_base_trainer: SubgameTrainer) ->
 # Stage 2: Divergent fine-tuning (A vs B)
 # ============================================================================
 
-def run_stage2(config: Phase2Config, s_base_trainer: SubgameTrainer,
+def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                belief_pretrain: dict = None) -> dict:
     """
-    Stage 2: 加载 S_base, 解冻 N, 分支微调.
+    Stage 2: 加载 base agent (N+S), 分支微调.
+
+    Stage 1 已联合训练了 N+S, 这里直接加载权重作为起跑线.
 
     Agent A: MAPPO (control)
     Agent B: MAPPO + r_info (β=0), belief net 从预训练权重初始化
@@ -227,8 +264,7 @@ def run_stage2(config: Phase2Config, s_base_trainer: SubgameTrainer,
     print("Stage 2: Divergent Fine-tuning (A=MAPPO vs B=MAPPO+r_info)")
     print("=" * 60)
 
-    # 保存 S_base 权重
-    s_base_state = copy.deepcopy(s_base_trainer.agent.model.state_dict())
+    base_state = copy.deepcopy(base_trainer.agent.model.state_dict())
     belief_state = belief_pretrain['belief_state'] if belief_pretrain else None
 
     results = {}
@@ -239,7 +275,6 @@ def run_stage2(config: Phase2Config, s_base_trainer: SubgameTrainer,
     ]:
         print(f"\n--- Stage 2: {name} ---")
 
-        # 创建新环境: north_rule=False (N 由 agent 决策)
         env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
 
         sub_config = SubgameConfig(
@@ -248,17 +283,16 @@ def run_stage2(config: Phase2Config, s_base_trainer: SubgameTrainer,
             accumulate_steps=config.stage2_accumulate,
             use_info_bonus=use_info,
             beta=beta,
-            lr=5e-5,  # 微调用更小 lr
+            lr=5e-5,
             device=config.device,
-            active_players=[NORTH, SOUTH],  # Both learn
-            # Belief warmup 大幅降低: 预训练已完成, 只做微调
+            active_players=[NORTH, SOUTH],
             belief_warmup_steps=100 if use_info else 0,
         )
         trainer = SubgameTrainer(env, sub_config)
 
-        # 加载 S_base 权重 (公平起跑线)
-        trainer.agent.model.load_state_dict(s_base_state)
-        print(f"  Loaded S_base weights")
+        # 加载 base agent 权重 (N+S 都已训练过)
+        trainer.agent.model.load_state_dict(base_state)
+        print(f"  Loaded base agent weights (N+S)")
 
         # 加载预训练的 belief net 权重
         if use_info and belief_state is not None and trainer.belief_net is not None:
@@ -686,6 +720,9 @@ def run_phase2(config: Phase2Config) -> dict:
     stage1 = run_stage1(config)
     report['stage1'] = stage1['results']
 
+    # Save S_base checkpoint
+    _save_checkpoint(stage1['trainer'], output_dir / "s_base.pt", "S_base")
+
     # Stage 1.5: Belief pre-training
     belief_pretrain = run_belief_pretrain(config, stage1['trainer'])
     report['belief_pretrain'] = belief_pretrain['results']
@@ -696,6 +733,12 @@ def run_phase2(config: Phase2Config) -> dict:
         name: {k: v for k, v in data.items() if k != '_trainer'}
         for name, data in stage2.items()
     }
+
+    # Save Stage 2 checkpoints
+    for name in ['A_control', 'B_partner_only']:
+        trainer = stage2[name].get('_trainer')
+        if trainer:
+            _save_checkpoint(trainer, output_dir / f"{name}.pt", name)
 
     # Stage 3: Analysis
     stage3 = run_stage3(config, stage1, stage2)
@@ -710,6 +753,17 @@ def run_phase2(config: Phase2Config) -> dict:
     print(f"\nReport saved to {report_path}")
 
     return report
+
+
+def _save_checkpoint(trainer, path: Path, name: str):
+    """保存模型权重 (policy + belief)."""
+    ckpt = {
+        'model': trainer.agent.model.state_dict(),
+    }
+    if trainer.belief_net is not None:
+        ckpt['belief_net'] = trainer.belief_net.state_dict()
+    torch.save(ckpt, path)
+    print(f"  💾 Saved {name} checkpoint → {path}")
 
 
 def _save_json(data: dict, path: Path):
@@ -765,6 +819,8 @@ def main():
         config.stage2_steps = 300
         config.eval_deals = 50
         config.diag_deals = 100
+        config.stayman_bc_samples = 1000
+        config.stayman_bc_epochs = 3
         config.belief_pretrain_deals = 200
         config.belief_pretrain_epochs = 5
         print("⚡ Quick mode: reduced steps for testing")

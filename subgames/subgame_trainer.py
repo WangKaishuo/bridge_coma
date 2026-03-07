@@ -56,6 +56,9 @@ class SubgameConfig:
     num_epochs: int = 4
     batch_size: int = 64
     entropy_coef: float = 0.01
+    entropy_coef_start: float = 0.05   # 探索期高 entropy (防止早期坍缩)
+    entropy_coef_end: float = 0.01     # 收敛期低 entropy
+    entropy_anneal_frac: float = 0.5   # 前 50% 步数做退火
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -118,6 +121,7 @@ class SubgameTrainer:
             self.opponent_stats = RunningStats()
 
         self.log = []
+        self._current_step = 0  # 当前训练步数, 用于 entropy annealing
 
     def get_lambda(self, step: int) -> float:
         cfg = self.config
@@ -126,6 +130,22 @@ class SubgameTrainer:
         progress = min(1.0, (step - cfg.belief_warmup_steps) /
                        max(1, cfg.num_steps - cfg.belief_warmup_steps))
         return cfg.lambda_start + (cfg.lambda_end - cfg.lambda_start) * progress
+
+    def get_entropy_coef(self, step: int) -> float:
+        """
+        Entropy coefficient annealing.
+
+        前 entropy_anneal_frac 的步数: 从 entropy_coef_start 线性退到 entropy_coef_end.
+        之后: 固定为 entropy_coef_end.
+
+        防止 PPO 在小动作空间 (Stayman 7 choices) 中过早坍缩到单一动作.
+        """
+        cfg = self.config
+        anneal_steps = int(cfg.num_steps * cfg.entropy_anneal_frac)
+        if step >= anneal_steps:
+            return cfg.entropy_coef_end
+        progress = step / max(1, anneal_steps)
+        return cfg.entropy_coef_start + (cfg.entropy_coef_end - cfg.entropy_coef_start) * progress
 
     # ====================================================================
     # Rollout collection
@@ -228,9 +248,11 @@ class SubgameTrainer:
         完全替代 agent.update(), 增加:
         - 只更新 active_players
         - 稳健 advantage 归一化 (防 std=0 NaN)
+        - Entropy coefficient annealing (防止小动作空间早期坍缩)
         """
         agent = self.agent
         min_size = self.config.min_buffer_size
+        ent_coef = self.get_entropy_coef(self._current_step)
 
         total_loss = total_policy = total_value = total_entropy = num_updates = 0
 
@@ -281,7 +303,7 @@ class SubgameTrainer:
 
                     loss = (policy_loss
                             + agent.config.value_coef * value_loss
-                            - agent.config.entropy_coef * entropy.mean())
+                            - ent_coef * entropy.mean())
 
                     agent.optimizer.zero_grad()
                     loss.backward()
@@ -306,6 +328,7 @@ class SubgameTrainer:
             'policy_loss': total_policy / num_updates,
             'value_loss': total_value / num_updates,
             'entropy': total_entropy / num_updates,
+            'entropy_coef': ent_coef,
         }
 
     # ====================================================================
@@ -464,8 +487,10 @@ class SubgameTrainer:
               f"effective_deals/update={eff_deals}")
 
         all_episodes_window = []
+        latest_update_stats = {}  # 缓存最新 PPO update 指标
 
         for step in range(1, cfg.num_steps + 1):
+            self._current_step = step
             episodes = self.collect_episodes(cfg.deals_per_step)
             all_episodes_window.extend(episodes)
 
@@ -476,32 +501,50 @@ class SubgameTrainer:
             self.store_episodes(episodes)
 
             # PPO update every accumulate_steps
-            update_stats = {}
             if step % cfg.accumulate_steps == 0:
-                update_stats = self.safe_update()
+                stats = self.safe_update()
+                if stats:
+                    latest_update_stats = stats
 
             # Logging
             if step % cfg.log_interval == 0:
                 rewards = [ep['final_reward'] for ep in all_episodes_window]
+                rw_arr = np.array(rewards) if rewards else np.array([0.0])
                 info_metrics = self.compute_info_bonus_for_episodes(episodes) \
                     if cfg.use_info_bonus else {}
 
                 entry = {
                     'step': step,
-                    'mean_reward': float(np.mean(rewards)) if rewards else 0,
-                    'std_reward': float(np.std(rewards)) if rewards else 0,
+                    'mean_reward': float(rw_arr.mean()),
+                    'std_reward': float(rw_arr.std()),
+                    'p25_reward': float(np.percentile(rw_arr, 25)),
+                    'p75_reward': float(np.percentile(rw_arr, 75)),
                     'belief_loss': float(belief_loss),
                     'lambda': self.get_lambda(step),
                     **info_metrics,
-                    **(update_stats or {}),
+                    **latest_update_stats,
                 }
                 self.log.append(entry)
 
                 if step % cfg.eval_interval == 0:
-                    print(f"  [Step {step}/{cfg.num_steps}] "
-                          f"reward={entry['mean_reward']:+.2f}±{entry['std_reward']:.2f} "
-                          f"belief_loss={belief_loss:.4f} "
-                          f"info_ratio={entry.get('info_ratio', 'N/A')}")
+                    # 紧凑的多指标日志行
+                    ent_str = f"ent={entry.get('entropy', 0):.2f}"
+                    ec_str = f"ec={entry.get('entropy_coef', 0):.3f}"
+                    vl_str = f"vl={entry.get('value_loss', 0):.3f}"
+                    pl_str = f"pl={entry.get('policy_loss', 0):.3f}"
+                    p25 = entry['p25_reward']
+                    p75 = entry['p75_reward']
+
+                    line = (f"  [Step {step}/{cfg.num_steps}] "
+                            f"r={entry['mean_reward']:+.2f}±{entry['std_reward']:.2f} "
+                            f"[p25={p25:.2f} p75={p75:.2f}] "
+                            f"{ent_str} {ec_str} {vl_str} {pl_str}")
+
+                    if cfg.use_info_bonus:
+                        line += (f" bl={belief_loss:.4f}"
+                                 f" ir={entry.get('info_ratio', 'N/A')}")
+
+                    print(line)
 
                 all_episodes_window = []
 
