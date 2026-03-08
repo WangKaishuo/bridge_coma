@@ -62,6 +62,14 @@ class SubgameConfig:
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
 
+    # KL Anchor: 限制 RL 策略偏离 BC 策略的程度
+    # loss += kl_lambda * KL(pi_current || pi_bc)
+    # kl_lambda 从 kl_lambda_start 线性退火到 kl_lambda_end
+    # 设 0.0 = 关闭 (向后兼容)
+    kl_lambda_start: float = 0.0
+    kl_lambda_end: float = 0.0
+    kl_anneal_frac: float = 1.0        # KL 退火覆盖的训练比例
+
     # Single-step (Contextual Bandit) mode
     # 当 episode 中每个 player 仅做 1-2 步决策时启用.
     # 用 batch-mean baseline 替代 GAE, 断开 Critic 梯度.
@@ -126,8 +134,40 @@ class SubgameTrainer:
             self.partner_stats = RunningStats()
             self.opponent_stats = RunningStats()
 
+        # BC anchor model (frozen reference, 用于 KL penalty)
+        # 由外部调用者通过 set_bc_anchor() 设置
+        self.bc_model = None
+
         self.log = []
         self._current_step = 0  # 当前训练步数, 用于 entropy annealing
+
+    def set_bc_anchor(self, state_dict: dict):
+        """
+        设置 BC 锚点模型 (Stage 1 结束时的快照).
+
+        调用后, safe_update() 会在 loss 中加入 KL 惩罚项:
+          loss += kl_lambda * KL(pi_current || pi_bc)
+
+        只需要 Actor 部分计算参考 logits, 不需要 Critic.
+        从完整 state_dict 中提取 actor.* 前缀的参数即可,
+        避免 centralized_critic 结构不匹配的问题.
+        """
+        from networks.policy_net import PolicyNetwork
+        self.bc_model = PolicyNetwork(
+            hand_dim=self.config.hand_dim,
+            history_dim=self.config.history_dim,
+            hidden_dim=self.config.hidden_dim,
+        ).to(self.device)
+        # 从完整 ActorCritic state_dict 中提取 actor.* 参数
+        actor_state = {
+            k[len('actor.'):]: v
+            for k, v in state_dict.items()
+            if k.startswith('actor.')
+        }
+        self.bc_model.load_state_dict(actor_state)
+        self.bc_model.eval()
+        for p in self.bc_model.parameters():
+            p.requires_grad_(False)
 
     def get_lambda(self, step: int) -> float:
         cfg = self.config
@@ -152,6 +192,23 @@ class SubgameTrainer:
             return cfg.entropy_coef_end
         progress = step / max(1, anneal_steps)
         return cfg.entropy_coef_start + (cfg.entropy_coef_end - cfg.entropy_coef_start) * progress
+
+    def get_kl_lambda(self, step: int) -> float:
+        """
+        KL 锚定系数退火.
+
+        从 kl_lambda_start 线性退到 kl_lambda_end,
+        在 kl_anneal_frac 比例的步数内完成.
+        这让训练前期严格锚定 BC, 后期逐渐放松让策略演化.
+        """
+        cfg = self.config
+        if cfg.kl_lambda_start == 0.0:
+            return 0.0
+        anneal_steps = int(cfg.num_steps * cfg.kl_anneal_frac)
+        if step >= anneal_steps:
+            return cfg.kl_lambda_end
+        progress = step / max(1, anneal_steps)
+        return cfg.kl_lambda_start + (cfg.kl_lambda_end - cfg.kl_lambda_start) * progress
 
     # ====================================================================
     # Rollout collection
@@ -258,13 +315,18 @@ class SubgameTrainer:
         - Entropy coefficient annealing (防止小动作空间早期坍缩)
         - single_step 模式: 用 batch-mean baseline 替代 GAE,
           断开 Critic 梯度, 防止 Value Loss 爆炸污染共享编码器
+        - KL Anchor (可选): loss += kl_lambda * KL(pi_current || pi_bc)
+          防止 RL 摧毁 BC 策略 (如退化为无脑 4M)
         """
         agent = self.agent
         min_size = self.config.min_buffer_size
         ent_coef = self.get_entropy_coef(self._current_step)
+        kl_lambda = self.get_kl_lambda(self._current_step)
         is_single = self.config.single_step
+        use_kl = (kl_lambda > 0.0 and self.bc_model is not None)
 
         total_loss = total_policy = total_value = total_entropy = num_updates = 0
+        total_kl = 0.0
 
         for player in range(NUM_PLAYERS):
             buffer = agent.buffers[player]
@@ -327,9 +389,49 @@ class SubgameTrainer:
                                     1 + agent.config.clip_ratio) * adv
                     ).mean()
 
+                    # ====================================================
+                    # KL Anchor: KL(pi_current || pi_bc)
+                    # 目的: 防止 RL 摧毁 BC 学到的策略
+                    # 数学: 用当前网络和 BC 参考网络对同一 obs 计算 logits,
+                    #       以 F.kl_div 计算散度并加入 loss
+                    # ====================================================
+                    kl_loss = torch.tensor(0.0, device=self.device)
+                    if use_kl:
+                        with torch.no_grad():
+                            # bc_model 是 PolicyNetwork, 直接调用即返回 raw logits
+                            bc_logits = self.bc_model(batch['obs'])
+                            # curr_logits 也在 no_grad 里计算:
+                            # KL 不应该产生独立的梯度路径回 actor.
+                            # policy_loss 已经通过 ratio*adv 传递梯度了.
+                            # 双路径会导致 logits 数值爆炸 → NaN.
+                            curr_logits_kl = agent.model.actor(batch['obs'])
+
+                        MASK_VAL = -1e9
+                        if 'legal_actions' in batch['obs']:
+                            legal = batch['obs']['legal_actions']
+                            illegal = (legal < 0.5)
+                            bc_logits = bc_logits.masked_fill(illegal, MASK_VAL)
+                            curr_logits_kl = curr_logits_kl.masked_fill(illegal, MASK_VAL)
+
+                        bc_log_probs = F.log_softmax(bc_logits, dim=-1)
+                        curr_log_probs_kl = F.log_softmax(curr_logits_kl, dim=-1)
+                        curr_probs_kl = curr_log_probs_kl.exp()
+
+                        # KL(curr || bc) = F.kl_div(input=log_bc, target=curr_probs)
+                        kl_loss = F.kl_div(
+                            bc_log_probs,
+                            curr_probs_kl,
+                            reduction='batchmean',
+                            log_target=False,
+                        )
+                        if not torch.isfinite(kl_loss):
+                            kl_loss = torch.tensor(0.0, device=self.device)
+
                     # Loss: single_step → 断开 Critic 梯度 (value_coef=0)
                     if is_single:
-                        loss = policy_loss - ent_coef * entropy.mean()
+                        loss = (policy_loss
+                                - ent_coef * entropy.mean()
+                                + kl_lambda * kl_loss)
                         value_loss_val = 0.0
                     else:
                         values = agent.model.critic(
@@ -337,7 +439,8 @@ class SubgameTrainer:
                         value_loss = F.mse_loss(values, batch['returns'])
                         loss = (policy_loss
                                 + agent.config.value_coef * value_loss
-                                - ent_coef * entropy.mean())
+                                - ent_coef * entropy.mean()
+                                + kl_lambda * kl_loss)
                         value_loss_val = value_loss.item()
 
                     agent.optimizer.zero_grad()
@@ -351,6 +454,7 @@ class SubgameTrainer:
                     total_policy += policy_loss.item()
                     total_value += value_loss_val
                     total_entropy += entropy.mean().item()
+                    total_kl += kl_loss.item()
                     num_updates += 1
 
             buffer.reset()
@@ -364,6 +468,8 @@ class SubgameTrainer:
             'value_loss': total_value / num_updates,
             'entropy': total_entropy / num_updates,
             'entropy_coef': ent_coef,
+            'kl_loss': total_kl / num_updates,
+            'kl_lambda': kl_lambda,
         }
 
     # ====================================================================
@@ -576,6 +682,12 @@ class SubgameTrainer:
                             f"r={entry['mean_reward']:+.2f}±{entry['std_reward']:.2f} "
                             f"[p25={p25:.2f} p75={p75:.2f}] "
                             f"{ent_str} {ec_str} {vl_str} {pl_str}")
+
+                    # KL anchor 监控
+                    kl_val = entry.get('kl_loss', 0)
+                    kl_lam = entry.get('kl_lambda', 0)
+                    if kl_lam > 0:
+                        line += f" kl={kl_val:.4f}(λ={kl_lam:.3f})"
 
                     if cfg.use_info_bonus:
                         line += (f" bl={belief_loss:.4f}"

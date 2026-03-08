@@ -78,9 +78,15 @@ class Phase2Config:
     stage2_accumulate: int = 8         # 256 deals/update
     stage2_lr: float = 3e-5            # 交替阶段用
     stage2_lr_joint: float = 1e-5      # 联合微调用
-    stage2_entropy_start: float = 0.05 # 防 3-action 坍缩
-    stage2_entropy_end: float = 0.02
+    stage2_entropy_start: float = 0.10 # 每轮重置到此值 (防 3-action 坍缩)
+    stage2_entropy_end: float = 0.05   # 每轮退火终点
     stage2_entropy_anneal: float = 0.8 # 延后退火
+
+    # KL Anchor: Stage 2 中限制 RL 策略偏离 BC 的程度
+    # 前两轮强锚定, 后两轮逐渐放松
+    stage2_kl_lambda_start: float = 0.5  # 初始 KL 系数
+    stage2_kl_lambda_end: float = 0.1    # 退火终点
+    stage2_kl_anneal_frac: float = 1.0   # 覆盖整个训练过程退火
 
     # Competitive
     competitive_steps: int = 5000
@@ -268,7 +274,9 @@ def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
                      active_players: list, use_info: bool = False,
                      beta: float = 0.0, belief_warmup: int = 0,
                      entropy_start: float = None,
-                     entropy_end: float = None) -> SubgameConfig:
+                     entropy_end: float = None,
+                     kl_lambda_start: float = None,
+                     kl_lambda_end: float = None) -> SubgameConfig:
     """构建单阶段 SubgameConfig 的 helper."""
     return SubgameConfig(
         num_steps=num_steps,
@@ -281,9 +289,13 @@ def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
         active_players=active_players,
         single_step=True,
         belief_warmup_steps=belief_warmup,
-        entropy_coef_start=entropy_start or config.stage2_entropy_start,
-        entropy_coef_end=entropy_end or config.stage2_entropy_end,
+        entropy_coef_start=entropy_start if entropy_start is not None else config.stage2_entropy_start,
+        entropy_coef_end=entropy_end if entropy_end is not None else config.stage2_entropy_end,
         entropy_anneal_frac=config.stage2_entropy_anneal,
+        # KL anchor: 每个半轮独立退火 (每轮重新从 kl_lambda_start 开始)
+        kl_lambda_start=kl_lambda_start if kl_lambda_start is not None else config.stage2_kl_lambda_start,
+        kl_lambda_end=kl_lambda_end if kl_lambda_end is not None else config.stage2_kl_lambda_end,
+        kl_anneal_frac=config.stage2_kl_anneal_frac,
         eval_interval=100,
         log_interval=20,
     )
@@ -291,14 +303,21 @@ def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
 
 def _run_one_phase(config: Phase2Config, env, sub_config: SubgameConfig,
                    prev_state: dict, belief_state: dict = None,
+                   bc_state: dict = None,
                    phase_label: str = "") -> Tuple:
     """
     运行一个训练阶段, 返回 (trainer, log, eval_results).
 
     加载 prev_state 权重, 可选加载 belief_state.
+    若提供 bc_state, 注入 KL anchor (防 RL 摧毁 BC 策略).
     """
     trainer = SubgameTrainer(env, sub_config)
     trainer.agent.model.load_state_dict(prev_state)
+
+    # 注入 KL anchor: BC 快照 = Stage 1 结束时的参数
+    # 每个半轮重新注入同一个 bc_state, 确保 anchor 始终指向 BC 分布
+    if bc_state is not None and sub_config.kl_lambda_start > 0.0:
+        trainer.set_bc_anchor(bc_state)
 
     if sub_config.use_info_bonus and belief_state and trainer.belief_net is not None:
         trainer.belief_net.load_state_dict(belief_state)
@@ -345,6 +364,8 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
 
     base_state = copy.deepcopy(base_trainer.agent.model.state_dict())
     belief_state = belief_pretrain['belief_state'] if belief_pretrain else None
+    # BC 快照: Stage 1 结束时的参数, 用于 KL anchor
+    bc_state = copy.deepcopy(base_state)
 
     results = {}
 
@@ -378,10 +399,14 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 config, config.stage2_alt_steps, config.stage2_lr,
                 active_players=[SOUTH],
                 use_info=False,  # S 阶段不用 info bonus
+                # entropy 每轮重置到 start (不跨轮退火)
+                entropy_start=config.stage2_entropy_start,
+                entropy_end=config.stage2_entropy_end,
             )
 
             trainer_s, _, eval_s = _run_one_phase(
                 config, env_s, cfg_s, current_state,
+                bc_state=bc_state,
                 phase_label=f"R{rnd} S-phase",
             )
             current_state = copy.deepcopy(trainer_s.agent.model.state_dict())
@@ -395,11 +420,15 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 use_info=use_info,  # B 在 N-phase 用 info bonus
                 beta=beta,
                 belief_warmup=30 if (use_info and rnd == 1) else 0,
+                # entropy 每轮重置到 start
+                entropy_start=config.stage2_entropy_start,
+                entropy_end=config.stage2_entropy_end,
             )
 
             trainer_n, log_n, eval_n = _run_one_phase(
                 config, env_n, cfg_n, current_state,
                 belief_state=current_belief,
+                bc_state=bc_state,
                 phase_label=f"R{rnd} N-phase",
             )
             current_state = copy.deepcopy(trainer_n.agent.model.state_dict())
@@ -429,11 +458,15 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
             # 联合阶段: 低 entropy, 不退火
             entropy_start=config.stage2_entropy_end,
             entropy_end=config.stage2_entropy_end,
+            # 联合阶段: KL 系数降至 end 值 (策略已稳定, 轻锚定)
+            kl_lambda_start=config.stage2_kl_lambda_end,
+            kl_lambda_end=config.stage2_kl_lambda_end,
         )
 
         trainer_j, log_j, eval_j = _run_one_phase(
             config, env_j, cfg_j, current_state,
             belief_state=current_belief,
+            bc_state=bc_state,
             phase_label="Joint",
         )
 

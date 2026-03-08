@@ -100,14 +100,20 @@ def deal_constrained_stayman(rng: np.random.Generator) -> Optional[np.ndarray]:
     生成符合 Stayman 约束的牌.
 
     N: 15-17 HCP, 均型 (无单缺)
-    S: 8+ HCP, 至少有 4 张高花 (H 或 S)
+    S: 8-10 HCP, 至少有 4 张高花 (H 或 S)
+
+    S 点力上限 10 的理由:
+    NS 合计 23-27 HCP 时, 将牌张数对定约选择影响最显著:
+    - 4-4 配合: 4M 明显优于 3NT
+    - 无配合: 3NT 几乎必然最优
+    高点力局面 (S 11+) 下 4-3 配合也可成局, DDS 标注 4M, 污染标签分布.
 
     Returns:
         hands: (4, 52) one-hot, 或 None 如果尝试失败
     """
     deck = np.arange(52)
     
-    for _ in range(1000):  # ~3% acceptance → ~30 expected tries
+    for _ in range(2000):  # 接受率约 1.7%, 期望约 59 次; 加大上限保险
         rng.shuffle(deck)
         hands = np.zeros((4, 52), dtype=np.float32)
         for i, card in enumerate(deck):
@@ -123,9 +129,10 @@ def deal_constrained_stayman(rng: np.random.Generator) -> Optional[np.ndarray]:
         if not is_balanced(n_hand):
             continue
 
-        # Check S: 8+ HCP, 4+ major
+        # Check S: 8-10 HCP, 4+ major
+        # 上限 10: 排除高点力局面 (NS 合计 25-27+ HCP 时将牌约束失效)
         s_hcp = count_hcp(s_hand)
-        if s_hcp < 8:
+        if not (8 <= s_hcp <= 10):
             continue
         s_h = suit_length(s_hand, 2)
         s_s = suit_length(s_hand, 3)
