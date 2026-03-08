@@ -26,6 +26,7 @@ import copy
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import Counter
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -58,8 +59,8 @@ class Phase2Config:
     device: str = "cpu"
     output_dir: str = "results/"
 
-    # Stage 1: Train S_base (N=rule, only S learns)
-    stage1_steps: int = 5000
+    # Stage 1: BC warmup + optional RL fine-tune
+    stage1_steps: int = 0             # 0 = 纯 BC (推荐), >0 = BC 后 RL 微调
     stage1_deals_per_step: int = 32
     stage1_accumulate: int = 4
 
@@ -68,10 +69,18 @@ class Phase2Config:
     belief_pretrain_epochs: int = 20
     belief_pretrain_target_acc: float = 0.80
 
-    # Stage 2: Joint fine-tune (N+S both learn)
-    stage2_steps: int = 3000
+    # Stage 2: Alternating fine-tune (single_step, batch-mean baseline)
+    # S-N-S-N... 交替训练 + 联合微调收尾
+    stage2_alt_rounds: int = 4         # 交替轮数 (每轮 = 1×S + 1×N)
+    stage2_alt_steps: int = 200        # 每个半轮的步数
+    stage2_joint_steps: int = 400      # 最终联合微调步数
     stage2_deals_per_step: int = 32
-    stage2_accumulate: int = 4
+    stage2_accumulate: int = 8         # 256 deals/update
+    stage2_lr: float = 3e-5            # 交替阶段用
+    stage2_lr_joint: float = 1e-5      # 联合微调用
+    stage2_entropy_start: float = 0.05 # 防 3-action 坍缩
+    stage2_entropy_end: float = 0.02
+    stage2_entropy_anneal: float = 0.8 # 延后退火
 
     # Competitive
     competitive_steps: int = 5000
@@ -151,11 +160,16 @@ def run_stage1(config: Phase2Config) -> dict:
     print("\n--- Post-BC Diagnostics ---")
     post_bc_diag = _run_diagnostics(env, trainer, config.diag_deals)
 
-    # --- RL Fine-tune ---
-    print("\n--- RL Fine-tune ---")
-    t0 = time.time()
-    log = trainer.train()
-    train_time = time.time() - t0
+    # --- RL Fine-tune (optional) ---
+    log = []
+    train_time = 0.0
+    if config.stage1_steps > 0:
+        print("\n--- RL Fine-tune ---")
+        t0 = time.time()
+        log = trainer.train()
+        train_time = time.time() - t0
+    else:
+        print("\n--- Skipping RL fine-tune (stage1_steps=0, pure BC) ---")
 
     # Evaluate
     eval_results = _evaluate_stayman_full(env, trainer, config.eval_deals)
@@ -247,21 +261,86 @@ def run_belief_pretrain(config: Phase2Config, base_trainer: SubgameTrainer) -> d
 
 
 # ============================================================================
-# Stage 2: Divergent fine-tuning (A vs B)
+# Stage 2: Alternating fine-tuning (A vs B)
 # ============================================================================
+
+def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
+                     active_players: list, use_info: bool = False,
+                     beta: float = 0.0, belief_warmup: int = 0,
+                     entropy_start: float = None,
+                     entropy_end: float = None) -> SubgameConfig:
+    """构建单阶段 SubgameConfig 的 helper."""
+    return SubgameConfig(
+        num_steps=num_steps,
+        deals_per_step=config.stage2_deals_per_step,
+        accumulate_steps=config.stage2_accumulate,
+        use_info_bonus=use_info,
+        beta=beta,
+        lr=lr,
+        device=config.device,
+        active_players=active_players,
+        single_step=True,
+        belief_warmup_steps=belief_warmup,
+        entropy_coef_start=entropy_start or config.stage2_entropy_start,
+        entropy_coef_end=entropy_end or config.stage2_entropy_end,
+        entropy_anneal_frac=config.stage2_entropy_anneal,
+        eval_interval=100,
+        log_interval=20,
+    )
+
+
+def _run_one_phase(config: Phase2Config, env, sub_config: SubgameConfig,
+                   prev_state: dict, belief_state: dict = None,
+                   phase_label: str = "") -> Tuple:
+    """
+    运行一个训练阶段, 返回 (trainer, log, eval_results).
+
+    加载 prev_state 权重, 可选加载 belief_state.
+    """
+    trainer = SubgameTrainer(env, sub_config)
+    trainer.agent.model.load_state_dict(prev_state)
+
+    if sub_config.use_info_bonus and belief_state and trainer.belief_net is not None:
+        trainer.belief_net.load_state_dict(belief_state)
+
+    log = trainer.train()
+
+    # 评估 (用 north_rule=False env 以测试 N+S agent 策略)
+    eval_env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+    eval_results = _evaluate_stayman_full(eval_env, trainer, config.eval_deals)
+
+    if phase_label:
+        print(f"    {phase_label}: IMP={eval_results['mean_imp']:+.2f}"
+              f"±{eval_results['std_imp']:.2f}")
+
+    return trainer, log, eval_results
+
 
 def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                belief_pretrain: dict = None) -> dict:
     """
-    Stage 2: 加载 base agent (N+S), 分支微调.
+    Stage 2: Alternating fine-tuning (Iterated Best Response).
 
-    Stage 1 已联合训练了 N+S, 这里直接加载权重作为起跑线.
+    交替训练解决 N↔S 同时变化的 credit assignment 问题:
 
-    Agent A: MAPPO (control)
-    Agent B: MAPPO + r_info (β=0), belief net 从预训练权重初始化
+      Round 1: S learns (N=BC frozen) → N learns (S=round1 frozen)
+      Round 2: S learns (N=round1)    → N learns (S=round2)
+      ...
+      Round K: S learns → N learns
+      Final:   N+S joint fine-tune (low lr)
+
+    每个半轮, 非 active player 由 agent 以 deterministic 模式执行
+    (SubgameTrainer.collect_episodes 中 non-active player 路径).
+    第一轮 S 训练时 N 用 north_rule=True (规则策略),
+    后续轮次全部用 north_rule=False (agent 策略).
+
+    A (control) 和 B (r_info) 各自独立跑完整流程.
     """
     print("\n" + "=" * 60)
-    print("Stage 2: Divergent Fine-tuning (A=MAPPO vs B=MAPPO+r_info)")
+    print("Stage 2: Alternating Fine-tuning")
+    print(f"  {config.stage2_alt_rounds} rounds × {config.stage2_alt_steps} steps"
+          f" + {config.stage2_joint_steps} joint")
+    print("  A=MAPPO (control) vs B=MAPPO+r_info")
     print("=" * 60)
 
     base_state = copy.deepcopy(base_trainer.agent.model.state_dict())
@@ -273,46 +352,101 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
         ("A_control", False, 0.0),
         ("B_partner_only", True, 0.0),
     ]:
-        print(f"\n--- Stage 2: {name} ---")
+        print(f"\n{'─'*60}")
+        print(f"  Agent: {name}")
+        print(f"{'─'*60}")
 
-        env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+        current_state = copy.deepcopy(base_state)
+        current_belief = copy.deepcopy(belief_state) if belief_state else None
+        round_imps = []
 
-        sub_config = SubgameConfig(
-            num_steps=config.stage2_steps,
-            deals_per_step=config.stage2_deals_per_step,
-            accumulate_steps=config.stage2_accumulate,
-            use_info_bonus=use_info,
-            beta=beta,
-            lr=5e-5,
-            device=config.device,
+        # ================================================================
+        # 交替轮次: S → N → S → N → ...
+        # ================================================================
+        for rnd in range(1, config.stage2_alt_rounds + 1):
+            print(f"\n  ── Round {rnd}/{config.stage2_alt_rounds} ──")
+
+            # --- S phase: 训 S, 冻结 N ---
+            if rnd == 1:
+                # 第一轮: N 用规则策略 (最稳定的起点)
+                env_s = StaymanSubgameEnv(config.stayman_data, north_rule=True)
+            else:
+                # 后续轮: N 用 agent 策略 (上轮训好的)
+                env_s = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+
+            cfg_s = _make_sub_config(
+                config, config.stage2_alt_steps, config.stage2_lr,
+                active_players=[SOUTH],
+                use_info=False,  # S 阶段不用 info bonus
+            )
+
+            trainer_s, _, eval_s = _run_one_phase(
+                config, env_s, cfg_s, current_state,
+                phase_label=f"R{rnd} S-phase",
+            )
+            current_state = copy.deepcopy(trainer_s.agent.model.state_dict())
+
+            # --- N phase: 训 N, 冻结 S ---
+            env_n = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+
+            cfg_n = _make_sub_config(
+                config, config.stage2_alt_steps, config.stage2_lr,
+                active_players=[NORTH],
+                use_info=use_info,  # B 在 N-phase 用 info bonus
+                beta=beta,
+                belief_warmup=30 if (use_info and rnd == 1) else 0,
+            )
+
+            trainer_n, log_n, eval_n = _run_one_phase(
+                config, env_n, cfg_n, current_state,
+                belief_state=current_belief,
+                phase_label=f"R{rnd} N-phase",
+            )
+            current_state = copy.deepcopy(trainer_n.agent.model.state_dict())
+
+            # 更新 belief state (如果有)
+            if use_info and trainer_n.belief_net is not None:
+                current_belief = copy.deepcopy(trainer_n.belief_net.state_dict())
+
+            round_imps.append({
+                'round': rnd,
+                'S_phase': eval_s['mean_imp'],
+                'N_phase': eval_n['mean_imp'],
+            })
+
+        # ================================================================
+        # 联合微调收尾
+        # ================================================================
+        print(f"\n  ── Joint fine-tune ({config.stage2_joint_steps} steps) ──")
+
+        env_j = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+
+        cfg_j = _make_sub_config(
+            config, config.stage2_joint_steps, config.stage2_lr_joint,
             active_players=[NORTH, SOUTH],
-            belief_warmup_steps=100 if use_info else 0,
+            use_info=use_info,
+            beta=beta,
+            # 联合阶段: 低 entropy, 不退火
+            entropy_start=config.stage2_entropy_end,
+            entropy_end=config.stage2_entropy_end,
         )
-        trainer = SubgameTrainer(env, sub_config)
 
-        # 加载 base agent 权重 (N+S 都已训练过)
-        trainer.agent.model.load_state_dict(base_state)
-        print(f"  Loaded base agent weights (N+S)")
+        trainer_j, log_j, eval_j = _run_one_phase(
+            config, env_j, cfg_j, current_state,
+            belief_state=current_belief,
+            phase_label="Joint",
+        )
 
-        # 加载预训练的 belief net 权重
-        if use_info and belief_state is not None and trainer.belief_net is not None:
-            trainer.belief_net.load_state_dict(belief_state)
-            print(f"  Loaded pre-trained belief network")
-
-        t0 = time.time()
-        log = trainer.train()
-        train_time = time.time() - t0
-
-        # Evaluate
-        eval_results = _evaluate_stayman_full(env, trainer, config.eval_deals)
-        belief_acc = trainer.evaluate_belief_accuracy(
+        # ================================================================
+        # 结果汇总
+        # ================================================================
+        belief_acc = trainer_j.evaluate_belief_accuracy(
             num_deals=config.eval_deals
         ) if use_info else 0.0
 
-        # 提取 info metrics
         info_metrics = {}
-        if use_info and log:
-            last = log[-1]
+        if use_info and log_n:
+            last = log_n[-1]
             info_metrics = {
                 'info_ratio': last.get('info_ratio', 0),
                 'partner_gain': last.get('partner_gain', 0),
@@ -320,24 +454,26 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
             }
 
         results[name] = {
-            'mean_imp': eval_results['mean_imp'],
-            'std_imp': eval_results['std_imp'],
+            'mean_imp': eval_j['mean_imp'],
+            'std_imp': eval_j['std_imp'],
             'belief_accuracy': belief_acc,
-            'train_time_sec': train_time,
-            'final_log': log[-1] if log else {},
+            'round_imps': round_imps,
+            'final_log': log_j[-1] if log_j else {},
             **info_metrics,
         }
 
-        print(f"  {name}: IMP={results[name]['mean_imp']:+.2f}±{results[name]['std_imp']:.2f}, "
-              f"belief_acc={belief_acc:.3f}")
+        print(f"\n  {name} progression:")
+        print(f"    BC base:  IMP ≈ -4.1")
+        for ri in round_imps:
+            print(f"    R{ri['round']}: S→{ri['S_phase']:+.2f}  N→{ri['N_phase']:+.2f}")
+        print(f"    Joint:    IMP = {eval_j['mean_imp']:+.2f}")
 
         # Diagnostics
-        print(f"\n--- {name} Diagnostics ---")
-        diag = _run_diagnostics(env, trainer, config.diag_deals)
+        print(f"\n--- {name} Final Diagnostics ---")
+        diag = _run_diagnostics(env_j, trainer_j, config.diag_deals)
         results[name]['diagnostics'] = diag
 
-        # 保存 trainer 用于 Stage 3 分析
-        results[name]['_trainer'] = trainer
+        results[name]['_trainer'] = trainer_j
 
     return results
 
@@ -792,8 +928,10 @@ def main():
     p.add_argument('--competitive_data', default='data/competitive_100k.npz')
     p.add_argument('--device', default=None)
     p.add_argument('--output_dir', default='results/')
-    p.add_argument('--stage1_steps', type=int, default=5000)
-    p.add_argument('--stage2_steps', type=int, default=3000)
+    p.add_argument('--stage1_steps', type=int, default=0)
+    p.add_argument('--alt_rounds', type=int, default=4)
+    p.add_argument('--alt_steps', type=int, default=200)
+    p.add_argument('--joint_steps', type=int, default=400)
     p.add_argument('--eval_deals', type=int, default=200)
     p.add_argument('--diag_deals', type=int, default=500)
     # Quick mode for testing
@@ -809,14 +947,19 @@ def main():
         device=device,
         output_dir=args.output_dir,
         stage1_steps=args.stage1_steps,
-        stage2_steps=args.stage2_steps,
+        stage2_alt_rounds=args.alt_rounds,
+        stage2_alt_steps=args.alt_steps,
+        stage2_joint_steps=args.joint_steps,
         eval_deals=args.eval_deals,
         diag_deals=args.diag_deals,
     )
 
     if args.quick:
-        config.stage1_steps = 500
-        config.stage2_steps = 300
+        config.stage1_steps = 0
+        config.stage2_alt_rounds = 2
+        config.stage2_alt_steps = 50
+        config.stage2_joint_steps = 50
+        config.stage2_accumulate = 4
         config.eval_deals = 50
         config.diag_deals = 100
         config.stayman_bc_samples = 1000

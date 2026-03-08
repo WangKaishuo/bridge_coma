@@ -62,6 +62,12 @@ class SubgameConfig:
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
 
+    # Single-step (Contextual Bandit) mode
+    # 当 episode 中每个 player 仅做 1-2 步决策时启用.
+    # 用 batch-mean baseline 替代 GAE, 断开 Critic 梯度.
+    # Competitive 子博弈 (multi-step) 走标准 GAE, 此处设 False.
+    single_step: bool = False
+
     # Which players does the agent control?
     active_players: Optional[List[int]] = None
 
@@ -172,10 +178,11 @@ class SubgameTrainer:
 
                 # 检查是否是 agent 决策的 player
                 if player not in self.active_players:
-                    # 不该到这里 — env 应该已经自动处理了非 active 玩家
-                    # 保险: 用随机合法动作
-                    legal = obs.get('legal_actions', np.ones(NUM_BIDS))
-                    action = np.random.choice(np.where(legal > 0.5)[0])
+                    # 非 active player: 用 agent 当前策略 (deterministic)
+                    # 而非随机, 确保冻结的 player 保持 BC 学到的行为
+                    all_hands = self.env._current_hands
+                    action, _ = self.agent.get_action(
+                        obs, all_hands=all_hands, deterministic=True)
                     obs, _, done, info = self.env.step(action)
                     continue
 
@@ -249,10 +256,13 @@ class SubgameTrainer:
         - 只更新 active_players
         - 稳健 advantage 归一化 (防 std=0 NaN)
         - Entropy coefficient annealing (防止小动作空间早期坍缩)
+        - single_step 模式: 用 batch-mean baseline 替代 GAE,
+          断开 Critic 梯度, 防止 Value Loss 爆炸污染共享编码器
         """
         agent = self.agent
         min_size = self.config.min_buffer_size
         ent_coef = self.get_entropy_coef(self._current_step)
+        is_single = self.config.single_step
 
         total_loss = total_policy = total_value = total_entropy = num_updates = 0
 
@@ -263,34 +273,52 @@ class SubgameTrainer:
                 buffer.reset()
                 continue
 
-            with torch.no_grad():
-                last_obs = {k: v.unsqueeze(0).to(self.device)
-                            for k, v in buffer.observations[-1].items()}
-                last_hands = (buffer.all_hands[-1].unsqueeze(0).to(self.device)
-                              if buffer.all_hands else None)
-                last_value = agent.model.critic(last_obs, last_hands).item()
+            # ============================================================
+            # 偷梁换柱: single_step → batch-mean baseline 替代 GAE
+            # ============================================================
+            if is_single:
+                # 1-step episode: Q(s,a) = r(s,a), 无需 bootstrapping
+                rewards = torch.tensor(buffer.rewards, dtype=torch.float32)
+                buffer.returns = rewards
+                # batch-mean baseline: advantage = reward - mean(reward)
+                baseline = rewards.mean()
+                advantages = rewards - baseline
+                # 标准化 (跨整个 buffer, 而非 mini-batch 内再做一次)
+                adv_std = advantages.std()
+                if torch.isfinite(adv_std) and adv_std > 1e-6:
+                    advantages = advantages / (adv_std + 1e-8)
+                buffer.advantages = advantages
+            else:
+                # 标准 GAE (Competitive 子博弈等 multi-step 场景)
+                with torch.no_grad():
+                    last_obs = {k: v.unsqueeze(0).to(self.device)
+                                for k, v in buffer.observations[-1].items()}
+                    last_hands = (buffer.all_hands[-1].unsqueeze(0).to(self.device)
+                                  if buffer.all_hands else None)
+                    last_value = agent.model.critic(last_obs, last_hands).item()
 
-            buffer.compute_returns_and_advantages(
-                last_value, agent.config.gamma, agent.config.gae_lambda
-            )
+                buffer.compute_returns_and_advantages(
+                    last_value, agent.config.gamma, agent.config.gae_lambda
+                )
 
             for _ in range(agent.config.num_epochs):
                 for batch in buffer.get_batches(agent.config.batch_size):
                     log_probs, entropy = agent.model.actor.evaluate_actions(
                         batch['obs'], batch['actions']
                     )
-                    values = agent.model.critic(batch['obs'], batch.get('all_hands'))
 
                     ratio = torch.exp(log_probs - batch['old_log_probs'])
 
-                    # 稳健 advantage 归一化
+                    # Advantage: single_step 已在 buffer 级别标准化;
+                    # multi-step 仍需 mini-batch 级别标准化
                     adv = batch['advantages']
-                    if adv.numel() > 1:
-                        adv_std = adv.std()
-                        if torch.isfinite(adv_std) and adv_std > 1e-6:
-                            adv = (adv - adv.mean()) / (adv_std + 1e-8)
-                        else:
-                            adv = adv - adv.mean()
+                    if not is_single:
+                        if adv.numel() > 1:
+                            adv_std = adv.std()
+                            if torch.isfinite(adv_std) and adv_std > 1e-6:
+                                adv = (adv - adv.mean()) / (adv_std + 1e-8)
+                            else:
+                                adv = adv - adv.mean()
 
                     policy_loss = -torch.min(
                         ratio * adv,
@@ -299,11 +327,18 @@ class SubgameTrainer:
                                     1 + agent.config.clip_ratio) * adv
                     ).mean()
 
-                    value_loss = F.mse_loss(values, batch['returns'])
-
-                    loss = (policy_loss
-                            + agent.config.value_coef * value_loss
-                            - ent_coef * entropy.mean())
+                    # Loss: single_step → 断开 Critic 梯度 (value_coef=0)
+                    if is_single:
+                        loss = policy_loss - ent_coef * entropy.mean()
+                        value_loss_val = 0.0
+                    else:
+                        values = agent.model.critic(
+                            batch['obs'], batch.get('all_hands'))
+                        value_loss = F.mse_loss(values, batch['returns'])
+                        loss = (policy_loss
+                                + agent.config.value_coef * value_loss
+                                - ent_coef * entropy.mean())
+                        value_loss_val = value_loss.item()
 
                     agent.optimizer.zero_grad()
                     loss.backward()
@@ -314,7 +349,7 @@ class SubgameTrainer:
 
                     total_loss += loss.item()
                     total_policy += policy_loss.item()
-                    total_value += value_loss.item()
+                    total_value += value_loss_val
                     total_entropy += entropy.mean().item()
                     num_updates += 1
 
@@ -480,7 +515,9 @@ class SubgameTrainer:
         cfg = self.config
         active_str = ','.join(str(p) for p in self.active_players)
         eff_deals = cfg.deals_per_step * cfg.accumulate_steps
+        mode_str = "single_step (batch-mean baseline)" if cfg.single_step else "GAE+Critic"
         print(f"SubgameTrainer: {cfg.num_steps} steps, "
+              f"mode={mode_str}, "
               f"info_bonus={cfg.use_info_bonus}, beta={cfg.beta}, "
               f"active_players=[{active_str}], "
               f"accumulate={cfg.accumulate_steps}, "
