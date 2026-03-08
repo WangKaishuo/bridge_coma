@@ -68,7 +68,12 @@ class BeliefNetwork(nn.Module):
         """
         hand_feat = self.hand_encoder(observer_hand)
         
-        _, (h_n, _) = self.history_encoder(history)
+        # 同 HistoryEncoder 修复: 只处理有效 token, 忽略零 padding
+        lengths = (history.sum(dim=-1) > 0).sum(dim=-1).clamp(min=1)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            history, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        _, (h_n, _) = self.history_encoder(packed)
         hist_feat = h_n[-1]
         
         obs_embed = self.position_embed(observer_pos)

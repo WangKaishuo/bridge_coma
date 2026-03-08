@@ -183,7 +183,7 @@ class SubgameTrainer:
                     all_hands = self.env._current_hands
                     action, _ = self.agent.get_action(
                         obs, all_hands=all_hands, deterministic=True)
-                    obs, _, done, info = self.env.step(action)
+                    obs, reward, done, info = self.env.step(action)
                     continue
 
                 history_before = self.env.history.copy()

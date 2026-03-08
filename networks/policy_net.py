@@ -30,7 +30,19 @@ class HandEncoder(nn.Module):
 
 
 class HistoryEncoder(nn.Module):
-    """叫牌历史编码器 (LSTM)"""
+    """
+    叫牌历史编码器 (LSTM)
+
+    关键修复: 只处理有效 token, 忽略零 padding.
+
+    原版直接对 (batch, 60, 38) 跑 LSTM 取 h_n[-1],
+    但实际叫牌历史只有 4-20 步, 剩余 40-56 步全是零向量.
+    LSTM 处理几十步零输入后 hidden state 退化到固定点,
+    冲刷掉了关键叫牌 (如 N 的 2D/2H/2S) 的信息.
+
+    修复: 检测每条序列的实际长度, 用 pack_padded_sequence
+    让 LSTM 只处理有效时间步, 取实际最后一步的 h_n.
+    """
     
     def __init__(self, input_dim: int = NUM_BIDS, hidden_dim: int = 256, num_layers: int = 2):
         super().__init__()
@@ -38,9 +50,23 @@ class HistoryEncoder(nn.Module):
         self.output_dim = hidden_dim
     
     def forward(self, history: torch.Tensor) -> torch.Tensor:
-        # history: (batch, seq_len, num_bids)
-        _, (h_n, _) = self.lstm(history)
-        return h_n[-1]  # 最后一层的隐藏状态
+        # history: (batch, max_seq_len, num_bids) — one-hot, 零 padding
+        batch_size = history.shape[0]
+
+        # 计算每条序列的实际长度: 非零行的数量
+        # history.sum(dim=-1) > 0 → (batch, max_seq_len) bool mask
+        lengths = (history.sum(dim=-1) > 0).sum(dim=-1)  # (batch,)
+        lengths = lengths.clamp(min=1)  # 防止全零序列导致 pack 崩溃
+
+        # pack → LSTM → unpack
+        # 需要 CPU 上的 lengths for pack_padded_sequence
+        lengths_cpu = lengths.cpu()
+        packed = nn.utils.rnn.pack_padded_sequence(
+            history, lengths_cpu, batch_first=True, enforce_sorted=False
+        )
+        packed_out, (h_n, _) = self.lstm(packed)
+        # h_n: (num_layers, batch, hidden_dim) — 已经是每条序列实际最后一步的状态
+        return h_n[-1]  # (batch, hidden_dim)
 
 
 class PolicyNetwork(nn.Module):

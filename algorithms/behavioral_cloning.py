@@ -301,6 +301,7 @@ def behavioral_cloning_warmup(
     epochs: int = 10,
     lr: float = 1e-3,
     batch_size: int = 256,
+    minority_weight: float = 2.0,
 ) -> dict:
     """
     对 agent 的 policy network 做交叉熵监督训练.
@@ -311,10 +312,17 @@ def behavioral_cloning_warmup(
         epochs: 训练轮数
         lr: 学习率
         batch_size: batch 大小
+        minority_weight: 少数类 (非 4H/4S 动作) 的 loss 权重.
+            默认 2.0: 让 3NT/2NT 等叫品的梯度贡献翻倍,
+            迫使网络不能靠猜多数派 (4M) 过关.
 
     Returns:
         训练统计: {'final_loss', 'final_acc'}
     """
+    from env import string_to_bid
+    # 高花成局叫品 — 多数类, 权重 1.0
+    majority_actions = {string_to_bid("4H"), string_to_bid("4S")}
+
     model = agent.model.actor
     device = agent.device
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -338,11 +346,37 @@ def behavioral_cloning_warmup(
             # Forward
             logits = model(obs_d)  # (B, 38)
 
-            # Mask illegal actions, then CE loss
+            # Mask illegal actions, then CE loss with per-sample weights
             mask = obs_d['legal_actions']
             logits = logits - 1e9 * (1 - mask)
 
-            loss = F.cross_entropy(logits, targets)
+            # ========================================================
+            # Per-sample 权重 (双重加权):
+            #
+            # 1) 动作加权: 非 4H/4S 少数类 → minority_weight
+            #    迫使网络不能靠猜多数派过关.
+            #
+            # 2) 玩家加权: S 的样本 → ×3
+            #    N 和 S 共享 HistoryEncoder, 但 N 的任务不需要 history
+            #    (N 只看手牌叫 2D/2H/2S). N 的 5000 个样本的梯度
+            #    告诉 HistoryEncoder "history 不重要", 直接和 S 的梯度
+            #    打架. S 的加权确保 HistoryEncoder 被 S 的需求主导.
+            # ========================================================
+            weights = torch.ones(targets.shape[0], device=device)
+
+            # 动作加权
+            is_minority = torch.ones(targets.shape[0], dtype=torch.bool, device=device)
+            for maj_act in majority_actions:
+                is_minority = is_minority & (targets != maj_act)
+            weights[is_minority] = minority_weight
+
+            # 玩家加权: position one-hot 的 argmax == SOUTH(2) 的样本
+            positions = obs_d['position']  # (B, 4)
+            is_south = positions.argmax(dim=-1) == 2  # SOUTH = 2
+            weights[is_south] = weights[is_south] * 3.0
+
+            loss = F.cross_entropy(logits, targets, reduction='none')
+            loss = (loss * weights).mean()
 
             optimizer.zero_grad()
             loss.backward()
