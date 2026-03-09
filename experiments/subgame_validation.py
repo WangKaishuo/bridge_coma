@@ -75,7 +75,7 @@ class Phase2Config:
 
     # Stage 2: Alternating fine-tune (single_step, batch-mean baseline)
     # S-N-S-N... 交替训练 + 联合微调收尾
-    stage2_alt_rounds: int = 4         # 交替轮数 (每轮 = 1×S + 1×N)
+    stage2_alt_rounds: int = 6         # 交替轮数 (每轮 = 1×S + 1×N); 4→6 给收敛更多空间
     stage2_alt_steps: int = 200        # 每个半轮的步数
     stage2_joint_steps: int = 400      # 最终联合微调步数
     stage2_deals_per_step: int = 32
@@ -87,19 +87,16 @@ class Phase2Config:
     stage2_entropy_anneal: float = 0.8 # 延后退火
 
     # KL Anchor: Stage 2 中限制 RL 策略偏离 BC 的程度
-    # 前两轮强锚定, 后两轮逐渐放松
     stage2_kl_lambda_start: float = 0.5  # 初始 KL 系数
     stage2_kl_lambda_end: float = 0.1    # 退火终点 (S-phase 用)
     stage2_kl_anneal_frac: float = 1.0   # 覆盖整个训练过程退火
 
-    # N-phase 专用 KL anchor (更强, 防止 N 退化为 100% 2D)
-    # 行动三: kl_lambda_end 提至 0.5, 无论 S 是否倾听, 强制 N 诚实报高花
-    stage2_n_kl_lambda_start: float = 0.5  # N-phase KL 起始值 (与全局相同)
-    stage2_n_kl_lambda_end: float = 0.5    # N-phase KL 终点值 (不退火, 始终保持强锚定)
+    # N-phase 专用 KL anchor (不退火, 始终强锚定防 N 退化)
+    stage2_n_kl_lambda_start: float = 0.5
+    stage2_n_kl_lambda_end: float = 0.5
 
-    # 课程学习前缀 (行动二): 在交替训练前, 先冻结 N 用规则策略, 只训 S N_warmup_rounds 轮
-    # 目的: 让 S 在"完美发信机"环境下建立"倾听信心", 再解冻 N
-    stage2_n_warmup_rounds: int = 1       # 0 = 关闭课程学习前缀; 1 = 保守折中
+    # 课程学习前缀: 0=关闭 (KL已修好, CW经实验证明弊大于利)
+    stage2_n_warmup_rounds: int = 0
 
     # Competitive
     competitive_steps: int = 5000
@@ -426,9 +423,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
         round_imps = []
 
         # ================================================================
-        # 行动二: 课程学习前缀 — 冻结 N (规则策略), 只训 S
-        # 目的: 让 S 在"完美信号源"下学会倾听, 建立"叫 4M 是安全的"信心
-        # 条件: N_warmup_rounds > 0 时启用; 完成后再进入正式交替训练
+        # 课程学习前缀 (可选): 冻结 N=规则, 只训 S
         # ================================================================
         if config.stage2_n_warmup_rounds > 0:
             print(f"\n  ── Curriculum Warmup: {config.stage2_n_warmup_rounds} rounds"
@@ -437,20 +432,17 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 env_sw = StaymanSubgameEnv(config.stayman_data, north_rule=True)
                 cfg_sw = _make_sub_config(
                     config, config.stage2_alt_steps, config.stage2_lr,
-                    active_players=[SOUTH],
-                    use_info=False,
+                    active_players=[SOUTH], use_info=False,
                     entropy_start=config.stage2_entropy_start,
                     entropy_end=config.stage2_entropy_end,
                 )
                 trainer_sw, _, eval_sw = _run_one_phase(
-                    config, env_sw, cfg_sw, current_state,
-                    bc_state=bc_state,
+                    config, env_sw, cfg_sw, current_state, bc_state=bc_state,
                     phase_label=f"CurriculumWarmup R{warmup_rnd} S-phase",
                 )
                 current_state = copy.deepcopy(trainer_sw.agent.model.state_dict())
                 round_imps.append({
-                    'round': f'CW{warmup_rnd}',
-                    'S_phase': eval_sw['mean_imp'],
+                    'round': f'CW{warmup_rnd}', 'S_phase': eval_sw['mean_imp'],
                     'N_phase': None,
                 })
 
@@ -496,9 +488,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 # entropy 每轮重置到 start
                 entropy_start=config.stage2_entropy_start,
                 entropy_end=config.stage2_entropy_end,
-                # 行动三: N-phase 使用更强的 KL anchor, 不退到 0.1
-                # 原理: N 退化成 100% 2D 时 KL 梯度为 0 (已到 BC 分布);
-                #       强 KL_end 让 N 锁定在 BC 的诚实分布附近, 无法摆烂
+                # N-phase 专用强 KL: 不退火, 防止 N 退化
                 kl_lambda_start=config.stage2_n_kl_lambda_start,
                 kl_lambda_end=config.stage2_n_kl_lambda_end,
             )
@@ -632,91 +622,286 @@ def run_stage3(config: Phase2Config, stage1_results: dict,
     print(f"  B (MAPPO+r_info): IMP = {b_imp:+.2f} (Δ vs S_base: {b_imp - s_base_imp:+.2f})")
     print(f"  B vs A:           Δ = {b_imp - a_imp:+.2f}")
 
-    # 定性分析: N 的策略偏移
-    print("\n--- N's Policy Shift Analysis ---")
+    # 定性分析: 完整叫牌协议 (N + S 条件分布, 叫牌树)
+    print("\n--- Bidding Protocol Analysis ---")
     for name in ['A_control', 'B_partner_only']:
         trainer = stage2_results[name].get('_trainer')
         if trainer is None:
             continue
-
         env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
-        policy = _analyze_north_policy(env, trainer, num_deals=500)
-        analysis[f'{name}_north_policy'] = policy
-
-        print(f"\n  {name} — N's bidding distribution:")
-        for situation, dist in policy.items():
-            print(f"    {situation}:")
-            for bid, pct in sorted(dist.items(), key=lambda x: -x[1]):
-                bar = "█" * int(pct * 40)
-                print(f"      {bid:4s}: {pct:5.1%} {bar}")
+        tree = _analyze_bidding_protocol(env, trainer, num_deals=500)
+        analysis[f'{name}_bidding_tree'] = tree
+        _print_bidding_tree(tree, name)
 
     # Go/No-Go
     go = _stayman_go_no_go(stage1_results, stage2_results, config)
     analysis['go_no_go'] = go
 
+    # 单副牌模拟演示 (随机抽 3 副有代表性的牌)
+    print("\n--- Single Deal Simulation (3 sample deals) ---")
+    trainer_a = stage2_results['A_control'].get('_trainer')
+    trainer_b = stage2_results['B_partner_only'].get('_trainer')
+    if trainer_a and trainer_b:
+        demo_env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+        for i in range(3):
+            hands, dd_table = demo_env.generate_deal()
+            print(f"\n  === Sample Deal {i+1} ===")
+            simulate_single_deal(trainer_a, trainer_b, hands, dd_table,
+                                 config.stayman_data)
+
     return analysis
 
 
-def _analyze_north_policy(env, trainer, num_deals: int = 500) -> dict:
+def _analyze_bidding_protocol(env, trainer, num_deals: int = 500) -> dict:
     """
-    分析 N 的策略分布.
+    分析完整叫牌协议: N 的叫品分布 + S 对每种 N 信号的条件分布.
 
-    对每种手牌类型 (有4H / 有4S / 都没有), 统计 N 叫什么.
+    输出形式:
+      叫牌树: N 叫 X → S 的条件分布
+      人类语言策略摘要
     """
+    import torch
     agent = trainer.agent
-    counts = {
-        'has_4H': {},   # N 有 4+H 时的叫品分布
-        'has_4S': {},   # N 有 4+S (无 4H) 时
-        'no_4M': {},    # 都没有时
-    }
+
+    # N 手型分类 × N 叫品 × S 叫品 的三维计数
+    # n_hand_type: has_4H / has_4S / no_4M
+    # n_bid: 2D / 2H / 2S
+    # s_bid: 2NT / 3H / 3NT / 3S / 4H / 4S / Pass
+    from collections import defaultdict
+    tree = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    # tree[n_hand_type][n_bid][s_bid] = count
 
     for _ in range(num_deals):
         hands, dd_table = env.generate_deal()
         obs = env.env.reset(hands, dealer=NORTH, vulnerability=(False, False))
 
-        # 执行固定前缀
         for bid_str_prefix in env.FIXED_PREFIX:
             bid = string_to_bid(bid_str_prefix)
             obs, _, done, _ = env.env.step(bid)
-
         if done:
             continue
 
-        # N's turn: get agent's action
+        # --- N's decision ---
         obs['legal_actions'] = env._get_stayman_mask()
         obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
                  for k, v in obs.items()}
         with torch.no_grad():
             all_h = torch.tensor(hands, dtype=torch.float32).unsqueeze(0).to(agent.device)
-            action, _, _, _ = agent.model.get_action_and_value(obs_t, all_h, deterministic=True)
-            action = action.item()
+            n_action, _, _, _ = agent.model.get_action_and_value(
+                obs_t, all_h, deterministic=True)
+            n_action = n_action.item()
+        n_bid_str = bid_to_string(n_action)
 
-        bid_str = bid_to_string(action)
-
-        # Categorize N's hand
         n_hand = hands[NORTH]
-        h = count_suit_length(n_hand, 2)  # hearts
-        s = count_suit_length(n_hand, 3)  # spades
+        h = count_suit_length(n_hand, 2)
+        s = count_suit_length(n_hand, 3)
+        n_type = 'has_4H' if h >= 4 else ('has_4S' if s >= 4 else 'no_4M')
 
-        if h >= 4:
-            key = 'has_4H'
-        elif s >= 4:
-            key = 'has_4S'
+        # Execute N's bid + E pass
+        obs, _, done, _ = env.env.step(n_action)
+        if done: continue
+        obs, _, done, _ = env.env.step(BID_PASS)  # E pass
+        if done: continue
+
+        # --- S's decision ---
+        obs['legal_actions'] = env._get_stayman_mask()
+        obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
+                 for k, v in obs.items()}
+        with torch.no_grad():
+            s_action, _, _, _ = agent.model.get_action_and_value(
+                obs_t, all_h, deterministic=True)
+            s_action = s_action.item()
+        s_bid_str = bid_to_string(s_action)
+
+        tree[n_type][n_bid_str][s_bid_str] += 1
+
+    return dict(tree)
+
+
+def _print_bidding_tree(tree: dict, agent_name: str):
+    """
+    打印叫牌树 + 人类语言策略摘要.
+
+    格式:
+      N hand type → N bids → S responds
+    """
+    print(f"\n  {'─'*56}")
+    print(f"  Bidding Protocol: {agent_name}")
+    print(f"  {'─'*56}")
+    print(f"  Format: [N hand type] → N bids X → S responds")
+
+    n_type_labels = {
+        'has_4H': 'N has 4+♥',
+        'has_4S': 'N has 4+♠ (no 4♥)',
+        'no_4M':  'N has no 4M',
+    }
+
+    # Collect natural language summary
+    summary_lines = []
+
+    for n_type in ['has_4H', 'has_4S', 'no_4M']:
+        n_bids = tree.get(n_type, {})
+        if not n_bids:
+            continue
+
+        # N's distribution for this hand type
+        n_total = sum(sum(s.values()) for s in n_bids.values())
+        print(f"\n  [{n_type_labels[n_type]}]  (n={n_total})")
+
+        for n_bid in sorted(n_bids.keys()):
+            s_dist = n_bids[n_bid]
+            n_bid_count = sum(s_dist.values())
+            n_pct = n_bid_count / max(1, n_total)
+            n_bar = "█" * int(n_pct * 20)
+
+            print(f"    N: {n_bid:4s} {n_pct:5.1%} {n_bar}")
+
+            # S's conditional distribution given N's bid
+            s_total = sum(s_dist.values())
+            for s_bid in sorted(s_dist.keys(), key=lambda b: -s_dist[b]):
+                s_pct = s_dist[s_bid] / max(1, s_total)
+                if s_pct < 0.02:
+                    continue
+                s_bar = "█" * int(s_pct * 20)
+                print(f"      └─ S: {s_bid:4s} {s_pct:5.1%} {s_bar}")
+
+    # Human-language strategy summary
+    print(f"\n  Strategy Summary ({agent_name}):")
+    for n_type in ['has_4H', 'has_4S', 'no_4M']:
+        n_bids = tree.get(n_type, {})
+        if not n_bids:
+            continue
+        n_total = sum(sum(s.values()) for s in n_bids.values())
+
+        # Dominant N bid
+        n_bid_counts = {b: sum(s.values()) for b, s in n_bids.items()}
+        dominant_n = max(n_bid_counts, key=n_bid_counts.get)
+        dominant_n_pct = n_bid_counts[dominant_n] / max(1, n_total)
+
+        # Dominant S response to dominant N bid
+        s_dist = n_bids.get(dominant_n, {})
+        s_total = sum(s_dist.values())
+        if s_total > 0:
+            dominant_s = max(s_dist, key=s_dist.get)
+            dominant_s_pct = s_dist[dominant_s] / s_total
+            print(f"    {n_type_labels[n_type]:22s} → N: {dominant_n} ({dominant_n_pct:.0%})"
+                  f" → S: {dominant_s} ({dominant_s_pct:.0%})")
         else:
-            key = 'no_4M'
+            print(f"    {n_type_labels[n_type]:22s} → N: {dominant_n} ({dominant_n_pct:.0%})")
 
-        counts[key][bid_str] = counts[key].get(bid_str, 0) + 1
 
-    # Convert to percentages
-    policy = {}
-    for situation, bids in counts.items():
-        total = sum(bids.values())
-        if total > 0:
-            policy[situation] = {bid: n / total for bid, n in bids.items()}
-        else:
-            policy[situation] = {}
+def simulate_single_deal(trainer_a, trainer_b, hands: np.ndarray,
+                         dd_table: np.ndarray, data_path: str):
+    """
+    给定一副牌, 分别用 Agent A 和 B 模拟完整叫牌过程.
 
-    return policy
+    打印每一步的:
+      - 当前叫品历史
+      - 该 agent 的 logit 分布 (top-3)
+      - 最终选择 + 理由 (手牌类型)
+    显示最终定约 + IMP.
+
+    用法:
+        simulate_single_deal(trainer_a, trainer_b, hands, dd_table, data_path)
+    """
+    from env import bid_to_string, string_to_bid, NORTH, SOUTH, EAST, WEST
+    import torch, torch.nn.functional as F
+
+    suit_symbols = ['♣', '♦', '♥', '♠', 'NT']
+    pos_names    = ['N', 'E', 'S', 'W']
+
+    def _hand_str(hand):
+        suits = []
+        for suit_idx, sym in enumerate(suit_symbols[:4]):
+            base = suit_idx * 13
+            ranks = ''.join(
+                ['A','K','Q','J','T','9','8','7','6','5','4','3','2'][12 - r]
+                for r in range(12, -1, -1) if hand[base + r] > 0.5
+            )
+            suits.append(f"{sym}{ranks if ranks else '—'}")
+        return '  '.join(suits)
+
+    def _run_agent_sim(trainer, agent_name):
+        agent = trainer.agent
+        env_sim = StaymanSubgameEnv(data_path, north_rule=False)
+        obs = env_sim.env.reset(hands, dealer=NORTH, vulnerability=(False, False))
+
+        print(f"\n  {'═'*54}")
+        print(f"  Agent {agent_name} — Deal Simulation")
+        print(f"  {'═'*54}")
+        print(f"  Hands:")
+        for p, pos in enumerate(pos_names):
+            print(f"    {pos}: {_hand_str(hands[p])}")
+
+        # Execute fixed prefix silently
+        for bid_str_prefix in env_sim.FIXED_PREFIX:
+            bid = string_to_bid(bid_str_prefix)
+            obs, _, done, _ = env_sim.env.step(bid)
+
+        history_display = list(env_sim.FIXED_PREFIX)
+        print(f"\n  Auction prefix: {' - '.join(history_display)}")
+        print()
+
+        step = 0
+        while not done:
+            player = env_sim.env.state.current_player
+            obs['legal_actions'] = env_sim._get_stayman_mask()
+            obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
+                     for k, v in obs.items()}
+            all_h = torch.tensor(hands, dtype=torch.float32).unsqueeze(0).to(agent.device)
+
+            with torch.no_grad():
+                logits = agent.model.actor(obs_t)
+                legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32).to(agent.device)
+                masked = logits.squeeze(0) - 1e9 * (1 - legal)
+                probs  = F.softmax(masked, dim=-1)
+                action = probs.argmax().item()  # deterministic
+
+            bid_str = bid_to_string(action)
+            step += 1
+
+            # Hand info for active player
+            hand_info = ""
+            if player == NORTH:
+                h = count_suit_length(hands[NORTH], 2)
+                s = count_suit_length(hands[NORTH], 3)
+                hcp = sum(4 if hands[NORTH][suit*13+12]>0.5 else 0 for suit in range(4)) + \
+                      sum(3 if hands[NORTH][suit*13+11]>0.5 else 0 for suit in range(4)) + \
+                      sum(2 if hands[NORTH][suit*13+10]>0.5 else 0 for suit in range(4)) + \
+                      sum(1 if hands[NORTH][suit*13+9]>0.5  else 0 for suit in range(4))
+                hand_info = f"  [{hcp}HCP, ♥{h} ♠{s}]"
+            elif player == SOUTH:
+                h = count_suit_length(hands[SOUTH], 2)
+                s = count_suit_length(hands[SOUTH], 3)
+                hcp = sum(4 if hands[SOUTH][suit*13+12]>0.5 else 0 for suit in range(4)) + \
+                      sum(3 if hands[SOUTH][suit*13+11]>0.5 else 0 for suit in range(4)) + \
+                      sum(2 if hands[SOUTH][suit*13+10]>0.5 else 0 for suit in range(4)) + \
+                      sum(1 if hands[SOUTH][suit*13+9]>0.5  else 0 for suit in range(4))
+                hand_info = f"  [{hcp}HCP, ♥{h} ♠{s}]"
+
+            # Top-3 legal actions by probability
+            legal_indices = [i for i in range(len(obs['legal_actions']))
+                             if obs['legal_actions'][i] > 0.5]
+            top3 = sorted(legal_indices, key=lambda i: probs[i].item(), reverse=True)[:3]
+            top3_str = '  '.join(f"{bid_to_string(i)}:{probs[i].item():.0%}" for i in top3)
+
+            print(f"  Step {step}: {pos_names[player]} bids {bid_str:4s}{hand_info}")
+            print(f"           Top options: [{top3_str}]")
+
+            obs, reward, done, info = env_sim.step(action)
+            history_display.append(bid_str)
+
+        contract = env_sim.env.state.final_contract
+        imp_val  = info.get('imp', 0)
+        contract_str = (f"{contract.level}{suit_symbols[contract.suit]} "
+                        f"by {pos_names[contract.declarer]}"
+                        if contract else "Passed out")
+        print(f"\n  Final contract : {contract_str}")
+        print(f"  IMP vs DDS opt : {imp_val:+.1f}")
+        print(f"  Full auction   : {' - '.join(history_display)}")
+
+    _run_agent_sim(trainer_a, "A (MAPPO)")
+    _run_agent_sim(trainer_b, "B (MAPPO+r_info)")
 
 
 def _stayman_go_no_go(stage1_results, stage2_results, config) -> dict:
@@ -787,29 +972,26 @@ def _classify_contract(contract) -> str:
 
 
 def _has_major_fit(hands, declarer_side_players=(NORTH, SOUTH)) -> dict:
-    """检测 N-S 高花配合情况 (含 4-4 / 5-3 / 双高花)."""
+    """
+    检测 N-S 高花配合情况.
+
+    分类标准: 8张及以上配合 (桥牌里打出花色合同的分水岭)
+      - heart_fit:  红桃总张数 >= 8
+      - spade_fit:  黑桃总张数 >= 8
+      - double_fit: 两门都 >= 8
+    """
     p1, p2 = declarer_side_players
-    h1 = count_suit_length(hands[p1], 2)
-    h2 = count_suit_length(hands[p2], 2)
-    s1 = count_suit_length(hands[p1], 3)
-    s2 = count_suit_length(hands[p2], 3)
-    heart_fit_44  = h1 >= 4 and h2 >= 4
-    spade_fit_44  = s1 >= 4 and s2 >= 4
-    heart_fit_53  = (h1 >= 5 and h2 >= 3) or (h1 >= 3 and h2 >= 5)
-    spade_fit_53  = (s1 >= 5 and s2 >= 3) or (s1 >= 3 and s2 >= 5)
-    heart_fit     = heart_fit_44 or heart_fit_53
-    spade_fit     = spade_fit_44 or spade_fit_53
+    h_total = count_suit_length(hands[p1], 2) + count_suit_length(hands[p2], 2)
+    s_total = count_suit_length(hands[p1], 3) + count_suit_length(hands[p2], 3)
+    heart_fit = h_total >= 8
+    spade_fit = s_total >= 8
     return {
-        'heart_fit_44': heart_fit_44,
-        'spade_fit_44': spade_fit_44,
-        'heart_fit_53': heart_fit_53 and not heart_fit_44,
-        'spade_fit_53': spade_fit_53 and not spade_fit_44,
-        'heart_fit':    heart_fit,
-        'spade_fit':    spade_fit,
-        'double_fit':   heart_fit and spade_fit,
-        'any_fit':      heart_fit or spade_fit,
-        'best_suit':    'H' if (heart_fit and not spade_fit) else
-                        ('S' if spade_fit else None),
+        'heart_fit':  heart_fit,
+        'spade_fit':  spade_fit,
+        'double_fit': heart_fit and spade_fit,
+        'any_fit':    heart_fit or spade_fit,
+        'best_suit':  'H' if (heart_fit and not spade_fit) else
+                      ('S' if spade_fit else None),
     }
 
 
@@ -826,11 +1008,12 @@ def _run_diagnostics(env, trainer, num_deals: int) -> dict:
     contract_counts = Counter()
     imp_values, reward_values = [], []
 
-    # Fit 细分计数器
+    # Fit 计数器: 8张及以上高花配合
     fit_counts = {
-        'heart_44': 0, 'spade_44': 0,
-        'heart_53': 0, 'spade_53': 0,
-        'double':   0, 'no_fit':   0,
+        'heart_8p': 0,   # 红桃 8+ 张 (非双高花)
+        'spade_8p': 0,   # 黑桃 8+ 张 (非双高花)
+        'double':   0,   # 双高花各 8+
+        'no_fit':   0,   # 无 8 张高花配合
     }
     # 代价矩阵: [情形] -> IMP 列表
     cost_matrix = {
@@ -869,12 +1052,10 @@ def _run_diagnostics(env, trainer, num_deals: int) -> dict:
         bid_4M    = (contract is not None and contract.suit in (2, 3) and contract.level >= 4)
         bid_3NT   = (contract is not None and contract.suit == 4 and contract.level == 3)
 
-        # Fit 细分统计
+        # Fit 统计: 8 张高花配合
         if fit_info['double_fit']:        fit_counts['double']   += 1
-        elif fit_info['heart_fit_44']:    fit_counts['heart_44'] += 1
-        elif fit_info['spade_fit_44']:    fit_counts['spade_44'] += 1
-        elif fit_info['heart_fit_53']:    fit_counts['heart_53'] += 1
-        elif fit_info['spade_fit_53']:    fit_counts['spade_53'] += 1
+        elif fit_info['heart_fit']:       fit_counts['heart_8p'] += 1
+        elif fit_info['spade_fit']:       fit_counts['spade_8p'] += 1
         else:                             fit_counts['no_fit']   += 1
 
         # 代价矩阵
@@ -899,11 +1080,10 @@ def _run_diagnostics(env, trainer, num_deals: int) -> dict:
         print(f"    {cat:14s}: {n:4d} ({pct:5.1%}) {bar}")
 
     print(f"\n  Fit Distribution ({total} deals):")
-    for label, key in [('4-4 Heart', 'heart_44'), ('4-4 Spade', 'spade_44'),
-                       ('5-3 Heart', 'heart_53'), ('5-3 Spade', 'spade_53'),
-                       ('Double Fit', 'double'), ('No Fit', 'no_fit')]:
+    for label, key in [('Heart 8+ fit', 'heart_8p'), ('Spade 8+ fit', 'spade_8p'),
+                       ('Double Fit',   'double'),   ('No Major Fit', 'no_fit')]:
         n = fit_counts[key]
-        print(f"    {label:12s}: {n:4d} ({n/max(1,total):5.1%})")
+        print(f"    {label:14s}: {n:4d} ({n/max(1,total):5.1%})")
 
     print(f"\n  Decision Error Matrix:")
     for label, key in [

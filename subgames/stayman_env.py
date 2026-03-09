@@ -563,6 +563,39 @@ def create_bc_dataset_for_stayman(
                 s_obs['legal_actions'] = s_mask
                 data.append({'obs': s_obs, 'action': int(s_target)})
 
+        # 执行 S 的叫品
+        obs, _, done, _ = env.step(s_target)
+        if done:
+            continue
+
+        # E Pass
+        obs, _, done, _ = env.step(BID_PASS)
+        if done:
+            # S 直接叫局 (4H/4S/3NT), 游戏结束, 不需要 N 应答
+            continue
+
+        # --- N Round 3: 接受或拒绝邀请 ---
+        # 只有 S 叫了邀请 (3H/3S/2NT) 时才能走到这里
+        if collect_north:
+            n_target2 = north_stayman_rule(hands, env.state.history)
+            if not env._is_valid_action(n_target2):
+                n_target2 = BID_PASS
+
+            n_mask2 = np.zeros(NUM_BIDS, dtype=np.float32)
+            n_mask2[BID_PASS] = 1.0              # 拒绝邀请
+            n_mask2[string_to_bid("3NT")] = 1.0  # 接受无将邀请
+            n_mask2[string_to_bid("4H")] = 1.0   # 接受红桃邀请
+            n_mask2[string_to_bid("4S")] = 1.0   # 接受黑桃邀请
+            env_legal2 = env._get_legal_actions()
+            n_mask2 = n_mask2 * env_legal2
+            if n_mask2.sum() < 0.5:
+                n_mask2[BID_PASS] = 1.0
+
+            if n_mask2[n_target2] > 0.5:
+                n_obs2 = {k: v.copy() for k, v in obs.items()}
+                n_obs2['legal_actions'] = n_mask2
+                data.append({'obs': n_obs2, 'action': int(n_target2)})
+
     n_count = sum(1 for d in data if d['obs']['position'].argmax() == NORTH) if collect_north else 0
     s_count = sum(1 for d in data if d['obs']['position'].argmax() == SOUTH) if collect_south else 0
     print(f"Stayman BC dataset: {len(data)} samples "
