@@ -59,15 +59,19 @@ class Phase2Config:
     device: str = "cpu"
     output_dir: str = "results/"
 
-    # Stage 1: BC warmup + optional RL fine-tune
-    stage1_steps: int = 0             # 0 = 纯 BC (推荐), >0 = BC 后 RL 微调
+    # Stage 1: BC warmup + Critic rollout warmup (双轨预热)
+    stage1_steps: int = 0             # 0 = 纯 BC+Critic 预热, >0 = 之后接 RL 微调
     stage1_deals_per_step: int = 32
     stage1_accumulate: int = 4
+    # 双轨预热: BC 和 Critic 交替训练
+    critic_warmup_rounds: int = 10    # 原 5; 给 Critic 更多收敛机会
+    critic_warmup_deals: int = 512
+    critic_warmup_log_interval: int = 2
 
     # Stage 1.5: Belief pre-training
-    belief_pretrain_deals: int = 2000
-    belief_pretrain_epochs: int = 20
-    belief_pretrain_target_acc: float = 0.80
+    belief_pretrain_deals: int = 10000   # 原 2000, 增加 5x 训练数据
+    belief_pretrain_epochs: int = 50     # 原 20, 充分收敛
+    belief_pretrain_target_acc: float = 0.40  # Top-13 命中率目标 (随机基线=0.25, 有意义≥0.35)
 
     # Stage 2: Alternating fine-tune (single_step, batch-mean baseline)
     # S-N-S-N... 交替训练 + 联合微调收尾
@@ -85,8 +89,17 @@ class Phase2Config:
     # KL Anchor: Stage 2 中限制 RL 策略偏离 BC 的程度
     # 前两轮强锚定, 后两轮逐渐放松
     stage2_kl_lambda_start: float = 0.5  # 初始 KL 系数
-    stage2_kl_lambda_end: float = 0.1    # 退火终点
+    stage2_kl_lambda_end: float = 0.1    # 退火终点 (S-phase 用)
     stage2_kl_anneal_frac: float = 1.0   # 覆盖整个训练过程退火
+
+    # N-phase 专用 KL anchor (更强, 防止 N 退化为 100% 2D)
+    # 行动三: kl_lambda_end 提至 0.5, 无论 S 是否倾听, 强制 N 诚实报高花
+    stage2_n_kl_lambda_start: float = 0.5  # N-phase KL 起始值 (与全局相同)
+    stage2_n_kl_lambda_end: float = 0.5    # N-phase KL 终点值 (不退火, 始终保持强锚定)
+
+    # 课程学习前缀 (行动二): 在交替训练前, 先冻结 N 用规则策略, 只训 S N_warmup_rounds 轮
+    # 目的: 让 S 在"完美发信机"环境下建立"倾听信心", 再解冻 N
+    stage2_n_warmup_rounds: int = 1       # 0 = 关闭课程学习前缀; 1 = 保守折中
 
     # Competitive
     competitive_steps: int = 5000
@@ -102,10 +115,10 @@ class Phase2Config:
     bc_epochs: int = 10
 
     # Eval
-    eval_deals: int = 200
+    eval_deals: int = 1000   # 原 200; 标准误差从 ±0.28 降至 ±0.14 IMP
 
     # Diagnostics
-    diag_deals: int = 500
+    diag_deals: int = 2000   # 原 500; 合同分布统计更稳定 (500 deals 方差约 ±2%)
 
     # Go/No-Go
     go_info_ratio: float = 1.0
@@ -118,14 +131,22 @@ class Phase2Config:
 
 def run_stage1(config: Phase2Config) -> dict:
     """
-    Stage 1: 联合训练 N+S base agent.
+    Stage 1: 联合训练 N+S base agent — 双轨预热.
 
     流程:
-      1. BC warmup: 用 north/south_stayman_rule 生成 N+S 联合监督数据
-      2. RL fine-tune: N+S 联合 PPO 微调 (north_rule=False)
+      Phase A: BC warmup (静态数据, Cross-Entropy, 教 Actor "该叫什么")
+      Phase B: Critic Rollout warmup × N 轮 (动态数据, MSE, 教 Critic
+               "在当前策略下, 这手牌能拿多少分")
 
-    BC 保证 N 和 S 都从合理策略出发 (避免随机初始化导致的乱叫),
-    RL 允许 N+S 在规则覆盖不到的边界情况上联合优化.
+    为什么必须双轨:
+      纯 BC 后 Critic 从随机初始化起步. Stage 2 进入时 V(s) 完全无意义.
+      Advantage = reward - V(s) 充满噪声. S 的梯度是"哪个动作看起来比
+      随机 Critic 更好", 而非"哪个动作真的更好". 结果必然坍缩到 4M.
+
+      Critic rollout target = 当前 Actor 在环境里实际拿到的 final_reward.
+      这是 V(s) 的无偏估计. 经过预热的 Critic 能精准区分
+      "8HCP 无配合手牌期望 -5 IMP" 和 "8HCP 有配合期望 +0 IMP",
+      Stage 2 的 Advantage 才能剥离牌运方差, S 才能真正听懂 N 的叫牌.
     """
     print("=" * 60)
     print("Stage 1: Train N+S base (BC warmup + RL fine-tune)")
@@ -140,11 +161,14 @@ def run_stage1(config: Phase2Config) -> dict:
         use_info_bonus=False,
         lr=1e-4,
         device=config.device,
-        active_players=[NORTH, SOUTH],  # Both learn
+        active_players=[NORTH, SOUTH],
+        single_step=False,   # 双轨预热后 Critic 有效, 启用标准 GAE
     )
     trainer = SubgameTrainer(env, sub_config)
 
-    # --- BC Warmup (N+S) ---
+    # ---------------------------------------------------------------
+    # Phase A: BC Warmup (静态数据, 教 Actor)
+    # ---------------------------------------------------------------
     print("\n--- BC Warmup (N+S rules) ---")
     bc_data = create_bc_dataset_for_stayman(
         config.stayman_data,
@@ -164,9 +188,27 @@ def run_stage1(config: Phase2Config) -> dict:
 
     # BC 后诊断
     print("\n--- Post-BC Diagnostics ---")
-    post_bc_diag = _run_diagnostics(env, trainer, config.diag_deals)
+    _run_diagnostics(env, trainer, config.diag_deals)
 
-    # --- RL Fine-tune (optional) ---
+    # ---------------------------------------------------------------
+    # Phase B: Critic Rollout Warmup (动态数据, 教 Critic)
+    # ---------------------------------------------------------------
+    print(f"\n--- Critic Rollout Warmup ({config.critic_warmup_rounds} rounds"
+          f" × {config.critic_warmup_deals} deals) ---")
+    critic_losses = []
+    for rnd in range(1, config.critic_warmup_rounds + 1):
+        v_loss = trainer.critic_warmup_step(num_deals=config.critic_warmup_deals)
+        critic_losses.append(v_loss)
+        if rnd % config.critic_warmup_log_interval == 0 or rnd == 1:
+            print(f"  [Round {rnd}/{config.critic_warmup_rounds}] "
+                  f"critic_value_loss={v_loss:.4f}")
+
+    print(f"  Critic warmup done: "
+          f"loss {critic_losses[0]:.4f} → {critic_losses[-1]:.4f}")
+
+    # ---------------------------------------------------------------
+    # Optional RL fine-tune
+    # ---------------------------------------------------------------
     log = []
     train_time = 0.0
     if config.stage1_steps > 0:
@@ -175,7 +217,7 @@ def run_stage1(config: Phase2Config) -> dict:
         log = trainer.train()
         train_time = time.time() - t0
     else:
-        print("\n--- Skipping RL fine-tune (stage1_steps=0, pure BC) ---")
+        print("\n--- Skipping RL fine-tune (stage1_steps=0, pure BC+Critic) ---")
 
     # Evaluate
     eval_results = _evaluate_stayman_full(env, trainer, config.eval_deals)
@@ -185,6 +227,7 @@ def run_stage1(config: Phase2Config) -> dict:
         'std_imp': eval_results['std_imp'],
         'train_time_sec': train_time,
         'bc_stats': bc_stats,
+        'critic_warmup_losses': critic_losses,
         'final_log': log[-1] if log else {},
     }
 
@@ -242,7 +285,8 @@ def run_belief_pretrain(config: Phase2Config, base_trainer: SubgameTrainer) -> d
 
         if epoch % 5 == 0 or epoch == 1:
             print(f"  [Epoch {epoch}/{config.belief_pretrain_epochs}] "
-                  f"belief_loss={loss:.4f}, belief_acc={acc:.3f}")
+                  f"belief_loss={loss:.4f}, top13_hit={acc:.3f}"
+                  f" (random_baseline=0.25)")
 
         best_acc = max(best_acc, acc)
         if acc >= config.belief_pretrain_target_acc:
@@ -256,9 +300,9 @@ def run_belief_pretrain(config: Phase2Config, base_trainer: SubgameTrainer) -> d
         'target_reached': best_acc >= config.belief_pretrain_target_acc,
     }
 
-    print(f"\nBelief pre-train: acc={best_acc:.3f} "
+    print(f"\nBelief pre-train: top13_hit={best_acc:.3f} "
           f"({'✓ reached' if results['target_reached'] else '✗ not reached'} "
-          f"target={config.belief_pretrain_target_acc:.2f})")
+          f"target={config.belief_pretrain_target_acc:.2f}, random_baseline=0.25)")
 
     return {
         'results': results,
@@ -287,7 +331,7 @@ def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
         lr=lr,
         device=config.device,
         active_players=active_players,
-        single_step=True,
+        single_step=False,   # Critic 已预热, 启用标准 GAE (不再用 batch-mean baseline)
         belief_warmup_steps=belief_warmup,
         entropy_coef_start=entropy_start if entropy_start is not None else config.stage2_entropy_start,
         entropy_coef_end=entropy_end if entropy_end is not None else config.stage2_entropy_end,
@@ -382,6 +426,35 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
         round_imps = []
 
         # ================================================================
+        # 行动二: 课程学习前缀 — 冻结 N (规则策略), 只训 S
+        # 目的: 让 S 在"完美信号源"下学会倾听, 建立"叫 4M 是安全的"信心
+        # 条件: N_warmup_rounds > 0 时启用; 完成后再进入正式交替训练
+        # ================================================================
+        if config.stage2_n_warmup_rounds > 0:
+            print(f"\n  ── Curriculum Warmup: {config.stage2_n_warmup_rounds} rounds"
+                  f" with N=rule (S only) ──")
+            for warmup_rnd in range(1, config.stage2_n_warmup_rounds + 1):
+                env_sw = StaymanSubgameEnv(config.stayman_data, north_rule=True)
+                cfg_sw = _make_sub_config(
+                    config, config.stage2_alt_steps, config.stage2_lr,
+                    active_players=[SOUTH],
+                    use_info=False,
+                    entropy_start=config.stage2_entropy_start,
+                    entropy_end=config.stage2_entropy_end,
+                )
+                trainer_sw, _, eval_sw = _run_one_phase(
+                    config, env_sw, cfg_sw, current_state,
+                    bc_state=bc_state,
+                    phase_label=f"CurriculumWarmup R{warmup_rnd} S-phase",
+                )
+                current_state = copy.deepcopy(trainer_sw.agent.model.state_dict())
+                round_imps.append({
+                    'round': f'CW{warmup_rnd}',
+                    'S_phase': eval_sw['mean_imp'],
+                    'N_phase': None,
+                })
+
+        # ================================================================
         # 交替轮次: S → N → S → N → ...
         # ================================================================
         for rnd in range(1, config.stage2_alt_rounds + 1):
@@ -423,6 +496,11 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 # entropy 每轮重置到 start
                 entropy_start=config.stage2_entropy_start,
                 entropy_end=config.stage2_entropy_end,
+                # 行动三: N-phase 使用更强的 KL anchor, 不退到 0.1
+                # 原理: N 退化成 100% 2D 时 KL 梯度为 0 (已到 BC 分布);
+                #       强 KL_end 让 N 锁定在 BC 的诚实分布附近, 无法摆烂
+                kl_lambda_start=config.stage2_n_kl_lambda_start,
+                kl_lambda_end=config.stage2_n_kl_lambda_end,
             )
 
             trainer_n, log_n, eval_n = _run_one_phase(
@@ -498,7 +576,13 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
         print(f"\n  {name} progression:")
         print(f"    BC base:  IMP ≈ -4.1")
         for ri in round_imps:
-            print(f"    R{ri['round']}: S→{ri['S_phase']:+.2f}  N→{ri['N_phase']:+.2f}")
+            rnd_label = ri['round']
+            s_imp = ri['S_phase']
+            n_imp = ri['N_phase']
+            if n_imp is None:
+                print(f"    {rnd_label}: S→{s_imp:+.2f}  N→(frozen rule)")
+            else:
+                print(f"    R{rnd_label}: S→{s_imp:+.2f}  N→{n_imp:+.2f}")
         print(f"    Joint:    IMP = {eval_j['mean_imp']:+.2f}")
 
         # Diagnostics
@@ -703,37 +787,59 @@ def _classify_contract(contract) -> str:
 
 
 def _has_major_fit(hands, declarer_side_players=(NORTH, SOUTH)) -> dict:
-    """检测 N-S 是否有 4-4 高花配合."""
+    """检测 N-S 高花配合情况 (含 4-4 / 5-3 / 双高花)."""
     p1, p2 = declarer_side_players
-    h1 = count_suit_length(hands[p1], 2)  # hearts
+    h1 = count_suit_length(hands[p1], 2)
     h2 = count_suit_length(hands[p2], 2)
-    s1 = count_suit_length(hands[p1], 3)  # spades
+    s1 = count_suit_length(hands[p1], 3)
     s2 = count_suit_length(hands[p2], 3)
+    heart_fit_44  = h1 >= 4 and h2 >= 4
+    spade_fit_44  = s1 >= 4 and s2 >= 4
+    heart_fit_53  = (h1 >= 5 and h2 >= 3) or (h1 >= 3 and h2 >= 5)
+    spade_fit_53  = (s1 >= 5 and s2 >= 3) or (s1 >= 3 and s2 >= 5)
+    heart_fit     = heart_fit_44 or heart_fit_53
+    spade_fit     = spade_fit_44 or spade_fit_53
     return {
-        'heart_fit': h1 >= 4 and h2 >= 4,
-        'spade_fit': s1 >= 4 and s2 >= 4,
-        'any_fit': (h1 >= 4 and h2 >= 4) or (s1 >= 4 and s2 >= 4),
+        'heart_fit_44': heart_fit_44,
+        'spade_fit_44': spade_fit_44,
+        'heart_fit_53': heart_fit_53 and not heart_fit_44,
+        'spade_fit_53': spade_fit_53 and not spade_fit_44,
+        'heart_fit':    heart_fit,
+        'spade_fit':    spade_fit,
+        'double_fit':   heart_fit and spade_fit,
+        'any_fit':      heart_fit or spade_fit,
+        'best_suit':    'H' if (heart_fit and not spade_fit) else
+                        ('S' if spade_fit else None),
     }
 
 
 def _run_diagnostics(env, trainer, num_deals: int) -> dict:
     """
     全面训练诊断:
-      1. Contract Distribution (定约等级分布)
-      2. N-S Fit Detection (4-4 高花配合检测率)
-      3. Reward / IMP Distribution (奖励分布统计)
+      1. Contract Distribution
+      2. Fit Detection — 细分 4-4 / 5-3 / 双高花
+      3. Decision Error Matrix — 代价矩阵 (有配合却叫 3NT / 无配合叫 4M)
+      4. Reward / IMP Distribution
     """
     agent = trainer.agent
 
     contract_counts = Counter()
-    imp_values = []
-    reward_values = []
+    imp_values, reward_values = [], []
 
-    # Fit detection tracking
-    fit_total = 0           # 有 4-4 fit 的牌副数
-    fit_bid_4M = 0          # 有 fit 且叫到 4M 的次数
-    fit_bid_3NT = 0         # 有 fit 但叫到 3NT 的次数
-    fit_bid_other = 0       # 有 fit 但叫到其他的次数
+    # Fit 细分计数器
+    fit_counts = {
+        'heart_44': 0, 'spade_44': 0,
+        'heart_53': 0, 'spade_53': 0,
+        'double':   0, 'no_fit':   0,
+    }
+    # 代价矩阵: [情形] -> IMP 列表
+    cost_matrix = {
+        'fit_bid_4M':    [],   # ✓ 有配合, 叫对了
+        'fit_bid_3NT':   [],   # ✗ 有配合, 叫了 3NT (漏配合)
+        'nofit_bid_3NT': [],   # ✓ 无配合, 叫对了
+        'nofit_bid_4M':  [],   # ✗ 无配合, 叫了 4M (假配合)
+        'other':         [],
+    }
 
     for _ in range(num_deals):
         hands, dd_table = env.generate_deal()
@@ -747,37 +853,41 @@ def _run_diagnostics(env, trainer, num_deals: int) -> dict:
                 all_hands = env._current_hands
                 all_h_t = torch.tensor(all_hands, dtype=torch.float32).unsqueeze(0).to(agent.device)
                 action, _, _, _ = agent.model.get_action_and_value(
-                    obs_t, all_h_t, deterministic=True
-                )
+                    obs_t, all_h_t, deterministic=True)
                 action = action.item()
-
             obs, reward, done, info = env.step(action)
 
-        # Record IMP and reward
         imp_val = info.get('imp', 0)
         imp_values.append(imp_val)
         reward_values.append(reward)
 
-        # Classify contract
-        contract = env.env.state.final_contract
-        category = _classify_contract(contract)
+        contract  = env.env.state.final_contract
+        category  = _classify_contract(contract)
         contract_counts[category] += 1
 
-        # Fit detection
-        fit_info = _has_major_fit(hands)
-        if fit_info['any_fit']:
-            fit_total += 1
-            if contract is not None:
-                if contract.suit in (2, 3) and contract.level >= 4:
-                    fit_bid_4M += 1
-                elif contract.suit == 4 and contract.level == 3:
-                    fit_bid_3NT += 1
-                else:
-                    fit_bid_other += 1
-            else:
-                fit_bid_other += 1
+        fit_info  = _has_major_fit(hands)
+        bid_4M    = (contract is not None and contract.suit in (2, 3) and contract.level >= 4)
+        bid_3NT   = (contract is not None and contract.suit == 4 and contract.level == 3)
 
-    # === Print diagnostics ===
+        # Fit 细分统计
+        if fit_info['double_fit']:        fit_counts['double']   += 1
+        elif fit_info['heart_fit_44']:    fit_counts['heart_44'] += 1
+        elif fit_info['spade_fit_44']:    fit_counts['spade_44'] += 1
+        elif fit_info['heart_fit_53']:    fit_counts['heart_53'] += 1
+        elif fit_info['spade_fit_53']:    fit_counts['spade_53'] += 1
+        else:                             fit_counts['no_fit']   += 1
+
+        # 代价矩阵
+        if fit_info['any_fit']:
+            if bid_4M:   cost_matrix['fit_bid_4M'].append(imp_val)
+            elif bid_3NT:cost_matrix['fit_bid_3NT'].append(imp_val)
+            else:        cost_matrix['other'].append(imp_val)
+        else:
+            if bid_3NT:  cost_matrix['nofit_bid_3NT'].append(imp_val)
+            elif bid_4M: cost_matrix['nofit_bid_4M'].append(imp_val)
+            else:        cost_matrix['other'].append(imp_val)
+
+    # === Print ===
     total = sum(contract_counts.values())
     print(f"\n  Contract Distribution ({total} deals):")
     display_order = ['passed_out', 'part_score', '3NT', '4M', '5m',
@@ -788,17 +898,30 @@ def _run_diagnostics(env, trainer, num_deals: int) -> dict:
         bar = "█" * int(pct * 40)
         print(f"    {cat:14s}: {n:4d} ({pct:5.1%}) {bar}")
 
-    print(f"\n  N-S Fit Detection:")
-    if fit_total > 0:
-        print(f"    Deals with 4-4 major fit: {fit_total}/{total} ({fit_total/total:.1%})")
-        print(f"    Correctly bid 4M when fit:  {fit_bid_4M}/{fit_total} ({fit_bid_4M/fit_total:.1%})")
-        print(f"    Bid 3NT instead when fit:   {fit_bid_3NT}/{fit_total} ({fit_bid_3NT/fit_total:.1%})")
-        print(f"    Other when fit:             {fit_bid_other}/{fit_total} ({fit_bid_other/fit_total:.1%})")
-    else:
-        print(f"    No 4-4 major fit found in {total} deals")
+    print(f"\n  Fit Distribution ({total} deals):")
+    for label, key in [('4-4 Heart', 'heart_44'), ('4-4 Spade', 'spade_44'),
+                       ('5-3 Heart', 'heart_53'), ('5-3 Spade', 'spade_53'),
+                       ('Double Fit', 'double'), ('No Fit', 'no_fit')]:
+        n = fit_counts[key]
+        print(f"    {label:12s}: {n:4d} ({n/max(1,total):5.1%})")
+
+    print(f"\n  Decision Error Matrix:")
+    for label, key in [
+        ('✓ fit  → 4M  ', 'fit_bid_4M'),
+        ('✗ fit  → 3NT ', 'fit_bid_3NT'),
+        ('✓ nofit→ 3NT ', 'nofit_bid_3NT'),
+        ('✗ nofit→ 4M  ', 'nofit_bid_4M'),
+    ]:
+        vals = cost_matrix[key]
+        if vals:
+            print(f"    {label}: n={len(vals):4d}  "
+                  f"IMP={np.mean(vals):+.2f}±{np.std(vals):.2f}  "
+                  f"[median={np.median(vals):+.1f}]")
+        else:
+            print(f"    {label}: n=   0")
 
     imp_arr = np.array(imp_values)
-    rw_arr = np.array(reward_values)
+    rw_arr  = np.array(reward_values)
     print(f"\n  Reward Distribution:")
     print(f"    reward: mean={rw_arr.mean():+.3f}, std={rw_arr.std():.3f}, "
           f"min={rw_arr.min():+.3f}, max={rw_arr.max():+.3f}")
@@ -806,26 +929,22 @@ def _run_diagnostics(env, trainer, num_deals: int) -> dict:
           f"[p5={np.percentile(imp_arr,5):+.0f}, p95={np.percentile(imp_arr,95):+.0f}]")
 
     # Build result dict
+    def _safe_mean(lst): return float(np.mean(lst)) if lst else 0.0
+
     diag = {
         'contract_distribution': {k: contract_counts.get(k, 0) / max(1, total)
                                   for k in display_order},
-        'fit_detection': {
-            'total_with_fit': fit_total,
-            'correctly_bid_4M': fit_bid_4M,
-            'bid_3NT_instead': fit_bid_3NT,
-            'bid_other': fit_bid_other,
-            'fit_4M_rate': fit_bid_4M / max(1, fit_total),
-            'fit_3NT_rate': fit_bid_3NT / max(1, fit_total),
+        'fit_distribution': {k: v / max(1, total) for k, v in fit_counts.items()},
+        'decision_matrix': {
+            k: {'n': len(v), 'mean_imp': _safe_mean(v)}
+            for k, v in cost_matrix.items()
         },
         'reward_stats': {
-            'mean': float(rw_arr.mean()),
-            'std': float(rw_arr.std()),
-            'min': float(rw_arr.min()),
-            'max': float(rw_arr.max()),
+            'mean': float(rw_arr.mean()), 'std': float(rw_arr.std()),
+            'min': float(rw_arr.min()),   'max': float(rw_arr.max()),
         },
         'imp_stats': {
-            'mean': float(imp_arr.mean()),
-            'std': float(imp_arr.std()),
+            'mean': float(imp_arr.mean()), 'std': float(imp_arr.std()),
             'median': float(np.median(imp_arr)),
             'p5': float(np.percentile(imp_arr, 5)),
             'p95': float(np.percentile(imp_arr, 95)),
@@ -999,6 +1118,8 @@ def main():
         config.stayman_bc_epochs = 3
         config.belief_pretrain_deals = 200
         config.belief_pretrain_epochs = 5
+        config.critic_warmup_rounds = 2      # quick mode: 少跑几轮
+        config.critic_warmup_deals = 128
         print("⚡ Quick mode: reduced steps for testing")
 
     run_phase2(config)

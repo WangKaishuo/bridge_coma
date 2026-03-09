@@ -35,7 +35,7 @@ class SubgameConfig:
     deals_per_step: int = 32
     accumulate_steps: int = 4         # collect N steps before 1 PPO update
     lr: float = 1e-4
-    belief_lr: float = 1e-3
+    belief_lr: float = 1e-4          # Stage 2 在线微调用低 lr, 防止 256-sample batch 震荡覆盖预训练
 
     # Info bonus
     use_info_bonus: bool = False
@@ -140,6 +140,82 @@ class SubgameTrainer:
 
         self.log = []
         self._current_step = 0  # 当前训练步数, 用于 entropy annealing
+
+    def critic_warmup_step(self, num_deals: int = 256) -> float:
+        """
+        Critic 预热: 用当前 Actor rollout 数据做一步 MSE 监督.
+
+        关键设计:
+        - target = 当前策略在环境里实际拿到的 final_reward (非 DDS optimal).
+          这是 V(s) 的无偏估计. 若用 DDS reward 做 target,
+          Critic 会系统性高估当前策略, Stage 2 的 advantage 全为负值,
+          策略梯度惩罚所有动作 → 坍缩.
+        - 只更新 Critic (agent.critic_optimizer), 不更新 Actor.
+        - 复用 agent.critic_optimizer (持久化, 保留动量状态).
+        - 返回 value_loss (float) 供外部监控收敛.
+        """
+        agent = self.agent
+        device = self.device
+
+        # 1. Rollout: 用当前 Actor 策略收集 episodes
+        episodes = self.collect_episodes(num_deals)
+
+        # 2. 构造 (obs, all_hands, target_value) 对
+        obs_list, hands_list, target_list = [], [], []
+        for ep in episodes:
+            final_r = float(ep['final_reward'])
+            for player, traj in ep['player_trajectories'].items():
+                target_r = final_r if player % 2 == 0 else -final_r
+                for step in traj:
+                    obs_list.append(step['obs'])
+                    hands_list.append(step.get('_all_hands'))
+                    target_list.append(target_r)
+
+        if not obs_list:
+            return 0.0
+
+        def stack_obs(obs_list):
+            keys = obs_list[0].keys()
+            return {k: torch.stack([
+                torch.tensor(o[k], dtype=torch.float32) for o in obs_list
+            ]).to(device) for k in keys}
+
+        obs_batch = stack_obs(obs_list)
+        targets = torch.tensor(target_list, dtype=torch.float32).to(device)
+
+        hands_batch = None
+        if hands_list[0] is not None:
+            hands_batch = torch.stack([
+                torch.tensor(h, dtype=torch.float32) for h in hands_list
+            ]).to(device)
+
+        # 3. 用持久化 critic_optimizer 做 mini-batch MSE 更新
+        # 复用 optimizer 保留动量, 不要每次新建 (否则动量清零, warmup 效率低)
+        critic_optimizer = agent.critic_optimizer
+        batch_size = min(256, len(obs_list))
+        idx = torch.randperm(len(obs_list))
+        total_loss = 0.0
+        num_batches = 0
+
+        for start in range(0, len(obs_list), batch_size):
+            b_idx = idx[start:start + batch_size]
+            b_obs = {k: v[b_idx] for k, v in obs_batch.items()}
+            b_targets = targets[b_idx]
+            b_hands = hands_batch[b_idx] if hands_batch is not None else None
+
+            values = agent.model.critic(b_obs, b_hands).squeeze(-1)
+            loss = F.mse_loss(values, b_targets)
+
+            critic_optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                agent.model.critic.parameters(), self.config.max_grad_norm)
+            critic_optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        return total_loss / max(1, num_batches)
 
     def set_bc_anchor(self, state_dict: dict):
         """
@@ -392,38 +468,40 @@ class SubgameTrainer:
                     # ====================================================
                     # KL Anchor: KL(pi_current || pi_bc)
                     # 目的: 防止 RL 摧毁 BC 学到的策略
-                    # 数学: 用当前网络和 BC 参考网络对同一 obs 计算 logits,
-                    #       以 F.kl_div 计算散度并加入 loss
+                    #
+                    # 手写 KL, 不用 F.kl_div:
+                    # F.kl_div(input, target) 中 target 被当作常数,
+                    # 梯度只流向 input. 我们的 input=bc_log_probs (冻结),
+                    # target=curr_probs (需要优化) → 梯度为零, 锚定完全失效.
+                    #
+                    # 正确写法: KL(curr||bc) = sum(P_curr * (logP_curr - logP_bc))
+                    # bc_logits 在 no_grad 里 (bc_model 冻结);
+                    # curr_logits 在 no_grad 外 → 梯度正确流回 actor.
                     # ====================================================
                     kl_loss = torch.tensor(0.0, device=self.device)
                     if use_kl:
-                        with torch.no_grad():
-                            # bc_model 是 PolicyNetwork, 直接调用即返回 raw logits
-                            bc_logits = self.bc_model(batch['obs'])
-                            # curr_logits 也在 no_grad 里计算:
-                            # KL 不应该产生独立的梯度路径回 actor.
-                            # policy_loss 已经通过 ratio*adv 传递梯度了.
-                            # 双路径会导致 logits 数值爆炸 → NaN.
-                            curr_logits_kl = agent.model.actor(batch['obs'])
-
                         MASK_VAL = -1e9
-                        if 'legal_actions' in batch['obs']:
-                            legal = batch['obs']['legal_actions']
-                            illegal = (legal < 0.5)
-                            bc_logits = bc_logits.masked_fill(illegal, MASK_VAL)
-                            curr_logits_kl = curr_logits_kl.masked_fill(illegal, MASK_VAL)
 
-                        bc_log_probs = F.log_softmax(bc_logits, dim=-1)
+                        # bc 参考分布: 冻结, 不需要梯度
+                        with torch.no_grad():
+                            bc_logits = self.bc_model(batch['obs'])
+                            if 'legal_actions' in batch['obs']:
+                                illegal = batch['obs']['legal_actions'] < 0.5
+                                bc_logits = bc_logits.masked_fill(illegal, MASK_VAL)
+                            bc_log_probs = F.log_softmax(bc_logits, dim=-1)
+
+                        # curr 分布: 在计算图内, 梯度流回 actor
+                        curr_logits_kl = agent.model.actor(batch['obs'])
+                        if 'legal_actions' in batch['obs']:
+                            illegal = batch['obs']['legal_actions'] < 0.5
+                            curr_logits_kl = curr_logits_kl.masked_fill(illegal, MASK_VAL)
                         curr_log_probs_kl = F.log_softmax(curr_logits_kl, dim=-1)
                         curr_probs_kl = curr_log_probs_kl.exp()
 
-                        # KL(curr || bc) = F.kl_div(input=log_bc, target=curr_probs)
-                        kl_loss = F.kl_div(
-                            bc_log_probs,
-                            curr_probs_kl,
-                            reduction='batchmean',
-                            log_target=False,
-                        )
+                        # KL(curr || bc) = Σ P_curr * (log P_curr - log P_bc)
+                        # batchmean: 除以 batch size, 与 PPO loss 量纲一致
+                        kl_loss = (curr_probs_kl * (curr_log_probs_kl - bc_log_probs)
+                                   ).sum(dim=-1).mean()
                         if not torch.isfinite(kl_loss):
                             kl_loss = torch.tensor(0.0, device=self.device)
 
@@ -432,26 +510,45 @@ class SubgameTrainer:
                         loss = (policy_loss
                                 - ent_coef * entropy.mean()
                                 + kl_lambda * kl_loss)
+                        agent.actor_optimizer.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            agent.model.actor.parameters(), agent.config.max_grad_norm)
+                        agent.actor_optimizer.step()
                         value_loss_val = 0.0
                     else:
+                        # Actor update (含 KL penalty)
+                        actor_loss = (policy_loss
+                                      - ent_coef * entropy.mean()
+                                      + kl_lambda * kl_loss)
+                        agent.actor_optimizer.zero_grad()
+                        actor_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            agent.model.actor.parameters(), agent.config.max_grad_norm)
+                        agent.actor_optimizer.step()
+
+                        # Critic update: 独立 optimizer + value clipping
+                        # value clipping 防止单步 Critic 更新幅度过大 (PPO2 风格)
                         values = agent.model.critic(
                             batch['obs'], batch.get('all_hands'))
-                        value_loss = F.mse_loss(values, batch['returns'])
-                        loss = (policy_loss
-                                + agent.config.value_coef * value_loss
-                                - ent_coef * entropy.mean()
-                                + kl_lambda * kl_loss)
+                        old_values = values.detach()
+                        v_clipped = old_values + (values - old_values).clamp(
+                            -agent.config.clip_ratio, agent.config.clip_ratio)
+                        value_loss = torch.max(
+                            F.mse_loss(values, batch['returns']),
+                            F.mse_loss(v_clipped, batch['returns'])
+                        )
+                        agent.critic_optimizer.zero_grad()
+                        value_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            agent.model.critic.parameters(), agent.config.max_grad_norm)
+                        agent.critic_optimizer.step()
                         value_loss_val = value_loss.item()
 
-                    agent.optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        agent.model.parameters(), agent.config.max_grad_norm
-                    )
-                    agent.optimizer.step()
-
-                    total_loss += loss.item()
-                    total_policy += policy_loss.item()
+                    # 统计 (single_step 下 loss=actor_loss, multi-step 下分开记)
+                    policy_loss_val = policy_loss.item()
+                    total_loss += policy_loss_val + value_loss_val
+                    total_policy += policy_loss_val
                     total_value += value_loss_val
                     total_entropy += entropy.mean().item()
                     total_kl += kl_loss.item()
@@ -605,11 +702,13 @@ class SubgameTrainer:
         tp = torch.tensor([target_pos], dtype=torch.long).to(self.device)
         th = torch.tensor(target_hand, dtype=torch.float32).unsqueeze(0).to(self.device)
 
-        belief_before = self.belief_net(oh, hb, op, tp).clamp(1e-7, 1 - 1e-7)
-        belief_after = self.belief_net(oh, ha, op, tp).clamp(1e-7, 1 - 1e-7)
+        # 用 get_probs (sigmoid 概率), 而非 forward (logits)
+        # BCE 需要 [0,1] 的概率输入, logits 会产生 NaN
+        belief_before = self.belief_net.get_probs(oh, hb, op, tp).clamp(1e-7, 1 - 1e-7)
+        belief_after  = self.belief_net.get_probs(oh, ha, op, tp).clamp(1e-7, 1 - 1e-7)
 
         ce_before = F.binary_cross_entropy(belief_before, th, reduction='none').sum(dim=-1)
-        ce_after = F.binary_cross_entropy(belief_after, th, reduction='none').sum(dim=-1)
+        ce_after  = F.binary_cross_entropy(belief_after,  th, reduction='none').sum(dim=-1)
 
         return float((ce_before - ce_after).item())
 
@@ -700,11 +799,27 @@ class SubgameTrainer:
         return self.log
 
     def evaluate_belief_accuracy(self, num_deals: int = 50) -> float:
+        """
+        评估 Belief Network 质量 — Top-13 命中率.
+
+        修复两个问题:
+        1. 评估动作: 用 agent 当前策略 (deterministic) 而非随机动作.
+           随机叫牌 history 无信息, 导致指标永远等于先验基线.
+        2. 评估指标: 用 Top-13 命中率替代 threshold acc.
+           旧指标: (pred>0.5)==target, 随机基线=75%, 无法区分好坏.
+           新指标: 取 top-13 概率最高的牌与真实手牌求交集.
+                   随机基线 = 13×13/52 = 3.25/13 ≈ 25%.
+                   完美预测 = 13/13 = 100%.
+                   实际有意义的网络应达到 35-50%+.
+
+        Returns:
+            top13_hit_rate: 0.0 (随机) ~ 1.0 (完美), 随机基线 ≈ 0.25
+        """
         if self.belief_net is None:
             return 0.0
 
         self.belief_net.eval()
-        correct = total = 0
+        all_probs, all_targets = [], []
 
         with torch.no_grad():
             for _ in range(num_deals):
@@ -712,22 +827,29 @@ class SubgameTrainer:
                 obs = self.env.reset(hands, dd_table)
                 done = False
                 while not done:
-                    legal = obs['legal_actions']
-                    action = np.random.choice(np.where(legal > 0.5)[0])
+                    all_hands = self.env._current_hands
+                    action, _ = self.agent.get_action(
+                        obs, all_hands=all_hands, deterministic=True)
                     obs, _, done, _ = self.env.step(action)
 
                 history = self._encode_history(self.env.history)
                 oh = torch.tensor(hands[NORTH], dtype=torch.float32).unsqueeze(0).to(self.device)
-                h = torch.tensor(history, dtype=torch.float32).unsqueeze(0).to(self.device)
-                op = torch.tensor([NORTH], dtype=torch.long).to(self.device)
-                tp = torch.tensor([SOUTH], dtype=torch.long).to(self.device)
+                h  = torch.tensor(history,      dtype=torch.float32).unsqueeze(0).to(self.device)
+                op = torch.tensor([NORTH],       dtype=torch.long).to(self.device)
+                tp = torch.tensor([SOUTH],       dtype=torch.long).to(self.device)
 
-                belief = self.belief_net(oh, h, op, tp)
+                # get_probs 返回 sigmoid 概率 (不再用 forward/logits)
+                probs  = self.belief_net.get_probs(oh, h, op, tp)
                 target = torch.tensor(hands[SOUTH], dtype=torch.float32).unsqueeze(0).to(self.device)
 
-                pred = (belief > 0.5).float()
-                correct += (pred == target).sum().item()
-                total += 52
+                all_probs.append(probs)
+                all_targets.append(target)
 
         self.belief_net.train()
-        return correct / max(1, total)
+
+        if not all_probs:
+            return 0.0
+
+        probs_cat   = torch.cat(all_probs,   dim=0)   # (N, 52)
+        targets_cat = torch.cat(all_targets, dim=0)   # (N, 52)
+        return BeliefNetwork.top13_hit_rate(probs_cat, targets_cat)

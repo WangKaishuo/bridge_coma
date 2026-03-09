@@ -73,7 +73,18 @@ class MAPPOAgent:
             centralized_critic=True
         ).to(self.device)
         
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
+        # 分离 Actor / Critic optimizer:
+        # 共用一个 optimizer 时, policy_loss 和 value_loss 梯度叠加,
+        # value_loss 量级 (MSE, 初始可达 10+) 远大于 policy_loss (~0.001),
+        # Critic 梯度淹没 Actor, 导致 value_loss 爆炸且 policy 无法学习.
+        # 分离后各自独立更新, 互不干扰.
+        self.actor_optimizer = torch.optim.Adam(
+            self.model.actor.parameters(), lr=config.lr)
+        self.critic_optimizer = torch.optim.Adam(
+            self.model.critic.parameters(), lr=config.lr * 2)  # Critic 用 2x lr 加速收敛
+        # 向后兼容: 保留 optimizer 属性指向 actor_optimizer
+        self.optimizer = self.actor_optimizer
+        
         self.buffers = {p: MAPPORolloutBuffer(self.device) for p in range(NUM_PLAYERS)}
     
     def get_action(self, obs: Dict[str, np.ndarray], all_hands: Optional[np.ndarray] = None,
@@ -107,23 +118,40 @@ class MAPPOAgent:
             
             for _ in range(self.config.num_epochs):
                 for batch in buffer.get_batches(self.config.batch_size):
+                    # --- Actor update ---
                     log_probs, entropy = self.model.actor.evaluate_actions(batch['obs'], batch['actions'])
-                    values = self.model.critic(batch['obs'], batch.get('all_hands'))
-                    
                     ratio = torch.exp(log_probs - batch['old_log_probs'])
                     adv = (batch['advantages'] - batch['advantages'].mean()) / (batch['advantages'].std() + 1e-8)
                     
-                    policy_loss = -torch.min(ratio * adv,
-                                             torch.clamp(ratio, 1 - self.config.clip_ratio, 1 + self.config.clip_ratio) * adv).mean()
-                    value_loss = F.mse_loss(values, batch['returns'])
-                    loss = policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy.mean()
+                    policy_loss = -torch.min(
+                        ratio * adv,
+                        torch.clamp(ratio, 1 - self.config.clip_ratio, 1 + self.config.clip_ratio) * adv
+                    ).mean()
+                    actor_loss = policy_loss - self.config.entropy_coef * entropy.mean()
                     
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                    self.optimizer.step()
+                    self.actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    nn.utils.clip_grad_norm_(self.model.actor.parameters(), self.config.max_grad_norm)
+                    self.actor_optimizer.step()
                     
-                    total_loss += loss.item()
+                    # --- Critic update (独立, 带 value clipping) ---
+                    values = self.model.critic(batch['obs'], batch.get('all_hands'))
+                    old_values = batch['values'] if 'values' in batch else values.detach()
+                    
+                    # PPO2 风格 value clipping: 防止单步 Critic 更新幅度过大
+                    v_clipped = old_values + (values - old_values).clamp(
+                        -self.config.clip_ratio, self.config.clip_ratio)
+                    value_loss = torch.max(
+                        F.mse_loss(values, batch['returns']),
+                        F.mse_loss(v_clipped, batch['returns'])
+                    )
+                    
+                    self.critic_optimizer.zero_grad()
+                    value_loss.backward()
+                    nn.utils.clip_grad_norm_(self.model.critic.parameters(), self.config.max_grad_norm)
+                    self.critic_optimizer.step()
+                    
+                    total_loss += actor_loss.item() + value_loss.item()
                     total_policy += policy_loss.item()
                     total_value += value_loss.item()
                     total_entropy += entropy.mean().item()
@@ -135,9 +163,18 @@ class MAPPOAgent:
                 'value_loss': total_value / max(1, num_updates), 'entropy': total_entropy / max(1, num_updates)} if num_updates else {}
     
     def save(self, path: str):
-        torch.save({'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict()}, path)
+        torch.save({
+            'model': self.model.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+        }, path)
     
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt['model'])
-        self.optimizer.load_state_dict(ckpt['optimizer'])
+        if 'actor_optimizer' in ckpt:
+            self.actor_optimizer.load_state_dict(ckpt['actor_optimizer'])
+            self.critic_optimizer.load_state_dict(ckpt['critic_optimizer'])
+        elif 'optimizer' in ckpt:
+            # 向后兼容旧格式
+            self.actor_optimizer.load_state_dict(ckpt['optimizer'])
