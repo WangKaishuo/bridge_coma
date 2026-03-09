@@ -39,7 +39,7 @@ class SubgameConfig:
 
     # Info bonus
     use_info_bonus: bool = False
-    beta: float = 0.5
+    beta: float = 0.05   # info bonus 权重; 0.05-0.1 = "微风"; 0.5 会盖过 IMP 信号
     lambda_start: float = 0.5
     lambda_end: float = 0.1
     belief_warmup_steps: int = 500
@@ -140,6 +140,10 @@ class SubgameTrainer:
 
         self.log = []
         self._current_step = 0  # 当前训练步数, 用于 entropy annealing
+
+        # Reward 归一化: 在线 running stats, 将 IMP regret 归一化为 ~N(0,1)
+        # 与全环境训练方式一致 (普适化设计)
+        self.reward_stats = RunningStats()
 
     def critic_warmup_step(self, num_deals: int = 256) -> float:
         """
@@ -271,11 +275,11 @@ class SubgameTrainer:
 
     def get_kl_lambda(self, step: int) -> float:
         """
-        KL 锚定系数退火.
+        KL 锚定系数退火 (全局基准系数).
 
-        从 kl_lambda_start 线性退到 kl_lambda_end,
-        在 kl_anneal_frac 比例的步数内完成.
-        这让训练前期严格锚定 BC, 后期逐渐放松让策略演化.
+        位置自适应 KL 的基准值, 由 compute_context_kl_weights() 在
+        mini-batch 级别进一步按叫牌阶数加权.
+        从 kl_lambda_start 线性退到 kl_lambda_end.
         """
         cfg = self.config
         if cfg.kl_lambda_start == 0.0:
@@ -285,6 +289,66 @@ class SubgameTrainer:
             return cfg.kl_lambda_end
         progress = step / max(1, anneal_steps)
         return cfg.kl_lambda_start + (cfg.kl_lambda_end - cfg.kl_lambda_start) * progress
+
+    @staticmethod
+    def compute_context_kl_weights(history_obs: torch.Tensor) -> torch.Tensor:
+        """
+        位置自适应 KL 权重 — 基于叫牌序列的当前最高阶数 (context level).
+
+        设计原则 (Gemini / 桥牌知识):
+          1阶: 系统基石 (开叫/应叫), 偏离 BC 后同伴完全迷失 → 权重 1.5
+          2阶: 常规应叫续叫                                    → 权重 1.0
+          3阶: 逼叫序列, 仍需人类协定                          → 权重 0.5
+          4阶: 进局决策, 开始允许 RL 自主探索                  → 权重 0.25
+          5阶+: 高阶争叫/满贯, 完全交给 DDS 算力博弈           → 权重 0.1
+
+        关键: 权重由状态 (history) 决定, 而非由 agent 选择的动作决定.
+        若用动作决定权重, agent 会通过跳叫高阶来规避 KL 惩罚 (gradient exploit).
+
+        Args:
+            history_obs: (B, max_len, NUM_BIDS) one-hot 叫牌历史张量
+                         来自 batch['obs']['history']
+
+        Returns:
+            weights: (B,) 每个样本的 KL 权重, 值域 [0.1, 1.5]
+        """
+        B = history_obs.shape[0]
+        device = history_obs.device
+
+        # BID_1C = 3 (index), 对应1阶最低叫品
+        # 实质叫品 index ∈ [3, 37] (BID_1C 到 7NT)
+        # one-hot 的列索引即 bid index
+        # bid level = (bid_index - 3) // 5 + 1  for bid_index in [3, 37]
+
+        # 找到每个样本历史中最高实质叫品的 level
+        # history_obs: (B, T, 38) → argmax over bid dim: (B, T)
+        bid_indices = history_obs.argmax(dim=-1)  # (B, T)
+
+        # 只考虑实质叫品 (index >= 3, 即 BID_1C+)
+        is_real_bid = (bid_indices >= 3)  # (B, T)
+
+        # 对每个样本, 找最大实质叫品 index
+        # 将非实质叫品位置置 0
+        real_bid_indices = bid_indices * is_real_bid.long()  # (B, T)
+        max_bid_idx = real_bid_indices.max(dim=-1).values    # (B,)
+
+        # 计算 context level: (bid_index - 3) // 5 + 1
+        # 若没有任何实质叫品 (全 Pass 前缀), level = 1
+        context_level = torch.where(
+            max_bid_idx >= 3,
+            (max_bid_idx - 3) // 5 + 1,
+            torch.ones(B, dtype=torch.long, device=device)
+        ).float()  # (B,)
+
+        # 映射到权重 (指数级衰减, 契合桥牌特性)
+        weights = torch.ones(B, device=device)
+        weights = torch.where(context_level <= 1, torch.full_like(weights, 1.5), weights)
+        weights = torch.where(context_level == 2, torch.full_like(weights, 1.0), weights)
+        weights = torch.where(context_level == 3, torch.full_like(weights, 0.5),  weights)
+        weights = torch.where(context_level == 4, torch.full_like(weights, 0.25), weights)
+        weights = torch.where(context_level >= 5, torch.full_like(weights, 0.1),  weights)
+
+        return weights
 
     # ====================================================================
     # Rollout collection
@@ -360,18 +424,66 @@ class SubgameTrainer:
         return episodes
 
     def store_episodes(self, episodes: List[Dict]):
-        """存入 agent buffer, 只存 active players."""
+        """存入 agent buffer, 只存 active players.
+
+        如果启用 info_bonus, 对 N (NORTH) 的 terminal reward 叠加
+        ReLU 截断后的 info gain:
+            r_total = r_IMP + β * max(0, I(bid;hand|partner) - β2*I(bid;hand|opp))
+        β 通常设为较小值 (0.05-0.1), 让信息奖励是"微风"而非"飓风".
+        """
         for ep in episodes:
+            # 预计算 info bonus (只在 use_info_bonus 且 N 是 active player 时)
+            info_bonus_by_player = {}
+            if (self.config.use_info_bonus and self.belief_net is not None
+                    and NORTH in self.active_players):
+                hands = ep['hands']
+                for player, traj in ep['player_trajectories'].items():
+                    if player % 2 != 0:   # 只有 NS 方 (偶数 = N/S)
+                        continue
+                    if player not in self.active_players:
+                        continue
+                    total_gain = 0.0
+                    partner = (player + 2) % 4
+                    opponent = (player + 1) % 4
+                    self.belief_net.eval()
+                    with torch.no_grad():
+                        for step in traj:
+                            hb = self._encode_history(step['history_before'])
+                            ha = self._encode_history(step['history_after'])
+                            pg = self._compute_single_info_gain(
+                                hands[partner], hb, ha, partner, player, hands[player])
+                            ol = self._compute_single_info_gain(
+                                hands[opponent], hb, ha, opponent, player, hands[player])
+                            # ReLU 已在 _compute_single_info_gain 内执行
+                            total_gain += pg - self.config.beta * ol
+                    self.belief_net.train()
+                    info_bonus_by_player[player] = total_gain
+
             for player, traj in ep['player_trajectories'].items():
                 if player not in self.active_players:
                     continue
-                for step in traj:
+                for i, step in enumerate(traj):
+                    reward = step['reward']
+                    # 只在 terminal step 叠加 info bonus (避免中间步稀释)
+                    is_terminal = (i == len(traj) - 1)
+                    if is_terminal and player in info_bonus_by_player:
+                        reward = reward + info_bonus_by_player[player]
+
+                    # Reward 归一化: 在线 running stats → ~N(0,1)
+                    # 只对 terminal reward 归一化 (中间步 reward=0, 跳过)
+                    # 使得 advantage 估计不受 IMP 量纲影响, 与全环境一致
+                    if is_terminal:
+                        self.reward_stats.update(reward)
+                        std = self.reward_stats.std
+                        if std > 1e-6:
+                            reward = (reward - self.reward_stats.mean) / (std + 1e-8)
+
                     self.agent.store_transition(
                         player,
                         step['obs'],
                         step['action'],
                         step['log_prob'],
-                        step['reward'],
+                        reward,
                         step['value'],
                         step['done'],
                         all_hands=step.get('_all_hands'),
@@ -498,10 +610,19 @@ class SubgameTrainer:
                         curr_log_probs_kl = F.log_softmax(curr_logits_kl, dim=-1)
                         curr_probs_kl = curr_log_probs_kl.exp()
 
-                        # KL(curr || bc) = Σ P_curr * (log P_curr - log P_bc)
-                        # batchmean: 除以 batch size, 与 PPO loss 量纲一致
-                        kl_loss = (curr_probs_kl * (curr_log_probs_kl - bc_log_probs)
-                                   ).sum(dim=-1).mean()
+                        # KL(curr || bc) = Σ P_curr * (log P_curr - log P_bc), shape (B,)
+                        kl_per_sample = (curr_probs_kl * (curr_log_probs_kl - bc_log_probs)
+                                         ).sum(dim=-1)
+
+                        # 位置自适应权重: 基于叫牌历史的当前最高阶数 (context level)
+                        # 权重由状态决定, 非动作决定 (防 gradient exploit)
+                        if 'history' in batch['obs']:
+                            ctx_weights = self.compute_context_kl_weights(
+                                batch['obs']['history'].to(self.device))
+                            kl_loss = (kl_per_sample * ctx_weights).mean()
+                        else:
+                            kl_loss = kl_per_sample.mean()
+
                         if not torch.isfinite(kl_loss):
                             kl_loss = torch.tensor(0.0, device=self.device)
 
@@ -598,6 +719,64 @@ class SubgameTrainer:
             n += 1
 
         return total_loss / max(1, n)
+
+    def jit_belief_burnin(self, num_deals: int = 2000, epochs: int = 3,
+                          lr: float = 1e-3):
+        """
+        JIT (Just-In-Time) Belief Burn-in.
+
+        在每轮 N-phase 开始前调用, 用当前策略的 rollout 快速更新 Belief Net,
+        使其与 N 的最新叫牌语言保持同步.
+
+        设计原则:
+        - 冻结 N 和 S (不更新 PPO), 只跑 rollout 采集数据
+        - 用较大的 lr (1e-3) 猛训 3-5 个 epoch, 快速追上语义漂移
+        - 完成后 lr 恢复到正常 belief_lr (1e-4)
+
+        Args:
+            num_deals:  用于 burn-in 的对局数 (建议 1000-3000)
+            epochs:     训练轮数 (建议 3-5)
+            lr:         burn-in 专用 lr (比正常 belief_lr 大 10x)
+        """
+        if self.belief_net is None or self.belief_optimizer is None:
+            return
+
+        # 1. 采集当前策略的 rollout (不更新任何参数)
+        episodes = self.collect_episodes(num_deals)
+        belief_data = self._extract_belief_data(episodes)
+        if not belief_data:
+            return
+
+        # 2. 临时调大 lr
+        for pg in self.belief_optimizer.param_groups:
+            pg['lr'] = lr
+
+        # 3. 多 epoch 猛训 Belief Net
+        total_loss = 0.0
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            n_batches = 0
+            for batch in self._iter_belief_batches(belief_data, batch_size=256):
+                loss = self.belief_net.compute_loss(
+                    batch['observer_hand'], batch['history'],
+                    batch['observer_pos'], batch['target_pos'],
+                    batch['target_hand'],
+                )
+                self.belief_optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.belief_net.parameters(), 1.0)
+                self.belief_optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+            total_loss = epoch_loss / max(1, n_batches)
+
+        # 4. 恢复正常 lr
+        normal_lr = getattr(self.config, 'belief_lr', 1e-4)
+        for pg in self.belief_optimizer.param_groups:
+            pg['lr'] = normal_lr
+
+        print(f"    [JIT Belief Burn-in] {num_deals} deals × {epochs} epochs "
+              f"→ belief_loss={total_loss:.4f}")
 
     def _extract_belief_data(self, episodes: List[Dict]) -> List[Dict]:
         data = []
@@ -710,7 +889,10 @@ class SubgameTrainer:
         ce_before = F.binary_cross_entropy(belief_before, th, reduction='none').sum(dim=-1)
         ce_after  = F.binary_cross_entropy(belief_after,  th, reduction='none').sum(dim=-1)
 
-        return float((ce_before - ce_after).item())
+        # 互信息在数学上 >= 0; 负值是 Belief Net 滞后产生的估算误差
+        # ReLU 截断: 不惩罚探索, 只奖励成功传递信息
+        gain = float((ce_before - ce_after).item())
+        return max(0.0, gain)
 
     # ====================================================================
     # Main training loop
@@ -853,3 +1035,130 @@ class SubgameTrainer:
         probs_cat   = torch.cat(all_probs,   dim=0)   # (N, 52)
         targets_cat = torch.cat(all_targets, dim=0)   # (N, 52)
         return BeliefNetwork.top13_hit_rate(probs_cat, targets_cat)
+
+
+# ============================================================================
+# Head-to-Head Evaluator
+# ============================================================================
+
+class HeadToHeadEvaluator:
+    """
+    双桌 IMP 对比评估框架 (普适化).
+
+    原理: 同一副牌在两桌同时打, Agent A 和 Agent B 分别担任 NS 方,
+    EW 方用相同的固定策略 (规则/frozen policy).
+    双桌 IMP 差 = B_score - A_score, 消除牌力方差.
+
+    这是真实团队赛 (Team Match) 的评估方式, 是论文核心对比指标.
+    与子博弈类型无关, 只要 env 有 generate_deal() 和 reset() 接口即可.
+
+    用法:
+        evaluator = HeadToHeadEvaluator(env_factory, trainer_a, trainer_b)
+        result = evaluator.evaluate(num_deals=500)
+        print(f"B vs A: {result['mean_imp_diff']:+.2f} IMP")
+    """
+
+    def __init__(self, env_factory, trainer_a: SubgameTrainer,
+                 trainer_b: SubgameTrainer, device: str = 'cpu'):
+        """
+        Args:
+            env_factory: 无参数可调用对象, 返回一个新的子博弈 env 实例.
+                         每次 evaluate() 用同一副牌在两个独立 env 里运行.
+            trainer_a: Agent A (对照组, 无 r_info)
+            trainer_b: Agent B (实验组, 有 r_info)
+            device: torch device
+        """
+        self.env_factory = env_factory
+        self.trainer_a = trainer_a
+        self.trainer_b = trainer_b
+        self.device = device
+
+    def _run_one_agent(self, trainer: SubgameTrainer,
+                       hands: np.ndarray, dd_table: np.ndarray) -> float:
+        """
+        用指定 trainer 打一副牌, 返回 IMP (actual vs DDS optimal).
+        使用 deterministic policy (argmax).
+        """
+        import torch
+        env = self.env_factory()
+        obs = env.reset(hands, dd_table)
+        done = False
+        reward = 0.0
+        info = {}
+
+        while not done:
+            all_hands = env._current_hands
+            action, _ = trainer.agent.get_action(
+                obs, all_hands=all_hands, deterministic=True)
+            obs, reward, done, info = env.step(action)
+
+        return float(info.get('imp', reward))
+
+    def evaluate(self, num_deals: int = 500) -> dict:
+        """
+        双桌对比评估.
+
+        对每副牌:
+          - A 打一遍, 得到 imp_a (vs DDS optimal)
+          - B 打同一副牌, 得到 imp_b (vs DDS optimal)
+          - diff = imp_b - imp_a (正数 = B 更好)
+
+        Returns:
+            {
+              'mean_imp_a': float,       # A 的平均 IMP regret
+              'mean_imp_b': float,       # B 的平均 IMP regret
+              'mean_imp_diff': float,    # B - A 的平均 IMP 差 (核心指标)
+              'std_imp_diff': float,     # IMP 差的标准差
+              'win_rate_b': float,       # B 单副牌胜率 (diff > 0 的比例)
+              'n_deals': int,
+            }
+        """
+        # 需要一个临时 env 来 generate_deal
+        ref_env = self.env_factory()
+
+        imp_a_list, imp_b_list, diff_list = [], [], []
+
+        for _ in range(num_deals):
+            hands, dd_table = ref_env.generate_deal()
+
+            imp_a = self._run_one_agent(self.trainer_a, hands, dd_table)
+            imp_b = self._run_one_agent(self.trainer_b, hands, dd_table)
+            diff  = imp_b - imp_a
+
+            imp_a_list.append(imp_a)
+            imp_b_list.append(imp_b)
+            diff_list.append(diff)
+
+        imp_a_arr  = np.array(imp_a_list)
+        imp_b_arr  = np.array(imp_b_list)
+        diff_arr   = np.array(diff_list)
+
+        win_rate_b = float((diff_arr > 0).mean())
+        tie_rate   = float((diff_arr == 0).mean())
+
+        return {
+            'mean_imp_a':    float(imp_a_arr.mean()),
+            'std_imp_a':     float(imp_a_arr.std()),
+            'mean_imp_b':    float(imp_b_arr.mean()),
+            'std_imp_b':     float(imp_b_arr.std()),
+            'mean_imp_diff': float(diff_arr.mean()),
+            'std_imp_diff':  float(diff_arr.std()),
+            'win_rate_b':    win_rate_b,
+            'tie_rate':      tie_rate,
+            'lose_rate_b':   float((diff_arr < 0).mean()),
+            'n_deals':       num_deals,
+        }
+
+    def print_summary(self, result: dict, label_a: str = 'A (MAPPO)',
+                      label_b: str = 'B (MAPPO+r_info)'):
+        """打印对比摘要."""
+        print(f"\n  ── Head-to-Head: {label_b} vs {label_a} ──")
+        print(f"  {label_a:25s}: {result['mean_imp_a']:+.2f} ± {result['std_imp_a']:.2f} IMP")
+        print(f"  {label_b:25s}: {result['mean_imp_b']:+.2f} ± {result['std_imp_b']:.2f} IMP")
+        print(f"  Δ (B − A):               {result['mean_imp_diff']:+.2f} ± {result['std_imp_diff']:.2f} IMP")
+        print(f"  Win rate (B > A):         {result['win_rate_b']:.1%}")
+        print(f"  Tie rate (B = A):         {result['tie_rate']:.1%}")
+        print(f"  Lose rate (B < A):        {result['lose_rate_b']:.1%}")
+        print(f"  Deals evaluated:          {result['n_deals']}")
+        verdict = "✅ B WINS" if result['mean_imp_diff'] > 0 else "❌ A WINS / TIE"
+        print(f"  Verdict:                  {verdict}")

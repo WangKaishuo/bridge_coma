@@ -37,14 +37,15 @@ from subgames.stayman_env import StaymanSubgameEnv
 from subgames.competitive_env import (
     CompetitiveSubgameEnv, cross_evaluate, make_agent_policy,
 )
-from subgames.subgame_trainer import SubgameTrainer, SubgameConfig
+from subgames.subgame_trainer import SubgameTrainer, SubgameConfig, HeadToHeadEvaluator
 from subgames.action_mask import count_suit_length, count_hcp
 from subgames.stayman_env import create_bc_dataset_for_stayman
 from algorithms.behavioral_cloning import (
     BCDataset, behavioral_cloning_warmup,
     create_bc_dataset_for_competitive, evaluate_pass_rate,
 )
-from env import BridgeBiddingEnv, NORTH, SOUTH, string_to_bid, bid_to_string
+from env import (BridgeBiddingEnv, NORTH, SOUTH, EAST, WEST,
+                 BID_PASS, string_to_bid, bid_to_string)
 
 
 # ============================================================================
@@ -104,7 +105,9 @@ class Phase2Config:
     competitive_eval_deals: int = 500
 
     # BC (Stayman)
-    stayman_bc_samples: int = 10000
+    # 20000: 确保稀有情形 (N=17HCP 接受高花邀请 ~5%) 有足够覆盖
+    # 每副牌产生 N×2 + S×1 个样本, 20000 ≈ 6700副 → ~330条4H/4S接受样本
+    stayman_bc_samples: int = 20000
     stayman_bc_epochs: int = 15
 
     # BC (Competitive)
@@ -116,6 +119,12 @@ class Phase2Config:
 
     # Diagnostics
     diag_deals: int = 2000   # 原 500; 合同分布统计更稳定 (500 deals 方差约 ±2%)
+
+    # JIT Belief Burn-in (每轮 N-phase 前, 仅 B)
+    # 用当前策略 rollout 快速同步 Belief Net, 消除语义漂移
+    jit_burnin_deals: int = 1000    # burn-in rollout 对局数
+    jit_burnin_epochs: int = 3      # burn-in 训练轮数
+    jit_burnin_lr: float = 1e-3     # burn-in 专用 lr (比正常 1e-4 大 10x)
 
     # Go/No-Go
     go_info_ratio: float = 1.0
@@ -376,6 +385,43 @@ def _run_one_phase(config: Phase2Config, env, sub_config: SubgameConfig,
     return trainer, log, eval_results
 
 
+def _jit_burn_in(config: Phase2Config, env, current_state: dict,
+                 belief_state: dict, num_deals: int, epochs: int,
+                 lr: float, rnd: int):
+    """
+    JIT Belief Burn-in: 在 N-phase PPO 训练前同步 Belief Net.
+
+    流程:
+      1. 用当前 N+S agent 策略 (不更新 PPO) 采集 rollout
+      2. 以较大 lr 猛训 Belief Net 数个 epoch
+      3. 更新 belief_state in-place (caller 持有引用)
+
+    数学依据:
+      ir = CE(belief_before, hand) - CE(belief_after, hand) ≈ I(bid; hand)
+      互信息 >= 0 (数学定理), 负值意味着 Belief Net 语义滞后.
+      Burn-in 让评估器与当前叫牌协议保持同步, 确保 ir 估计准确.
+    """
+    # 构建只用于 rollout 的临时 trainer (不训练 PPO)
+    burnin_cfg = SubgameConfig(
+        num_steps=1,           # 占位, 不实际用
+        deals_per_step=num_deals,
+        use_info_bonus=True,
+        device=config.device,
+        active_players=[NORTH, SOUTH],
+    )
+    burnin_trainer = SubgameTrainer(env, burnin_cfg)
+    burnin_trainer.agent.model.load_state_dict(current_state)
+    burnin_trainer.belief_net.load_state_dict(belief_state)
+
+    # 运行 JIT burn-in (内部采集 rollout + 快速更新 Belief Net)
+    burnin_trainer.jit_belief_burnin(
+        num_deals=num_deals, epochs=epochs, lr=lr)
+
+    # 将更新后的 belief state 写回 (in-place 修改 dict 内容)
+    belief_state.clear()
+    belief_state.update(burnin_trainer.belief_net.state_dict())
+
+
 def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                belief_pretrain: dict = None) -> dict:
     """
@@ -411,8 +457,8 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
     results = {}
 
     for name, use_info, beta in [
-        ("A_control", False, 0.0),
-        ("B_partner_only", True, 0.0),
+        ("A_control",     False, 0.0),
+        ("B_partner_only", True, 0.05),  # β=0.05: 微风, 不盖过 IMP 信号
     ]:
         print(f"\n{'─'*60}")
         print(f"  Agent: {name}")
@@ -478,6 +524,15 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
 
             # --- N phase: 训 N, 冻结 S ---
             env_n = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+
+            # JIT Belief Burn-in (仅 B, 每轮 N-phase 前执行)
+            # 用当前策略 rollout 快速更新 Belief Net, 消除语义漂移
+            if use_info and current_belief is not None:
+                _jit_burn_in(config, env_n, current_state, current_belief,
+                             num_deals=config.jit_burnin_deals,
+                             epochs=config.jit_burnin_epochs,
+                             lr=config.jit_burnin_lr,
+                             rnd=rnd)
 
             cfg_n = _make_sub_config(
                 config, config.stage2_alt_steps, config.stage2_lr,
@@ -637,6 +692,24 @@ def run_stage3(config: Phase2Config, stage1_results: dict,
     go = _stayman_go_no_go(stage1_results, stage2_results, config)
     analysis['go_no_go'] = go
 
+    # ── Head-to-Head: B vs A 双桌 IMP 对比 ──────────────────────────────
+    print("\n--- Head-to-Head Evaluation (B vs A, dual-table IMP) ---")
+    trainer_a_h2h = stage2_results['A_control'].get('_trainer')
+    trainer_b_h2h = stage2_results['B_partner_only'].get('_trainer')
+    if trainer_a_h2h and trainer_b_h2h:
+        def _stayman_env_factory():
+            return StaymanSubgameEnv(config.stayman_data, north_rule=False)
+        h2h = HeadToHeadEvaluator(
+            _stayman_env_factory, trainer_a_h2h, trainer_b_h2h,
+            device=config.device,
+        )
+        h2h_result = h2h.evaluate(num_deals=config.eval_deals)
+        h2h.print_summary(h2h_result)
+        analysis['head_to_head'] = h2h_result
+    else:
+        print("  (skipped: trainer not available)")
+        analysis['head_to_head'] = {}
+
     # 单副牌模拟演示 (随机抽 3 副有代表性的牌)
     print("\n--- Single Deal Simulation (3 sample deals) ---")
     trainer_a = stage2_results['A_control'].get('_trainer')
@@ -682,7 +755,7 @@ def _analyze_bidding_protocol(env, trainer, num_deals: int = 500) -> dict:
             continue
 
         # --- N's decision ---
-        obs['legal_actions'] = env._get_stayman_mask()
+        obs['legal_actions'] = env.env._get_legal_actions()
         obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
                  for k, v in obs.items()}
         with torch.no_grad():
@@ -704,7 +777,7 @@ def _analyze_bidding_protocol(env, trainer, num_deals: int = 500) -> dict:
         if done: continue
 
         # --- S's decision ---
-        obs['legal_actions'] = env._get_stayman_mask()
+        obs['legal_actions'] = env.env._get_legal_actions()
         obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
                  for k, v in obs.items()}
         with torch.no_grad():
@@ -824,7 +897,8 @@ def simulate_single_deal(trainer_a, trainer_b, hands: np.ndarray,
     def _run_agent_sim(trainer, agent_name):
         agent = trainer.agent
         env_sim = StaymanSubgameEnv(data_path, north_rule=False)
-        obs = env_sim.env.reset(hands, dealer=NORTH, vulnerability=(False, False))
+        # Use env_sim.reset(hands, dd_table) so _current_dd is set correctly
+        obs = env_sim.reset(hands, dd_table)
 
         print(f"\n  {'═'*54}")
         print(f"  Agent {agent_name} — Deal Simulation")
@@ -833,19 +907,16 @@ def simulate_single_deal(trainer_a, trainer_b, hands: np.ndarray,
         for p, pos in enumerate(pos_names):
             print(f"    {pos}: {_hand_str(hands[p])}")
 
-        # Execute fixed prefix silently
-        for bid_str_prefix in env_sim.FIXED_PREFIX:
-            bid = string_to_bid(bid_str_prefix)
-            obs, _, done, _ = env_sim.env.step(bid)
-
         history_display = list(env_sim.FIXED_PREFIX)
         print(f"\n  Auction prefix: {' - '.join(history_display)}")
         print()
 
+        done = False
         step = 0
+        info = {}
         while not done:
             player = env_sim.env.state.current_player
-            obs['legal_actions'] = env_sim._get_stayman_mask()
+            obs['legal_actions'] = env_sim.env._get_legal_actions()
             obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
                      for k, v in obs.items()}
             all_h = torch.tensor(hands, dtype=torch.float32).unsqueeze(0).to(agent.device)
@@ -1102,10 +1173,10 @@ def _run_diagnostics(env, trainer, num_deals: int) -> dict:
 
     imp_arr = np.array(imp_values)
     rw_arr  = np.array(reward_values)
-    print(f"\n  Reward Distribution:")
-    print(f"    reward: mean={rw_arr.mean():+.3f}, std={rw_arr.std():.3f}, "
+    print(f"\n  Reward Distribution (raw IMP regret,归一化在 trainer 内完成):")
+    print(f"    IMP regret: mean={rw_arr.mean():+.3f}, std={rw_arr.std():.3f}, "
           f"min={rw_arr.min():+.3f}, max={rw_arr.max():+.3f}")
-    print(f"    IMP:    mean={imp_arr.mean():+.2f}, median={np.median(imp_arr):+.1f}, "
+    print(f"    IMP eval:   mean={imp_arr.mean():+.2f}, median={np.median(imp_arr):+.1f}, "
           f"[p5={np.percentile(imp_arr,5):+.0f}, p95={np.percentile(imp_arr,95):+.0f}]")
 
     # Build result dict
@@ -1261,7 +1332,7 @@ def main():
     p.add_argument('--device', default=None)
     p.add_argument('--output_dir', default='results/')
     p.add_argument('--stage1_steps', type=int, default=0)
-    p.add_argument('--alt_rounds', type=int, default=4)
+    p.add_argument('--alt_rounds', type=int, default=6)
     p.add_argument('--alt_steps', type=int, default=200)
     p.add_argument('--joint_steps', type=int, default=400)
     p.add_argument('--eval_deals', type=int, default=200)

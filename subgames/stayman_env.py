@@ -271,9 +271,9 @@ class StaymanSubgameEnv:
             obs = self.env._get_observation()
             return obs, reward, True, info
 
-        # 中间步
+        # 中间步: 使用桥牌规则合法性 mask
         if not done_after:
-            obs['legal_actions'] = self._get_stayman_mask()
+            obs['legal_actions'] = self.env._get_legal_actions()
 
         return obs, 0.0, False, info
 
@@ -284,6 +284,7 @@ class StaymanSubgameEnv:
         - north_rule=True 时, N 也用规则策略
 
         返回下一个需要 agent 决策的 player 的 obs.
+        legal_actions 直接使用桥牌规则合法性 mask (普适化, 无硬编码限制).
         """
         while not done:
             player = self.env.state.current_player
@@ -300,8 +301,10 @@ class StaymanSubgameEnv:
                 # 轮到 agent 决策的 player, 停下来
                 break
 
+        # 使用桥牌规则合法性 mask, 而非硬编码的 Stayman 专用 mask
+        # 这确保 agent 面对完整的 38-bid 动作空间, 与全环境一致
         if not done:
-            obs['legal_actions'] = self._get_stayman_mask()
+            obs['legal_actions'] = self.env._get_legal_actions()
 
         return obs
 
@@ -310,7 +313,12 @@ class StaymanSubgameEnv:
         return self.env._check_done()
 
     def _get_stayman_mask(self) -> np.ndarray:
-        """Stayman 专用 action mask."""
+        """
+        [Deprecated] Stayman 专用硬编码 action mask.
+
+        已被桥牌规则合法性 mask (env._get_legal_actions()) 取代.
+        保留此函数仅供向后兼容, 训练/评估代码不应调用.
+        """
         mask = np.zeros(NUM_BIDS, dtype=np.float32)
         history = self.env.state.history
         prefix_len = len(self.FIXED_PREFIX)
@@ -347,59 +355,33 @@ class StaymanSubgameEnv:
 
         return mask
 
-    # Action mask 的最高阶数 — DDS baseline 也应受此限制
-    MAX_LEVEL = 4
-
     def _compute_terminal_reward(self) -> float:
         """
-        训练 reward: Piecewise linear, 映射 IMP regret → [0.01, 1.0]
+        训练 reward: 直接返回 IMP regret (actual - DDS optimal).
 
-        分段设计 (breakpoints 对应桥牌计分的自然不连续点):
-          IMP =  0  → 1.00  完美匹配受限 DDS 最优
-          IMP = -1  → 0.70  错选花色 (3NT vs 4M), 陡峭惩罚 (Δ=0.30)
-          IMP = -6  → 0.25  漏局 (Part-score vs Game)
-          IMP ≤ -13 → 0.01  灾难 (clamp, 保留微弱梯度)
+        值域: (-∞, 0], 通常在 [-13, 0] 范围内.
+        归一化由 SubgameTrainer 的 RunningStats 在线处理,
+        确保 reward 分布 ~ N(0,1), 与全环境训练方式完全一致.
 
-        关键: 0→-1 段斜率 (0.30/IMP) 远大于 -1→-6 段 (0.09/IMP),
-        迫使模型优先区分 N 的应叫 (2H vs 2D vs 2S), 而非恐惧大错.
+        DDS baseline 使用完整 7 阶无限制最优 (max_level=7),
+        让 agent 面对真实的机会成本, 而非人为压低的天花板.
         """
-        imp_diff = self._compute_imp_diff()
-        return float(self._piecewise_reward(imp_diff))
-
-    @staticmethod
-    def _piecewise_reward(imp_diff: float) -> float:
-        """Piecewise linear reward mapping."""
-        if imp_diff >= 0:
-            return 1.0
-        elif imp_diff >= -1:
-            # 陡峭段: 0 → -1 映射到 1.0 → 0.7  (slope = 0.30/IMP)
-            return 1.0 + imp_diff * 0.3
-        elif imp_diff >= -6:
-            # 中等段: -1 → -6 映射到 0.7 → 0.25  (slope = 0.09/IMP)
-            return 0.7 + (imp_diff + 1) * 0.09
-        elif imp_diff >= -13:
-            # 平缓段: -6 → -13 映射到 0.25 → 0.01
-            return 0.25 + (imp_diff + 6) * (0.24 / 7)
-        else:
-            return 0.01
+        return float(self._compute_imp_diff())
 
     def _compute_imp_diff(self) -> float:
         """
-        计算 actual vs DDS optimal (受限) 的 IMP 差值 (≤ 0).
-
-        DDS baseline 受 MAX_LEVEL 限制, 与 action mask 对齐.
-        确保模型不会因叫不到满贯而被不公平地惩罚.
+        计算 actual vs DDS optimal (无级别限制) 的 IMP 差值 (≤ 0).
         """
         contract = self.env.state.final_contract
         dd_table = self._current_dd
         actual_score = self._compute_score(contract, dd_table, is_ns=True)
-        optimal = self._get_optimal_contract_ns(dd_table,
-                                                max_level=self.MAX_LEVEL)
+        # max_level=7: 无限制, 反映真实机会成本
+        optimal = self._get_optimal_contract_ns(dd_table, max_level=7)
         optimal_score = self._compute_score(optimal, dd_table, is_ns=True)
         return float(score_to_imp(actual_score - optimal_score))
 
     def _compute_eval_imp(self) -> float:
-        """评估用 IMP: actual vs DDS optimal (受限)."""
+        """评估用 IMP: actual vs DDS optimal (无级别限制)."""
         return self._compute_imp_diff()
 
     def _compute_score(self, contract: Optional[Contract],
@@ -459,6 +441,366 @@ def create_bc_dataset_for_stayman(
     max_history_len: int = 60,
     players: str = 'south',
 ) -> list:
+    """
+    为 Stayman 子博弈生成 BC 训练数据.
+
+    对每副牌, 模拟完整 Stayman 序列 (N 规则 + S 规则),
+    采集指定玩家的所有决策: (obs, target_action) 对.
+
+    采集点:
+      N Round1: 回应 2C → 2D / 2H / 2S
+      S Round2: 再叫   → 邀请 (2NT/3H/3S) 或 直接进局 (3NT/4H/4S)
+      N Round3: 应邀   → Pass (拒绝) / 3NT / 4H / 4S (接受)
+                只在 S 叫邀请时才存在
+
+    Args:
+        data_path:      DDS 数据路径
+        num_samples:    目标样本数 (建议 ≥ 15000 确保稀有情形覆盖)
+        max_history_len:历史编码长度
+        players:        'south'=只采S, 'north'=只采N, 'both'=采N+S
+
+    Returns:
+        list of {'obs': dict, 'action': int}
+    """
+    loader = create_loader(data_path)
+    env = BridgeBiddingEnv(max_history_len)
+    data = []
+    collect_north = players in ('north', 'both')
+    collect_south = players in ('south', 'both')
+
+    # 统计计数器 (用于摘要)
+    n_r3_reached = 0
+    n_r3_pass = 0
+    n_r3_accept = 0
+    s_action_counts = {}
+
+    max_attempts = num_samples * 20   # 安全上限 (接受率~30%, 有足够余量)
+    attempts = 0
+
+    while len(data) < num_samples and attempts < max_attempts:
+        attempts += 1
+        hands, dd_table = loader.sample_one()
+
+        # 验证约束
+        n_hand, s_hand = hands[NORTH], hands[SOUTH]
+        n_hcp = count_hcp(n_hand)
+        s_hcp = count_hcp(s_hand)
+        if not (15 <= n_hcp <= 17 and is_balanced(n_hand)):
+            continue
+        s_h = count_suit_length(s_hand, 2)
+        s_s = count_suit_length(s_hand, 3)
+        if not (s_hcp >= 8 and (s_h >= 4 or s_s >= 4)):
+            continue
+
+        # 模拟叫牌: 固定前缀 1NT - Pass - 2C - Pass
+        obs = env.reset(hands, dealer=NORTH, vulnerability=(False, False))
+        done = False
+        for bid_str in ["1NT", "Pass", "2C", "Pass"]:
+            obs, _, done, _ = env.step(string_to_bid(bid_str))
+            if done: break
+        if done:
+            continue
+
+        # ── N Round 1: 回应 2C ────────────────────────────────────────────
+        n_target = north_stayman_rule(hands, env.state.history)
+        if not env._is_valid_action(n_target):
+            n_target = BID_PASS
+
+        if collect_north:
+            n_mask = np.zeros(NUM_BIDS, dtype=np.float32)
+            for b in ["2D", "2H", "2S"]:
+                n_mask[string_to_bid(b)] = 1.0
+            n_mask *= env._get_legal_actions()
+            if n_mask.sum() < 0.5:
+                n_mask[BID_PASS] = 1.0
+            if n_mask[n_target] > 0.5:
+                n_obs = {k: v.copy() for k, v in obs.items()}
+                n_obs['legal_actions'] = n_mask
+                data.append({'obs': n_obs, 'action': int(n_target)})
+
+        obs, _, done, _ = env.step(n_target)
+        if done: continue
+        obs, _, done, _ = env.step(BID_PASS)   # E Pass
+        if done: continue
+
+        # ── S Round 2: 邀请或直接进局 ────────────────────────────────────
+        s_target = south_stayman_rule(hands, env.state.history)
+        s_action_counts[bid_to_string(s_target)] = \
+            s_action_counts.get(bid_to_string(s_target), 0) + 1
+
+        if collect_south:
+            s_mask = np.zeros(NUM_BIDS, dtype=np.float32)
+            for b in ["Pass", "2NT", "3NT", "3H", "3S", "4H", "4S"]:
+                s_mask[string_to_bid(b)] = 1.0
+            s_mask *= env._get_legal_actions()
+            if s_mask.sum() < 0.5:
+                s_mask[BID_PASS] = 1.0
+            if s_mask[s_target] > 0.5:
+                s_obs = {k: v.copy() for k, v in obs.items()}
+                s_obs['legal_actions'] = s_mask
+                data.append({'obs': s_obs, 'action': int(s_target)})
+
+        obs, _, done, _ = env.step(s_target)
+        if done: continue
+        obs, _, done, _ = env.step(BID_PASS)   # E Pass
+        if done:
+            # S 直接进局 → 游戏结束, 无需 N 应答
+            continue
+
+        # ── N Round 3: 接受或拒绝邀请 ────────────────────────────────────
+        # 只有 S 叫了邀请 (2NT/3H/3S) 时才能到达这里
+        n_r3_reached += 1
+        n_target2 = north_stayman_rule(hands, env.state.history)
+        if not env._is_valid_action(n_target2):
+            n_target2 = BID_PASS
+
+        if n_target2 == BID_PASS:
+            n_r3_pass += 1
+        else:
+            n_r3_accept += 1
+
+        if collect_north:
+            n_mask2 = np.zeros(NUM_BIDS, dtype=np.float32)
+            for b in ["Pass", "3NT", "4H", "4S"]:
+                n_mask2[string_to_bid(b)] = 1.0
+            n_mask2 *= env._get_legal_actions()
+            if n_mask2.sum() < 0.5:
+                n_mask2[BID_PASS] = 1.0
+            if n_mask2[n_target2] > 0.5:
+                n_obs2 = {k: v.copy() for k, v in obs.items()}
+                n_obs2['legal_actions'] = n_mask2
+                data.append({'obs': n_obs2, 'action': int(n_target2)})
+
+    # ── 摘要 ──────────────────────────────────────────────────────────────
+    n_count = sum(1 for d in data
+                  if d['obs']['position'].argmax() == NORTH) if collect_north else 0
+    s_count = sum(1 for d in data
+                  if d['obs']['position'].argmax() == SOUTH) if collect_south else 0
+
+    # N Round1 vs Round3 细分
+    r1_bids = {string_to_bid(b) for b in ["2D", "2H", "2S"]}
+    n_r1_count = sum(1 for d in data
+                     if d['obs']['position'].argmax() == NORTH
+                     and d['action'] in r1_bids) if collect_north else 0
+    n_r3_count = n_count - n_r1_count
+
+    print(f"Stayman BC dataset: {len(data)} samples  "
+          f"(N={n_count} [R1={n_r1_count} R3={n_r3_count}], S={s_count})")
+    if collect_north and n_r3_reached > 0:
+        print(f"  N Round3: reached={n_r3_reached}, "
+              f"Pass={n_r3_pass} ({n_r3_pass/n_r3_reached:.0%}), "
+              f"Accept={n_r3_accept} ({n_r3_accept/n_r3_reached:.0%})")
+    if s_action_counts:
+        invite = sum(v for k, v in s_action_counts.items()
+                     if k in ("2NT", "3♥", "3H", "3♠", "3S"))
+        game   = sum(v for k, v in s_action_counts.items()
+                     if k in ("3NT", "4♥", "4H", "4♠", "4S"))
+        total_s = invite + game
+        print(f"  S Round2: invite={invite} ({invite/max(1,total_s):.0%}), "
+              f"game={game} ({game/max(1,total_s):.0%})")
+    return data
+    loader = create_loader(data_path)
+    env = BridgeBiddingEnv(max_history_len)
+    data = []
+    collect_north = players in ('north', 'both')
+    collect_south = players in ('south', 'both')
+
+    # ── debug counters ────────────────────────────────────────────────────
+    dbg = {
+        'deals_tried': 0,
+        'n_hcp': {15: 0, 16: 0, 17: 0},
+        's_hcp': {8: 0, 9: 0, 10: 0, 'other': 0},
+        's_action': {},          # S 叫了什么
+        'n_r1_action': {},       # N Round1 叫了什么
+        'n_r3_reached': 0,       # 到达 N Round3 的次数
+        'n_r3_action': {},       # N Round3 叫了什么 (Pass / 4H / 4S / 3NT)
+        'n_r3_hcp': {15: 0, 16: 0, 17: 0},  # N Round3 时 N 的 HCP
+    }
+    # ─────────────────────────────────────────────────────────────────────
+
+    for _ in range(num_samples * 10):   # 扩大上限，确保能采满
+        if len(data) >= num_samples:
+            break
+
+        hands, dd_table = loader.sample_one()
+        dbg['deals_tried'] += 1
+
+        # 验证约束
+        n_hand, s_hand = hands[NORTH], hands[SOUTH]
+        n_hcp = count_hcp(n_hand)
+        s_hcp = count_hcp(s_hand)
+        if not (15 <= n_hcp <= 17 and is_balanced(n_hand)):
+            continue
+        s_h = count_suit_length(s_hand, 2)
+        s_s = count_suit_length(s_hand, 3)
+        if not (s_hcp >= 8 and (s_h >= 4 or s_s >= 4)):
+            continue
+
+        # debug: 记录 HCP 分布
+        dbg['n_hcp'][n_hcp] = dbg['n_hcp'].get(n_hcp, 0) + 1
+        k = s_hcp if s_hcp in (8, 9, 10) else 'other'
+        dbg['s_hcp'][k] = dbg['s_hcp'].get(k, 0) + 1
+
+        # 模拟叫牌
+        obs = env.reset(hands, dealer=NORTH, vulnerability=(False, False))
+
+        # 固定前缀: 1NT - Pass - 2C - Pass
+        done = False
+        for bid_str in ["1NT", "Pass", "2C", "Pass"]:
+            bid = string_to_bid(bid_str)
+            obs, _, done, _ = env.step(bid)
+            if done:
+                break
+        if done:
+            continue
+
+        # --- N Round 1: 回应 2C (2D/2H/2S) ---
+        n_target = north_stayman_rule(hands, env.state.history)
+        if not env._is_valid_action(n_target):
+            n_target = BID_PASS
+
+        dbg['n_r1_action'][bid_to_string(n_target)] = \
+            dbg['n_r1_action'].get(bid_to_string(n_target), 0) + 1
+
+        if collect_north:
+            n_mask = np.zeros(NUM_BIDS, dtype=np.float32)
+            n_mask[string_to_bid("2D")] = 1.0
+            n_mask[string_to_bid("2H")] = 1.0
+            n_mask[string_to_bid("2S")] = 1.0
+            env_legal = env._get_legal_actions()
+            n_mask = n_mask * env_legal
+            if n_mask.sum() < 0.5:
+                n_mask[BID_PASS] = 1.0
+
+            if n_mask[n_target] > 0.5:
+                n_obs = {k: v.copy() for k, v in obs.items()}
+                n_obs['legal_actions'] = n_mask
+                data.append({'obs': n_obs, 'action': int(n_target)})
+
+        # 执行 N 的叫品
+        obs, _, done, _ = env.step(n_target)
+        if done:
+            continue
+
+        # E Pass
+        obs, _, done, _ = env.step(BID_PASS)
+        if done:
+            continue
+
+        # --- S Round 2: 再叫 ---
+        s_target = south_stayman_rule(hands, env.state.history)
+        dbg['s_action'][bid_to_string(s_target)] = \
+            dbg['s_action'].get(bid_to_string(s_target), 0) + 1
+
+        if collect_south:
+            s_mask = np.zeros(NUM_BIDS, dtype=np.float32)
+            s_mask[BID_PASS] = 1.0
+            s_mask[string_to_bid("2NT")] = 1.0
+            s_mask[string_to_bid("3NT")] = 1.0
+            s_mask[string_to_bid("3H")] = 1.0
+            s_mask[string_to_bid("3S")] = 1.0
+            s_mask[string_to_bid("4H")] = 1.0
+            s_mask[string_to_bid("4S")] = 1.0
+            env_legal = env._get_legal_actions()
+            s_mask = s_mask * env_legal
+            if s_mask.sum() < 0.5:
+                s_mask[BID_PASS] = 1.0
+
+            if s_mask[s_target] > 0.5:
+                s_obs = {k: v.copy() for k, v in obs.items()}
+                s_obs['legal_actions'] = s_mask
+                data.append({'obs': s_obs, 'action': int(s_target)})
+
+        # 执行 S 的叫品
+        obs, _, done, _ = env.step(s_target)
+        if done:
+            continue
+
+        # E Pass
+        obs, _, done, _ = env.step(BID_PASS)
+        if done:
+            # S 直接叫局 (4H/4S/3NT), 游戏结束, 不需要 N 应答
+            continue
+
+        # --- N Round 3: 接受或拒绝邀请 ---
+        dbg['n_r3_reached'] += 1
+        dbg['n_r3_hcp'][n_hcp] = dbg['n_r3_hcp'].get(n_hcp, 0) + 1
+
+        if collect_north:
+            n_target2 = north_stayman_rule(hands, env.state.history)
+            if not env._is_valid_action(n_target2):
+                n_target2 = BID_PASS
+
+            dbg['n_r3_action'][bid_to_string(n_target2)] = \
+                dbg['n_r3_action'].get(bid_to_string(n_target2), 0) + 1
+
+            n_mask2 = np.zeros(NUM_BIDS, dtype=np.float32)
+            n_mask2[BID_PASS] = 1.0
+            n_mask2[string_to_bid("3NT")] = 1.0
+            n_mask2[string_to_bid("4H")] = 1.0
+            n_mask2[string_to_bid("4S")] = 1.0
+            env_legal2 = env._get_legal_actions()
+            n_mask2 = n_mask2 * env_legal2
+            if n_mask2.sum() < 0.5:
+                n_mask2[BID_PASS] = 1.0
+
+            if n_mask2[n_target2] > 0.5:
+                n_obs2 = {k: v.copy() for k, v in obs.items()}
+                n_obs2['legal_actions'] = n_mask2
+                data.append({'obs': n_obs2, 'action': int(n_target2)})
+
+    # ── debug report ──────────────────────────────────────────────────────
+    total_deals = sum(dbg['n_hcp'].values())
+    print(f"\n[BC Debug] Deals sampled: {total_deals} (tried {dbg['deals_tried']})")
+
+    print(f"\n  N HCP distribution:")
+    for v in (15, 16, 17):
+        n = dbg['n_hcp'].get(v, 0)
+        print(f"    {v} HCP: {n:5d} ({n/max(1,total_deals):.1%})")
+
+    print(f"\n  S HCP distribution:")
+    for v in (8, 9, 10, 'other'):
+        n = dbg['s_hcp'].get(v, 0)
+        print(f"    {str(v):5s} HCP: {n:5d} ({n/max(1,total_deals):.1%})")
+
+    print(f"\n  N Round1 actions (2D/2H/2S):")
+    for bid, n in sorted(dbg['n_r1_action'].items(), key=lambda x: -x[1]):
+        print(f"    {bid:6s}: {n:5d} ({n/max(1,total_deals):.1%})")
+
+    print(f"\n  S Round2 actions:")
+    for bid, n in sorted(dbg['s_action'].items(), key=lambda x: -x[1]):
+        print(f"    {bid:6s}: {n:5d} ({n/max(1,total_deals):.1%})")
+
+    print(f"\n  N Round3 reached: {dbg['n_r3_reached']} "
+          f"({dbg['n_r3_reached']/max(1,total_deals):.1%} of deals)")
+    if dbg['n_r3_reached'] > 0:
+        print(f"  N Round3 HCP when reached:")
+        for v in (15, 16, 17):
+            n = dbg['n_r3_hcp'].get(v, 0)
+            print(f"    {v} HCP: {n:5d} ({n/max(1,dbg['n_r3_reached']):.1%})")
+        print(f"  N Round3 actions (Pass=拒绝 / 4H,4S,3NT=接受):")
+        for bid, n in sorted(dbg['n_r3_action'].items(), key=lambda x: -x[1]):
+            print(f"    {bid:6s}: {n:5d} ({n/max(1,dbg['n_r3_reached']):.1%})")
+
+    n_count = sum(1 for d in data if d['obs']['position'].argmax() == NORTH) if collect_north else 0
+    s_count = sum(1 for d in data if d['obs']['position'].argmax() == SOUTH) if collect_south else 0
+    print(f"\n  BC samples breakdown: total={len(data)}  N={n_count}  S={s_count}")
+    if collect_north and n_count > 0:
+        n_r1 = sum(1 for d in data
+                   if d['obs']['position'].argmax() == NORTH
+                   and d['action'] in [string_to_bid("2D"),
+                                       string_to_bid("2H"),
+                                       string_to_bid("2S")])
+        n_r3 = n_count - n_r1
+        print(f"    N Round1 samples: {n_r1}  N Round3 samples: {n_r3}")
+        r3_pass = sum(1 for d in data
+                      if d['obs']['position'].argmax() == NORTH
+                      and d['action'] == BID_PASS)
+        r3_accept = n_r3 - r3_pass
+        print(f"    N Round3: Pass(拒绝)={r3_pass}  Accept(接受)={r3_accept}")
+
+    print(f"Stayman BC dataset: {len(data)} samples (N={n_count}, S={s_count})")
+    return data
     """
     为 Stayman 子博弈生成 BC 训练数据.
 
