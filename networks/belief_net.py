@@ -2,7 +2,20 @@
 Belief Network
 ==============
 
-推断他人手牌的网络，用于计算 Dual-Info Bonus
+推断他人手牌的网络，用于计算 Dual-Info Bonus。
+
+v2: 预测目标从 52 维 one-hot 改为 48 维二值语义特征
+    详见 hand_features.py
+
+    [0 :16]  荣誉牌归属 (AKQJ × 4门)  — 16维独立 binary
+    [16:48]  套长 one-hot (0~7+ × 4门) — 32维，每门花色互斥 8档
+
+    优势:
+    - AKQJ 覆盖全部大牌点来源，T以下对叫牌决策贡献极小
+    - one-hot 套长避免阶梯式编码的单调性冗余：
+      "5张黑桃"只激活1个bit，r_info 不会重复计算
+    - pos_weight 统一=3.0，简洁无额外超参数
+    - r_info / BCEWithLogitsLoss 公式完全不变
 """
 
 import torch
@@ -11,32 +24,28 @@ import torch.nn.functional as F
 from typing import Tuple
 
 from env import NUM_BIDS
+from utils.hand_features import (
+    BELIEF_DIM, HONOR_DIM, build_pos_weight, belief_accuracy
+)
 
 
 class BeliefNetwork(nn.Module):
     """
-    Belief Network: 推断目标玩家的手牌
+    Belief Network: 预测目标玩家的 48 维二值语义特征。
 
-    输入: 观察者手牌 + 叫牌历史 + 观察者位置 + 目标位置
-    输出: 目标手牌 52 张牌的 logits (未经 Sigmoid)
+    输入: 观察者手牌 (52) + 叫牌历史 + 观察者位置 + 目标位置
+    输出: (batch, 48) logits，未经 Sigmoid
 
-    关键修复 — 类别不平衡问题:
-    每手 13 张牌, 目标向量中 39 个 0, 13 个 1 (比例 3:1).
-    若用普通 BCE + Sigmoid, 网络只需无脑预测全 0 就能拿到
-    acc = 39/52 = 0.75, Loss ≈ 0.47, 实际上什么都没学.
+    pos_weight:
+        统一 3.0，(48,) tensor
+        荣誉牌理论值恰好 = 3.0 (P=0.25)
+        套长 one-hot 互斥特性使不平衡影响较小，3.0 作为统一值
 
-    修复方案:
-    1. 最后一层去掉 Sigmoid, 直接输出 logits.
-    2. 用 BCEWithLogitsLoss(pos_weight=3.0): 正样本 (有牌) 权重
-       ×3, 强迫网络关注 13 张实际存在的牌.
-    3. 评估改用 Top-13 命中率 (随机基线 = 3.25/13 ≈ 25%),
-       而非阈值 acc (随机基线 = 75%, 完全无法区分好坏).
-
-    forward 返回 logits; 外部调用 sigmoid(logits) 得概率.
+    评估指标 (替代旧版 top13_hit_rate):
+        honor_acc  — AKQJ 归属准确率 (threshold=0.5)
+        length_acc — 套长 argmax 准确率 (等价于分类准确率)
+        overall_acc — 全部48维准确率
     """
-
-    # 正样本权重: 0/1 比例 = 3:1
-    POS_WEIGHT = 3.0
 
     def __init__(self, hand_dim: int = 256, history_dim: int = 256, hidden_dim: int = 256):
         super().__init__()
@@ -58,21 +67,23 @@ class BeliefNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 52),
-            # 注意: 不加 Sigmoid, forward 返回 logits
-            # 概率 = torch.sigmoid(logits)
+            nn.Linear(hidden_dim, BELIEF_DIM),   # 52 → 48
+            # 不加 Sigmoid; forward 返回 logits
         )
+
+        # pos_weight 注册为 buffer（随模型保存/迁移设备）
+        self.register_buffer('pos_weight', build_pos_weight())
 
     def forward(
         self,
         observer_hand: torch.Tensor,
         history: torch.Tensor,
         observer_pos: torch.Tensor,
-        target_pos: torch.Tensor
+        target_pos: torch.Tensor,
     ) -> torch.Tensor:
         """
         Returns:
-            logits: (batch, 52) — 未经 sigmoid 的 raw scores
+            logits: (batch, 48) — 未经 sigmoid 的 raw scores
         """
         hand_feat = self.hand_encoder(observer_hand)
 
@@ -94,9 +105,9 @@ class BeliefNetwork(nn.Module):
         observer_hand: torch.Tensor,
         history: torch.Tensor,
         observer_pos: torch.Tensor,
-        target_pos: torch.Tensor
+        target_pos: torch.Tensor,
     ) -> torch.Tensor:
-        """返回 sigmoid 概率, 供信息增益计算使用."""
+        """返回 sigmoid 概率 (batch, 48)，供 r_info 计算使用。"""
         return torch.sigmoid(self.forward(observer_hand, history, observer_pos, target_pos))
 
     def compute_loss(
@@ -105,91 +116,82 @@ class BeliefNetwork(nn.Module):
         history: torch.Tensor,
         observer_pos: torch.Tensor,
         target_pos: torch.Tensor,
-        target_hand: torch.Tensor
+        target_features: torch.Tensor,   # (batch, 48)
     ) -> torch.Tensor:
         """
-        BCEWithLogitsLoss + pos_weight=3.
-
-        等价于: BCE(sigmoid(logits), target) 但数值更稳定,
-        且正样本梯度权重 ×3, 解决类别不平衡问题.
-        """
-        logits = self.forward(observer_hand, history, observer_pos, target_pos)
-        pw = torch.tensor([self.POS_WEIGHT], device=logits.device)
-        return F.binary_cross_entropy_with_logits(logits, target_hand, pos_weight=pw)
-
-    @staticmethod
-    def top13_hit_rate(probs: torch.Tensor, target_hand: torch.Tensor) -> float:
-        """
-        Top-13 命中率: 取概率最高的 13 张牌, 与真实手牌求交集.
-
-        随机基线: E[交集] = 13×13/52 = 3.25 张 (25%)
-        完美预测: 13 张全中 (100%)
+        BCEWithLogitsLoss with uniform pos_weight=3.0.
 
         Args:
-            probs: (batch, 52) sigmoid 概率
-            target_hand: (batch, 52) 0/1
-        Returns:
-            平均命中率 (0.0 ~ 1.0)
+            target_features: (batch, 48) 由 hand_to_belief_target() 生成
         """
-        top13 = probs.topk(13, dim=-1).indices  # (batch, 13)
-        hits = 0.0
-        for i in range(probs.shape[0]):
-            pred_set = set(top13[i].tolist())
-            true_set = set(target_hand[i].nonzero(as_tuple=False).squeeze(-1).tolist())
-            hits += len(pred_set & true_set)
-        return hits / (probs.shape[0] * 13)
+        logits = self.forward(observer_hand, history, observer_pos, target_pos)
+        return F.binary_cross_entropy_with_logits(
+            logits, target_features, pos_weight=self.pos_weight
+        )
+
+    @staticmethod
+    def evaluate_accuracy(probs: torch.Tensor, targets: torch.Tensor) -> dict:
+        """
+        评估指标，替代旧版 top13_hit_rate。
+
+        Returns:
+            honor_acc  / length_acc / overall_acc
+        """
+        return belief_accuracy(probs, targets)
 
 
 class DualInfoComputer:
     """
     计算 Dual-Info Bonus
-    
+
     r_info = I(bid; hand | partner) - β * I(bid; hand | opponent)
-    
-    近似计算:
-    I(bid; hand) ≈ H(hand | before) - H(hand | after)
-                 ≈ CE(belief_before, hand) - CE(belief_after, hand)
+
+    近似:
+    I(bid; hand) ≈ CE(belief_before, target) - CE(belief_after, target)
+
+    注: target 现为 48 维特征，CE 计算方式与原 52 维完全相同。
+    reduction='mean' 归一化维度数量，避免量纲随特征维度变化漂移。
     """
-    
+
     def __init__(self, belief_net: BeliefNetwork, beta: float = 0.5):
         self.belief_net = belief_net
         self.beta = beta
-    
+
     def compute_info_gain(
         self,
-        belief_before: torch.Tensor,
-        belief_after: torch.Tensor,
-        target_hand: torch.Tensor
+        belief_before: torch.Tensor,    # (batch, 48) sigmoid probs
+        belief_after: torch.Tensor,     # (batch, 48) sigmoid probs
+        target_features: torch.Tensor,  # (batch, 48) 0/1
     ) -> torch.Tensor:
         """
-        计算信息增益
-        
-        = CE(before, target) - CE(after, target)
-        = uncertainty_before - uncertainty_after
+        信息增益 = CE(before, target) - CE(after, target)
+        用 mean(dim=-1) 归一化，消除维度数量对量纲的影响。
         """
-        ce_before = F.binary_cross_entropy(belief_before, target_hand, reduction='none').sum(dim=-1)
-        ce_after = F.binary_cross_entropy(belief_after, target_hand, reduction='none').sum(dim=-1)
+        ce_before = F.binary_cross_entropy(
+            belief_before, target_features, reduction='none'
+        ).mean(dim=-1)   # mean 而非 sum，归一化48维
+        ce_after = F.binary_cross_entropy(
+            belief_after, target_features, reduction='none'
+        ).mean(dim=-1)
         return ce_before - ce_after
-    
+
     def compute_dual_info_bonus(
         self,
         partner_gain: torch.Tensor,
-        opponent_leak: torch.Tensor
+        opponent_leak: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        计算 Dual-Info Bonus
-        
+        Dual-Info Bonus = partner_gain - β * opponent_leak
+
         Returns:
-            bonus: partner_gain - β * opponent_leak
-            metrics: 详细指标
+            bonus:   (batch,) tensor
+            metrics: 详细指标 dict
         """
         bonus = partner_gain - self.beta * opponent_leak
-        
         metrics = {
-            'partner_gain': partner_gain.mean().item(),
-            'opponent_leak': opponent_leak.mean().item(),
-            'info_ratio': (partner_gain.mean() / (opponent_leak.mean() + 1e-8)).item(),
+            'partner_gain':    partner_gain.mean().item(),
+            'opponent_leak':   opponent_leak.mean().item(),
+            'info_ratio':      (partner_gain.mean() / (opponent_leak.mean() + 1e-8)).item(),
             'dual_info_bonus': bonus.mean().item(),
         }
-        
         return bonus, metrics

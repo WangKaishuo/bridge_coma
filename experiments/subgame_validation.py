@@ -4,18 +4,21 @@ Subgame Validation (Phase 2)
 ==============================
 
 三阶段 Stayman 实验:
-  Stage 1: N 规则策略, 训练 S_base (公共基线)
+  Stage 1:   N 规则策略, 训练 S_base (公共基线); BC warmup + Critic rollout warmup
   Stage 1.5: Belief Network 预训练 (用 Stage 1 rollout 数据)
-  Stage 2: 加载 S_base, 解冻 N, 分支 A (MAPPO) vs B (MAPPO+r_info)
-  Stage 3: 评估 + 定性分析 (N 策略偏移) + 训练诊断
+  Stage 2:   加载 S_base, 解冻 N, 分支 A (MAPPO) vs B (MAPPO+r_info)
+             交替训练 (S→N×alt_rounds) + 联合微调收尾
+  Stage 3:   评估 + 定性分析 (叫牌协议树) + H2H 对比
 
 Usage:
     cd bridge-coma/
-    python -m utils.generate_subgame_data --type both --num_workers 4
+    python -m utils.generate_subgame_data --type stayman --num_workers 4
     python experiments/subgame_validation.py \\
         --stayman_data data/stayman_50k.npz \\
-        --competitive_data data/competitive_100k.npz \\
-        --device cuda
+        --seed 42 \\
+        --alt_rounds 3 \\
+        --joint_steps 300 \\
+        --device cpu
 """
 
 import argparse
@@ -25,27 +28,23 @@ import time
 import copy
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from subgames.stayman_env import StaymanSubgameEnv
-from subgames.competitive_env import (
-    CompetitiveSubgameEnv, cross_evaluate, make_agent_policy,
-)
+from subgames.stayman_env import StaymanSubgameEnv, create_bc_dataset_for_stayman
 from subgames.subgame_trainer import SubgameTrainer, SubgameConfig, HeadToHeadEvaluator
 from subgames.action_mask import count_suit_length, count_hcp
-from subgames.stayman_env import create_bc_dataset_for_stayman
-from algorithms.behavioral_cloning import (
-    BCDataset, behavioral_cloning_warmup,
-    create_bc_dataset_for_competitive, evaluate_pass_rate,
+from algorithms.behavioral_cloning import BCDataset, behavioral_cloning_warmup
+from env import (
+    BID_PASS, NORTH, SOUTH, EAST, WEST,
+    bid_to_string, string_to_bid,
 )
-from env import (BridgeBiddingEnv, NORTH, SOUTH, EAST, WEST,
-                 BID_PASS, string_to_bid, bid_to_string)
 
 
 # ============================================================================
@@ -54,11 +53,11 @@ from env import (BridgeBiddingEnv, NORTH, SOUTH, EAST, WEST,
 
 @dataclass
 class Phase2Config:
-    """Phase 2 全局配置."""
+    """Phase 2 全局配置 (Stayman 子博弈)."""
     stayman_data: str = "data/stayman_50k.npz"
-    competitive_data: str = "data/competitive_100k.npz"
     device: str = "cpu"
     output_dir: str = "results/"
+    seed: int = 42
 
     # Stage 1: BC warmup + Critic rollout warmup (双轨预热)
     stage1_steps: int = 0             # 0 = 纯 BC+Critic 预热, >0 = 之后接 RL 微调
@@ -99,32 +98,19 @@ class Phase2Config:
     # 课程学习前缀: 0=关闭 (KL已修好, CW经实验证明弊大于利)
     stage2_n_warmup_rounds: int = 0
 
-    # Competitive
-    competitive_steps: int = 5000
-    competitive_deals_per_step: int = 32
-    competitive_eval_deals: int = 500
-
     # BC (Stayman)
     # 20000: 确保稀有情形 (N=17HCP 接受高花邀请 ~5%) 有足够覆盖
-    # 每副牌产生 N×2 + S×1 个样本, 20000 ≈ 6700副 → ~330条4H/4S接受样本
     stayman_bc_samples: int = 20000
     stayman_bc_epochs: int = 15
 
-    # BC (Competitive)
-    bc_num_samples: int = 30000
-    bc_epochs: int = 10
-
     # Eval
-    eval_deals: int = 1000   # 原 200; 标准误差从 ±0.28 降至 ±0.14 IMP
-
-    # Diagnostics
-    diag_deals: int = 2000   # 原 500; 合同分布统计更稳定 (500 deals 方差约 ±2%)
+    eval_deals: int = 1000   # 标准误差 ±0.14 IMP
+    diag_deals: int = 2000   # 合同分布统计更稳定
 
     # JIT Belief Burn-in (每轮 N-phase 前, 仅 B)
-    # 用当前策略 rollout 快速同步 Belief Net, 消除语义漂移
-    jit_burnin_deals: int = 1000    # burn-in rollout 对局数
-    jit_burnin_epochs: int = 3      # burn-in 训练轮数
-    jit_burnin_lr: float = 1e-3     # burn-in 专用 lr (比正常 1e-4 大 10x)
+    jit_burnin_deals: int = 1000
+    jit_burnin_epochs: int = 3
+    jit_burnin_lr: float = 1e-3
 
     # Go/No-Go
     go_info_ratio: float = 1.0
@@ -733,14 +719,12 @@ def _analyze_bidding_protocol(env, trainer, num_deals: int = 500) -> dict:
       叫牌树: N 叫 X → S 的条件分布
       人类语言策略摘要
     """
-    import torch
     agent = trainer.agent
 
     # N 手型分类 × N 叫品 × S 叫品 的三维计数
     # n_hand_type: has_4H / has_4S / no_4M
     # n_bid: 2D / 2H / 2S
     # s_bid: 2NT / 3H / 3NT / 3S / 4H / 4S / Pass
-    from collections import defaultdict
     tree = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     # tree[n_hand_type][n_bid][s_bid] = count
 
@@ -877,9 +861,6 @@ def simulate_single_deal(trainer_a, trainer_b, hands: np.ndarray,
     用法:
         simulate_single_deal(trainer_a, trainer_b, hands, dd_table, data_path)
     """
-    from env import bid_to_string, string_to_bid, NORTH, SOUTH, EAST, WEST
-    import torch, torch.nn.functional as F
-
     suit_symbols = ['♣', '♦', '♥', '♠', 'NT']
     pos_names    = ['N', 'E', 'S', 'W']
 
@@ -1286,8 +1267,8 @@ def run_phase2(config: Phase2Config) -> dict:
         if not k.startswith('_')
     }
 
-    # Save report
-    report_path = output_dir / "phase2_report.json"
+    # Save report — filename includes seed for multi-seed runs
+    report_path = output_dir / f"phase2_report_seed{config.seed}.json"
     _save_json(report, report_path)
     print(f"\nReport saved to {report_path}")
 
@@ -1326,17 +1307,19 @@ def _save_json(data: dict, path: Path):
 # ============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="Phase 2: Subgame Validation")
+    p = argparse.ArgumentParser(description="Phase 2: Stayman Subgame Validation")
     p.add_argument('--stayman_data', default='data/stayman_50k.npz')
-    p.add_argument('--competitive_data', default='data/competitive_100k.npz')
+    p.add_argument('--seed', type=int, default=42,
+                   help='Random seed (multi-seed: run 5× with seeds 42,123,456,789,2024)')
     p.add_argument('--device', default=None)
     p.add_argument('--output_dir', default='results/')
     p.add_argument('--stage1_steps', type=int, default=0)
-    p.add_argument('--alt_rounds', type=int, default=6)
+    p.add_argument('--alt_rounds', type=int, default=3,
+                   help='Alternating training rounds (default: 3; IMP plateaus by round 2-3)')
     p.add_argument('--alt_steps', type=int, default=200)
-    p.add_argument('--joint_steps', type=int, default=400)
-    p.add_argument('--eval_deals', type=int, default=200)
-    p.add_argument('--diag_deals', type=int, default=500)
+    p.add_argument('--joint_steps', type=int, default=300)
+    p.add_argument('--eval_deals', type=int, default=1000)
+    p.add_argument('--diag_deals', type=int, default=2000)
     # Quick mode for testing
     p.add_argument('--quick', action='store_true',
                    help='Quick test run (fewer steps)')
@@ -1344,9 +1327,13 @@ def main():
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # Set random seeds for reproducibility
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     config = Phase2Config(
         stayman_data=args.stayman_data,
-        competitive_data=args.competitive_data,
+        seed=args.seed,
         device=device,
         output_dir=args.output_dir,
         stage1_steps=args.stage1_steps,
@@ -1369,7 +1356,7 @@ def main():
         config.stayman_bc_epochs = 3
         config.belief_pretrain_deals = 200
         config.belief_pretrain_epochs = 5
-        config.critic_warmup_rounds = 2      # quick mode: 少跑几轮
+        config.critic_warmup_rounds = 2
         config.critic_warmup_deals = 128
         print("⚡ Quick mode: reduced steps for testing")
 

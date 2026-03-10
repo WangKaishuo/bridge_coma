@@ -25,6 +25,9 @@ from networks.belief_net import DualInfoComputer
 from algorithms.ippo import PPOConfig, RolloutBuffer
 from algorithms.mappo import MAPPOAgent, MAPPOConfig, MAPPORolloutBuffer
 from utils.running_stats import RunningStats
+from utils.hand_features import (
+    hand_to_belief_target, batch_hand_to_belief_target, belief_accuracy
+)
 
 
 @dataclass
@@ -464,20 +467,9 @@ class SubgameTrainer:
                     continue
                 for i, step in enumerate(traj):
                     reward = step['reward']
-                    # 只在 terminal step 叠加 info bonus (避免中间步稀释)
                     is_terminal = (i == len(traj) - 1)
                     if is_terminal and player in info_bonus_by_player:
                         reward = reward + info_bonus_by_player[player]
-
-                    # Reward 归一化: 在线 running stats → ~N(0,1)
-                    # 只对 terminal reward 归一化 (中间步 reward=0, 跳过)
-                    # 使得 advantage 估计不受 IMP 量纲影响, 与全环境一致
-                    if is_terminal:
-                        self.reward_stats.update(reward)
-                        std = self.reward_stats.std
-                        if std > 1e-6:
-                            reward = (reward - self.reward_stats.mean) / (std + 1e-8)
-
                     self.agent.store_transition(
                         player,
                         step['obs'],
@@ -793,7 +785,8 @@ class SubgameTrainer:
                             'history': self._encode_history(hist),
                             'observer_pos': player,
                             'target_pos': target,
-                            'target_hand': hands[target],
+                            # 48 维二值特征，替代原始 52 维 one-hot
+                            'target_hand': hand_to_belief_target(hands[target]),
                         })
         return data
 
@@ -879,15 +872,17 @@ class SubgameTrainer:
         ha = torch.tensor(history_after, dtype=torch.float32).unsqueeze(0).to(self.device)
         op = torch.tensor([observer_pos], dtype=torch.long).to(self.device)
         tp = torch.tensor([target_pos], dtype=torch.long).to(self.device)
-        th = torch.tensor(target_hand, dtype=torch.float32).unsqueeze(0).to(self.device)
+        th = torch.tensor(
+            hand_to_belief_target(target_hand), dtype=torch.float32
+        ).unsqueeze(0).to(self.device)
 
         # 用 get_probs (sigmoid 概率), 而非 forward (logits)
         # BCE 需要 [0,1] 的概率输入, logits 会产生 NaN
         belief_before = self.belief_net.get_probs(oh, hb, op, tp).clamp(1e-7, 1 - 1e-7)
         belief_after  = self.belief_net.get_probs(oh, ha, op, tp).clamp(1e-7, 1 - 1e-7)
 
-        ce_before = F.binary_cross_entropy(belief_before, th, reduction='none').sum(dim=-1)
-        ce_after  = F.binary_cross_entropy(belief_after,  th, reduction='none').sum(dim=-1)
+        ce_before = F.binary_cross_entropy(belief_before, th, reduction="none").mean(dim=-1)
+        ce_after  = F.binary_cross_entropy(belief_after,  th, reduction="none").mean(dim=-1)
 
         # 互信息在数学上 >= 0; 负值是 Belief Net 滞后产生的估算误差
         # ReLU 截断: 不惩罚探索, 只奖励成功传递信息
@@ -982,20 +977,16 @@ class SubgameTrainer:
 
     def evaluate_belief_accuracy(self, num_deals: int = 50) -> float:
         """
-        评估 Belief Network 质量 — Top-13 命中率.
+        评估 Belief Network 质量。
 
-        修复两个问题:
-        1. 评估动作: 用 agent 当前策略 (deterministic) 而非随机动作.
-           随机叫牌 history 无信息, 导致指标永远等于先验基线.
-        2. 评估指标: 用 Top-13 命中率替代 threshold acc.
-           旧指标: (pred>0.5)==target, 随机基线=75%, 无法区分好坏.
-           新指标: 取 top-13 概率最高的牌与真实手牌求交集.
-                   随机基线 = 13×13/52 = 3.25/13 ≈ 25%.
-                   完美预测 = 13/13 = 100%.
-                   实际有意义的网络应达到 35-50%+.
+        指标 (替代旧版 top13_hit_rate):
+            top8_acc    — 前8张 (AKQJT987) 归属准确率
+            shape_acc   — 牌型阶梯 (has_4+/5+/6+/7+) 准确率
+            overall_acc — 全部48维准确率
+            (见 utils/hand_features.py)
 
         Returns:
-            top13_hit_rate: 0.0 (随机) ~ 1.0 (完美), 随机基线 ≈ 0.25
+            overall_acc: float, 作为主指标与旧接口保持兼容
         """
         if self.belief_net is None:
             return 0.0
@@ -1020,9 +1011,11 @@ class SubgameTrainer:
                 op = torch.tensor([NORTH],       dtype=torch.long).to(self.device)
                 tp = torch.tensor([SOUTH],       dtype=torch.long).to(self.device)
 
-                # get_probs 返回 sigmoid 概率 (不再用 forward/logits)
                 probs  = self.belief_net.get_probs(oh, h, op, tp)
-                target = torch.tensor(hands[SOUTH], dtype=torch.float32).unsqueeze(0).to(self.device)
+                # 目标转为 48 维特征
+                target = torch.tensor(
+                    hand_to_belief_target(hands[SOUTH]), dtype=torch.float32
+                ).unsqueeze(0).to(self.device)
 
                 all_probs.append(probs)
                 all_targets.append(target)
@@ -1032,9 +1025,14 @@ class SubgameTrainer:
         if not all_probs:
             return 0.0
 
-        probs_cat   = torch.cat(all_probs,   dim=0)   # (N, 52)
-        targets_cat = torch.cat(all_targets, dim=0)   # (N, 52)
-        return BeliefNetwork.top13_hit_rate(probs_cat, targets_cat)
+        probs_cat   = torch.cat(all_probs,   dim=0)   # (N, 48)
+        targets_cat = torch.cat(all_targets, dim=0)   # (N, 48)
+        metrics = belief_accuracy(probs_cat, targets_cat)
+        # 打印详细指标供监控
+        print(f"  [BeliefNet] top8_acc={metrics['top8_acc']:.3f}  "
+              f"shape_acc={metrics['shape_acc']:.3f}  "
+              f"overall_acc={metrics['overall_acc']:.3f}")
+        return metrics['overall_acc']
 
 
 # ============================================================================
@@ -1073,56 +1071,47 @@ class HeadToHeadEvaluator:
         self.trainer_b = trainer_b
         self.device = device
 
-    def _run_one_agent(self, trainer: SubgameTrainer,
-                       hands: np.ndarray, dd_table: np.ndarray) -> float:
+    def _run_one_agent_on_env(self, env, trainer,
+                              hands: np.ndarray, dd_table: np.ndarray) -> float:
         """
-        用指定 trainer 打一副牌, 返回 IMP (actual vs DDS optimal).
+        用指定 trainer 在已有 env 实例上打一副牌.
+        返回 terminal reward (raw IMP regret, ≤ 0).
         使用 deterministic policy (argmax).
         """
-        import torch
-        env = self.env_factory()
         obs = env.reset(hands, dd_table)
         done = False
         reward = 0.0
-        info = {}
 
         while not done:
             all_hands = env._current_hands
             action, _ = trainer.agent.get_action(
                 obs, all_hands=all_hands, deterministic=True)
-            obs, reward, done, info = env.step(action)
+            obs, reward, done, _ = env.step(action)
 
-        return float(info.get('imp', reward))
+        return float(reward)
 
     def evaluate(self, num_deals: int = 500) -> dict:
         """
         双桌对比评估.
 
         对每副牌:
-          - A 打一遍, 得到 imp_a (vs DDS optimal)
-          - B 打同一副牌, 得到 imp_b (vs DDS optimal)
+          - A 打一遍, 得到 imp_a (terminal reward = raw IMP regret)
+          - B 打同一副牌, 得到 imp_b
           - diff = imp_b - imp_a (正数 = B 更好)
 
-        Returns:
-            {
-              'mean_imp_a': float,       # A 的平均 IMP regret
-              'mean_imp_b': float,       # B 的平均 IMP regret
-              'mean_imp_diff': float,    # B - A 的平均 IMP 差 (核心指标)
-              'std_imp_diff': float,     # IMP 差的标准差
-              'win_rate_b': float,       # B 单副牌胜率 (diff > 0 的比例)
-              'n_deals': int,
-            }
+        复用同一对 env 实例, 避免每副牌重建 env 触发大量初始化 print.
         """
-        # 需要一个临时 env 来 generate_deal
-        ref_env = self.env_factory()
+        # 创建一次 env, 整个评估过程复用
+        env_a = self.env_factory()
+        env_b = self.env_factory()
 
         imp_a_list, imp_b_list, diff_list = [], [], []
 
         for _ in range(num_deals):
-            hands, dd_table = ref_env.generate_deal()
+            hands, dd_table = env_a.generate_deal()
 
-            imp_a = self._run_one_agent(self.trainer_a, hands, dd_table)
-            imp_b = self._run_one_agent(self.trainer_b, hands, dd_table)
+            imp_a = self._run_one_agent_on_env(env_a, self.trainer_a, hands, dd_table)
+            imp_b = self._run_one_agent_on_env(env_b, self.trainer_b, hands, dd_table)
             diff  = imp_b - imp_a
 
             imp_a_list.append(imp_a)

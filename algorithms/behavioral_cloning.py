@@ -2,22 +2,25 @@
 Behavioral Cloning
 ==================
 
-BC 预热 — 仅用于 Competitive 子博弈 (1H-1S)。
-Stayman 子博弈不需要 BC (固定前缀后动作空间小)。
+BC 预热 — 用于 Stayman 和 Competitive 子博弈。
 
-开叫规则 + 竞叫应叫规则 (启发式, 偏简单保守)。
+- BCDataset / behavioral_cloning_warmup: 通用 BC 训练组件 (两个子博弈共用)
+- create_bc_dataset_for_competitive: 生成 Competitive 子博弈 BC 数据
+  (Stayman BC 数据由 stayman_env.create_bc_dataset_for_stayman 生成)
+- 开叫规则 + 竞叫应叫规则 (启发式, 偏简单保守)
+- evaluate_pass_rate: 用于诊断 agent 是否退化为全 Pass
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 from torch.utils.data import Dataset, DataLoader
 
 from env import (
-    BridgeBiddingEnv, NUM_BIDS, NUM_PLAYERS,
-    BID_PASS, BID_DOUBLE, BID_1C,
+    BridgeBiddingEnv,
+    BID_PASS, BID_DOUBLE,
     bid_to_string, string_to_bid,
     NORTH, EAST, SOUTH, WEST,
 )
