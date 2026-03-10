@@ -25,9 +25,7 @@ from networks.belief_net import DualInfoComputer
 from algorithms.ippo import PPOConfig, RolloutBuffer
 from algorithms.mappo import MAPPOAgent, MAPPOConfig, MAPPORolloutBuffer
 from utils.running_stats import RunningStats
-from utils.hand_features import (
-    hand_to_belief_target, batch_hand_to_belief_target, belief_accuracy
-)
+from utils.hand_features import hand_to_belief_target, belief_accuracy
 
 
 @dataclass
@@ -79,6 +77,18 @@ class SubgameConfig:
     # Competitive 子博弈 (multi-step) 走标准 GAE, 此处设 False.
     single_step: bool = False
 
+    # Critic LR 倍数: critic_lr = lr * critic_lr_ratio
+    # 分离 Actor/Critic LR, 让 Critic 在非平稳环境下快速重建价值估计.
+    # 交替训练中 partner 策略更新后, Critic 面对新 value landscape,
+    # 高 LR 加速收敛, 避免 vl 长期偏高压制 actor 梯度.
+    critic_lr_ratio: float = 3.0
+
+    # Critic 预热 (轻量版, 仅在交替训练中使用)
+    # 在 PPO 训练前先做固定轮数的纯 Critic 更新, 让 vl 先收敛再更新 Actor.
+    # 0 = 关闭 (默认, 向后兼容)
+    critic_prewarm_rounds: int = 0    # 预热轮数; 0=关闭
+    critic_prewarm_deals: int = 128   # 每轮 rollout deals 数
+
     # Which players does the agent control?
     active_players: Optional[List[int]] = None
 
@@ -116,6 +126,7 @@ class SubgameTrainer:
             value_coef=config.value_coef,
             max_grad_norm=config.max_grad_norm,
             device=config.device,
+            critic_lr_ratio=config.critic_lr_ratio,
         )
         self.agent = MAPPOAgent(mappo_config)
 
@@ -150,77 +161,62 @@ class SubgameTrainer:
 
     def critic_warmup_step(self, num_deals: int = 256) -> float:
         """
-        Critic 预热: 用当前 Actor rollout 数据做一步 MSE 监督.
+        Critic 预热: 用 GAE returns 做纯 Critic MSE 更新, 不更新 Actor.
 
         关键设计:
-        - target = 当前策略在环境里实际拿到的 final_reward (非 DDS optimal).
-          这是 V(s) 的无偏估计. 若用 DDS reward 做 target,
-          Critic 会系统性高估当前策略, Stage 2 的 advantage 全为负值,
-          策略梯度惩罚所有动作 → 坍缩.
-        - 只更新 Critic (agent.critic_optimizer), 不更新 Actor.
-        - 复用 agent.critic_optimizer (持久化, 保留动量状态).
-        - 返回 value_loss (float) 供外部监控收敛.
+        - target = GAE returns (与 PPO 主循环完全一致的 value target).
+          之前用 final_reward 平铺给所有时间步, 与 GAE returns 分布不同,
+          导致预热后 Critic 值域错误, PPO 开始后 advantage 偏差 → 性能下降.
+        - 走完整的 store_episodes → compute_returns_and_advantages 路径,
+          确保 target scale 与 PPO 一致.
+        - 只更新 Critic, 更新后清空 buffer (避免污染 PPO 的 buffer 状态).
         """
         agent = self.agent
-        device = self.device
 
-        # 1. Rollout: 用当前 Actor 策略收集 episodes
+        # 1. 收集 episodes 并存入 buffer (走标准路径, 含 GAE 所需的 value 估计)
         episodes = self.collect_episodes(num_deals)
+        self.store_episodes(episodes)
 
-        # 2. 构造 (obs, all_hands, target_value) 对
-        obs_list, hands_list, target_list = [], [], []
-        for ep in episodes:
-            final_r = float(ep['final_reward'])
-            for player, traj in ep['player_trajectories'].items():
-                target_r = final_r if player % 2 == 0 else -final_r
-                for step in traj:
-                    obs_list.append(step['obs'])
-                    hands_list.append(step.get('_all_hands'))
-                    target_list.append(target_r)
-
-        if not obs_list:
-            return 0.0
-
-        def stack_obs(obs_list):
-            keys = obs_list[0].keys()
-            return {k: torch.stack([
-                torch.tensor(o[k], dtype=torch.float32) for o in obs_list
-            ]).to(device) for k in keys}
-
-        obs_batch = stack_obs(obs_list)
-        targets = torch.tensor(target_list, dtype=torch.float32).to(device)
-
-        hands_batch = None
-        if hands_list[0] is not None:
-            hands_batch = torch.stack([
-                torch.tensor(h, dtype=torch.float32) for h in hands_list
-            ]).to(device)
-
-        # 3. 用持久化 critic_optimizer 做 mini-batch MSE 更新
-        # 复用 optimizer 保留动量, 不要每次新建 (否则动量清零, warmup 效率低)
-        critic_optimizer = agent.critic_optimizer
-        batch_size = min(256, len(obs_list))
-        idx = torch.randperm(len(obs_list))
         total_loss = 0.0
         num_batches = 0
 
-        for start in range(0, len(obs_list), batch_size):
-            b_idx = idx[start:start + batch_size]
-            b_obs = {k: v[b_idx] for k, v in obs_batch.items()}
-            b_targets = targets[b_idx]
-            b_hands = hands_batch[b_idx] if hands_batch is not None else None
+        for player in self.active_players:
+            buffer = agent.buffers[player]
+            if len(buffer.actions) < 2:
+                buffer.reset()
+                continue
 
-            values = agent.model.critic(b_obs, b_hands).squeeze(-1)
-            loss = F.mse_loss(values, b_targets)
+            # 2. 计算 GAE returns (与 safe_update 完全相同的路径)
+            with torch.no_grad():
+                last_obs = {k: v.unsqueeze(0).to(self.device)
+                            for k, v in buffer.observations[-1].items()}
+                last_hands = (buffer.all_hands[-1].unsqueeze(0).to(self.device)
+                              if buffer.all_hands else None)
+                last_value = agent.model.critic(last_obs, last_hands).item()
+            buffer.compute_returns_and_advantages(
+                last_value, agent.config.gamma, agent.config.gae_lambda)
 
-            critic_optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                agent.model.critic.parameters(), self.config.max_grad_norm)
-            critic_optimizer.step()
+            # 3. 只更新 Critic (MSE vs GAE returns), 跳过 Actor
+            critic_optimizer = agent.critic_optimizer
+            for batch in buffer.get_batches(agent.config.batch_size):
+                b_obs   = batch['obs']
+                b_hands = batch.get('all_hands')
+                b_ret   = batch['returns']
 
-            total_loss += loss.item()
-            num_batches += 1
+                values = agent.model.critic(b_obs, b_hands).squeeze(-1)
+                loss = F.mse_loss(values, b_ret)
+
+                critic_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    agent.model.critic.parameters(), self.config.max_grad_norm)
+                critic_optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            # 4. 清空 buffer, 避免污染后续 PPO 主循环的 buffer 状态
+            buffer.reset()
 
         return total_loss / max(1, num_batches)
 
@@ -785,7 +781,6 @@ class SubgameTrainer:
                             'history': self._encode_history(hist),
                             'observer_pos': player,
                             'target_pos': target,
-                            # 48 维二值特征，替代原始 52 维 one-hot
                             'target_hand': hand_to_belief_target(hands[target]),
                         })
         return data
@@ -873,16 +868,17 @@ class SubgameTrainer:
         op = torch.tensor([observer_pos], dtype=torch.long).to(self.device)
         tp = torch.tensor([target_pos], dtype=torch.long).to(self.device)
         th = torch.tensor(
-            hand_to_belief_target(target_hand), dtype=torch.float32
-        ).unsqueeze(0).to(self.device)
+            hand_to_belief_target(target_hand) if target_hand.shape[-1] == 52
+            else target_hand,
+            dtype=torch.float32).unsqueeze(0).to(self.device)
 
         # 用 get_probs (sigmoid 概率), 而非 forward (logits)
         # BCE 需要 [0,1] 的概率输入, logits 会产生 NaN
         belief_before = self.belief_net.get_probs(oh, hb, op, tp).clamp(1e-7, 1 - 1e-7)
         belief_after  = self.belief_net.get_probs(oh, ha, op, tp).clamp(1e-7, 1 - 1e-7)
 
-        ce_before = F.binary_cross_entropy(belief_before, th, reduction="none").mean(dim=-1)
-        ce_after  = F.binary_cross_entropy(belief_after,  th, reduction="none").mean(dim=-1)
+        ce_before = F.binary_cross_entropy(belief_before, th, reduction='none').sum(dim=-1)
+        ce_after  = F.binary_cross_entropy(belief_after,  th, reduction='none').sum(dim=-1)
 
         # 互信息在数学上 >= 0; 负值是 Belief Net 滞后产生的估算误差
         # ReLU 截断: 不惩罚探索, 只奖励成功传递信息
@@ -904,6 +900,19 @@ class SubgameTrainer:
               f"active_players=[{active_str}], "
               f"accumulate={cfg.accumulate_steps}, "
               f"effective_deals/update={eff_deals}")
+
+        # ── Critic 预热 (固定轮数) ───────────────────────────────────────
+        # 在 PPO 主循环前做固定轮数的纯 Critic 更新 (不更新 Actor).
+        # 目的: partner 策略在上轮更新后, Critic 面对新的 value landscape,
+        #       预热让 vl 先收敛, 避免早期高 vl 压制 actor 梯度.
+        if cfg.critic_prewarm_rounds > 0:
+            prewarm_losses = []
+            for _ in range(cfg.critic_prewarm_rounds):
+                vl = self.critic_warmup_step(cfg.critic_prewarm_deals)
+                prewarm_losses.append(vl)
+            print(f"  [Critic Prewarm] {cfg.critic_prewarm_rounds} rounds × "
+                  f"{cfg.critic_prewarm_deals} deals: "
+                  f"vl {prewarm_losses[0]:.3f} → {prewarm_losses[-1]:.3f}")
 
         all_episodes_window = []
         latest_update_stats = {}  # 缓存最新 PPO update 指标
@@ -977,16 +986,20 @@ class SubgameTrainer:
 
     def evaluate_belief_accuracy(self, num_deals: int = 50) -> float:
         """
-        评估 Belief Network 质量。
+        评估 Belief Network 质量 — Top-13 命中率.
 
-        指标 (替代旧版 top13_hit_rate):
-            top8_acc    — 前8张 (AKQJT987) 归属准确率
-            shape_acc   — 牌型阶梯 (has_4+/5+/6+/7+) 准确率
-            overall_acc — 全部48维准确率
-            (见 utils/hand_features.py)
+        修复两个问题:
+        1. 评估动作: 用 agent 当前策略 (deterministic) 而非随机动作.
+           随机叫牌 history 无信息, 导致指标永远等于先验基线.
+        2. 评估指标: 用 Top-13 命中率替代 threshold acc.
+           旧指标: (pred>0.5)==target, 随机基线=75%, 无法区分好坏.
+           新指标: 取 top-13 概率最高的牌与真实手牌求交集.
+                   随机基线 = 13×13/52 = 3.25/13 ≈ 25%.
+                   完美预测 = 13/13 = 100%.
+                   实际有意义的网络应达到 35-50%+.
 
         Returns:
-            overall_acc: float, 作为主指标与旧接口保持兼容
+            top13_hit_rate: 0.0 (随机) ~ 1.0 (完美), 随机基线 ≈ 0.25
         """
         if self.belief_net is None:
             return 0.0
@@ -1011,11 +1024,11 @@ class SubgameTrainer:
                 op = torch.tensor([NORTH],       dtype=torch.long).to(self.device)
                 tp = torch.tensor([SOUTH],       dtype=torch.long).to(self.device)
 
+                # get_probs 返回 sigmoid 概率 (不再用 forward/logits)
                 probs  = self.belief_net.get_probs(oh, h, op, tp)
-                # 目标转为 48 维特征
                 target = torch.tensor(
-                    hand_to_belief_target(hands[SOUTH]), dtype=torch.float32
-                ).unsqueeze(0).to(self.device)
+                    hand_to_belief_target(hands[SOUTH]),
+                    dtype=torch.float32).unsqueeze(0).to(self.device)
 
                 all_probs.append(probs)
                 all_targets.append(target)
@@ -1027,12 +1040,11 @@ class SubgameTrainer:
 
         probs_cat   = torch.cat(all_probs,   dim=0)   # (N, 48)
         targets_cat = torch.cat(all_targets, dim=0)   # (N, 48)
-        metrics = belief_accuracy(probs_cat, targets_cat)
-        # 打印详细指标供监控
-        print(f"  [BeliefNet] top8_acc={metrics['top8_acc']:.3f}  "
-              f"shape_acc={metrics['shape_acc']:.3f}  "
-              f"overall_acc={metrics['overall_acc']:.3f}")
-        return metrics['overall_acc']
+        acc_dict = belief_accuracy(probs_cat, targets_cat)
+        print(f"  [BeliefNet] honor_acc={acc_dict['honor_acc']:.3f} "
+              f" length_acc={acc_dict['length_acc']:.3f} "
+              f" overall_acc={acc_dict['overall_acc']:.3f}")
+        return acc_dict['overall_acc']
 
 
 # ============================================================================

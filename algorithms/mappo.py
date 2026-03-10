@@ -21,6 +21,7 @@ from algorithms.ippo import PPOConfig, RolloutBuffer
 class MAPPOConfig(PPOConfig):
     """MAPPO 配置"""
     centralized_critic: bool = True
+    critic_lr_ratio: float = 3.0   # critic_lr = lr * ratio; 默认3x加速Critic收敛
 
 
 class MAPPORolloutBuffer(RolloutBuffer):
@@ -81,7 +82,7 @@ class MAPPOAgent:
         self.actor_optimizer = torch.optim.Adam(
             self.model.actor.parameters(), lr=config.lr)
         self.critic_optimizer = torch.optim.Adam(
-            self.model.critic.parameters(), lr=config.lr * 2)  # Critic 用 2x lr 加速收敛
+            self.model.critic.parameters(), lr=config.lr * config.critic_lr_ratio)
         # 向后兼容: 保留 optimizer 属性指向 actor_optimizer
         self.optimizer = self.actor_optimizer
         
