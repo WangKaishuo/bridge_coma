@@ -378,16 +378,7 @@ class StaymanSubgameEnv:
     @staticmethod
     def _piecewise_reward(imp_diff: float) -> float:
         """Piecewise linear reward mapping."""
-        if imp_diff >= 0:
-            return 1.0
-        elif imp_diff >= -1:
-            return 1.0 + imp_diff * 0.3
-        elif imp_diff >= -6:
-            return 0.7 + (imp_diff + 1) * 0.09
-        elif imp_diff >= -13:
-            return 0.25 + (imp_diff + 6) * (0.24 / 7)
-        else:
-            return 0.01
+        return max(imp_diff/13 + 1, 0.01)
 
     def _compute_imp_diff(self) -> float:
         """

@@ -117,9 +117,9 @@ class Phase2Config:
     competitive_eval_deals: int = 500
 
     # BC (Stayman)
-    # 20000: 确保稀有情形 (N=17HCP 接受高花邀请 ~5%) 有足够覆盖
-    # 每副牌产生 N×2 + S×1 个样本, 20000 ≈ 6700副 → ~330条4H/4S接受样本
-    stayman_bc_samples: int = 20000
+    # 50000: 确保稀有情形 (N=17HCP 接受高花邀请 ~5%) 有足够覆盖
+    # early stopping 控制过拟合 (acc>=0.98 × 3 epochs), 不依赖样本数减少
+    stayman_bc_samples: int = 50000
     stayman_bc_epochs: int = 15
 
     # BC (Competitive)
@@ -186,27 +186,72 @@ def run_stage1(config: Phase2Config) -> dict:
 
     # ---------------------------------------------------------------
     # Phase A: BC Warmup (静态数据, 教 Actor)
+    # HAPPO: actor_n 和 actor_s 独立, 分别用各自角色数据训练
     # ---------------------------------------------------------------
-    print("\n--- BC Warmup (N+S rules) ---")
-    bc_data = create_bc_dataset_for_stayman(
+    print("\n--- BC Warmup (N+S rules, HAPPO dual-actor) ---")
+    bc_data_n = create_bc_dataset_for_stayman(
         config.stayman_data,
         num_samples=config.stayman_bc_samples,
-        players='both',
+        players='north',
     )
-    bc_dataset = BCDataset(bc_data)
-    bc_stats = behavioral_cloning_warmup(
+    bc_data_s = create_bc_dataset_for_stayman(
+        config.stayman_data,
+        num_samples=config.stayman_bc_samples,
+        players='south',
+    )
+
+    from env import NORTH as _NORTH, SOUTH as _SOUTH
+    # 训练 actor_n (NORTH)
+    bc_stats_n = behavioral_cloning_warmup(
         trainer.agent,
-        bc_dataset,
+        BCDataset(bc_data_n),
         epochs=config.stayman_bc_epochs,
         lr=1e-3,
         batch_size=256,
+        player=_NORTH,
     )
-    print(f"  BC result: loss={bc_stats['final_loss']:.4f}, "
-          f"acc={bc_stats['final_acc']:.3f}")
+    print(f"  BC-N: loss={bc_stats_n['final_loss']:.4f}, "
+          f"acc={bc_stats_n['final_acc']:.3f}, "
+          f"ent={bc_stats_n.get('final_entropy', 0):.3f}, "
+          f"epochs={bc_stats_n.get('epochs_trained', config.stayman_bc_epochs)}"
+          f"{' (early stop)' if bc_stats_n.get('stopped_early') else ''}")
+
+    # 训练 actor_s (SOUTH)
+    bc_stats_s = behavioral_cloning_warmup(
+        trainer.agent,
+        BCDataset(bc_data_s),
+        epochs=config.stayman_bc_epochs,
+        lr=1e-3,
+        batch_size=256,
+        player=_SOUTH,
+    )
+    print(f"  BC-S: loss={bc_stats_s['final_loss']:.4f}, "
+          f"acc={bc_stats_s['final_acc']:.3f}, "
+          f"ent={bc_stats_s.get('final_entropy', 0):.3f}, "
+          f"epochs={bc_stats_s.get('epochs_trained', config.stayman_bc_epochs)}"
+          f"{' (early stop)' if bc_stats_s.get('stopped_early') else ''}")
+
+    bc_stats = {'N': bc_stats_n, 'S': bc_stats_s,
+                'final_loss': (bc_stats_n['final_loss'] + bc_stats_s['final_loss']) / 2,
+                'final_acc':  (bc_stats_n['final_acc']  + bc_stats_s['final_acc'])  / 2}
 
     # BC 后诊断
-    print("\n--- Post-BC Diagnostics ---")
+    print("\n--- Post-BC Diagnostics (BC N + BC S, north_rule=False) ---")
     _run_diagnostics(env, trainer, config.diag_deals)
+
+    # ---------------------------------------------------------------
+    # BC 质量对比: rule-N vs BC-N
+    # 量化 "BC 的 N 比规则 N 差多少", 确认 BC 阶段有无引入 N-side 弱点
+    # ---------------------------------------------------------------
+    print("\n--- BC Quality Check: rule-N vs BC-N (S quality isolation) ---")
+    env_rule_n = StaymanSubgameEnv(config.stayman_data, north_rule=True)
+    eval_rule_n = _evaluate_stayman_full(env_rule_n, trainer, config.eval_deals)
+    eval_bc_n   = _evaluate_stayman_full(env,         trainer, config.eval_deals)
+    delta_n = eval_bc_n['mean_imp'] - eval_rule_n['mean_imp']
+    print(f"  S with rule-N:  IMP = {eval_rule_n['mean_imp']:+.2f} ± {eval_rule_n['std_imp']:.2f}")
+    print(f"  S with BC-N:    IMP = {eval_bc_n['mean_imp']:+.2f} ± {eval_bc_n['std_imp']:.2f}")
+    print(f"  Δ (BC-N − rule-N): {delta_n:+.2f} IMP  "
+          f"{'⚠ BC-N is significantly weaker' if delta_n < -0.5 else '✓ within acceptable range'}")
 
     # ---------------------------------------------------------------
     # Phase B: Critic Rollout Warmup (动态数据, 教 Critic)
@@ -370,6 +415,52 @@ def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
     )
 
 
+def _revive_entropy(state_dict: dict, temperature: float = 2.0) -> dict:
+    """
+    BC 后策略坍缩修复: 对 actor 最后一层 logit 权重做温度缩放.
+
+    HAPPO 改动 (P48): state_dict 现在包含 actor_n.* 和 actor_s.* 两组参数.
+    对两组各自找到最后一层 38-dim output head 并缩放.
+
+    原理:
+      BC 训练到 acc≈0.98 后, actor 最后一层对 "正确" 动作输出极大 logit (~10),
+      其余动作 logit 极小. softmax 后概率几乎是 one-hot, entropy≈0.
+      PPO 的 entropy bonus (coef × H(π)) 乘以近似零 → 梯度消失 → RL 空转.
+
+      将最后一层权重除以 temperature, 压缩 logit 量级:
+        logit_new = logit_old / T
+      概率分布从近 one-hot 变为更平滑的分布
+      entropy 从 ~0 恢复到 ~log(T) nats 量级
+
+      关键: 只缩放量级, 不改变排序 → BC 学到的相对偏好完全保留.
+
+    Args:
+        state_dict: agent.state_dict() (新格式: actor_n.* / actor_s.* / critic.*)
+                    或旧格式 (actor.* / critic.*)
+        temperature: logit 缩放因子 (推荐 1.3-2.0)
+
+    Returns:
+        修改后的 state dict (新对象, 不污染原始 bc_state)
+    """
+    import copy
+    new_state = copy.deepcopy(state_dict)
+
+    for key, tensor in new_state.items():
+        # 匹配 actor_n 或 actor_s 的最后一层 output head (38-dim)
+        # 旧格式兼容: actor.fc.2.weight / actor.fc.2.bias
+        is_actor_key = (key.startswith('actor_n.') or
+                        key.startswith('actor_s.') or
+                        key.startswith('actor.'))
+        if not is_actor_key:
+            continue
+        if tensor.dim() == 2 and tensor.shape[0] == 38:
+            new_state[key] = tensor / temperature
+        elif tensor.dim() == 1 and tensor.shape[0] == 38:
+            new_state[key] = tensor / temperature
+
+    return new_state
+
+
 def _run_one_phase(config: Phase2Config, env, sub_config: SubgameConfig,
                    prev_state: dict, belief_state: dict = None,
                    bc_state: dict = None,
@@ -381,7 +472,8 @@ def _run_one_phase(config: Phase2Config, env, sub_config: SubgameConfig,
     若提供 bc_state, 注入 KL anchor (防 RL 摧毁 BC 策略).
     """
     trainer = SubgameTrainer(env, sub_config)
-    trainer.agent.model.load_state_dict(prev_state)
+    # HAPPO: agent.load_state_dict 支持新格式 (actor_n.* / actor_s.* / critic.*)
+    trainer.agent.load_state_dict(prev_state)
 
     # 注入 KL anchor: BC 快照 = Stage 1 结束时的参数
     # 每个半轮重新注入同一个 bc_state, 确保 anchor 始终指向 BC 分布
@@ -429,7 +521,7 @@ def _jit_burn_in(config: Phase2Config, env, current_state: dict,
         active_players=[NORTH, SOUTH],
     )
     burnin_trainer = SubgameTrainer(env, burnin_cfg)
-    burnin_trainer.agent.model.load_state_dict(current_state)
+    burnin_trainer.agent.load_state_dict(current_state)
     burnin_trainer.belief_net.load_state_dict(belief_state)
 
     # 运行 JIT burn-in (内部采集 rollout + 快速更新 Belief Net)
@@ -468,7 +560,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
     print("  A=MAPPO (control) vs B=MAPPO+r_info")
     print("=" * 60)
 
-    base_state = copy.deepcopy(base_trainer.agent.model.state_dict())
+    base_state = copy.deepcopy(base_trainer.agent.state_dict())
     belief_state = belief_pretrain['belief_state'] if belief_pretrain else None
     # BC 快照: Stage 1 结束时的参数, 用于 KL anchor
     bc_state = copy.deepcopy(base_state)
@@ -488,6 +580,16 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
         round_imps = []
 
         # ================================================================
+        # Entropy 复活: BC 后策略坍缩修复
+        # BC acc≈0.98 时 actor logit 已极端, entropy≈0, RL 无法探索.
+        # temperature=2.0 压缩 logit 量级, 恢复 entropy 到 ~0.5 nats,
+        # 同时保留 BC 学到的动作偏好排序 (相对顺序不变).
+        # ================================================================
+        print(f"  [Entropy Revival] Applying temperature=2.0 to BC logits "
+              f"before Stage 2 RL fine-tuning...")
+        current_state = _revive_entropy(current_state, temperature=2.0)
+
+        # ================================================================
         # 课程学习前缀 (可选): 冻结 N=规则, 只训 S
         # ================================================================
         if config.stage2_n_warmup_rounds > 0:
@@ -505,7 +607,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                     config, env_sw, cfg_sw, current_state, bc_state=bc_state,
                     phase_label=f"CurriculumWarmup R{warmup_rnd} S-phase",
                 )
-                current_state = copy.deepcopy(trainer_sw.agent.model.state_dict())
+                current_state = copy.deepcopy(trainer_sw.agent.state_dict())
                 round_imps.append({
                     'round': f'CW{warmup_rnd}', 'S_phase': eval_sw['mean_imp'],
                     'N_phase': None,
@@ -557,7 +659,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 bc_state=bc_state,
                 phase_label=f"R{rnd} S-phase",
             )
-            current_state = copy.deepcopy(trainer_s.agent.model.state_dict())
+            current_state = copy.deepcopy(trainer_s.agent.state_dict())
 
             # --- N phase: 训 N, 冻结 S ---
             env_n = StaymanSubgameEnv(config.stayman_data, north_rule=False)
@@ -590,7 +692,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 bc_state=bc_state,
                 phase_label=f"R{rnd} N-phase",
             )
-            current_state = copy.deepcopy(trainer_n.agent.model.state_dict())
+            current_state = copy.deepcopy(trainer_n.agent.state_dict())
 
             # 更新 belief state (如果有)
             if use_info and trainer_n.belief_net is not None:
@@ -958,7 +1060,7 @@ def simulate_single_deal(trainer_a, trainer_b, hands: np.ndarray,
             all_h = torch.tensor(hands, dtype=torch.float32).unsqueeze(0).to(agent.device)
 
             with torch.no_grad():
-                logits = agent.model.actor(obs_t)
+                logits = agent.get_actor(player)(obs_t)
                 legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32).to(agent.device)
                 masked = logits.squeeze(0) - 1e9 * (1 - legal)
                 probs  = F.softmax(masked, dim=-1)
@@ -1333,7 +1435,7 @@ def run_phase2(config: Phase2Config) -> dict:
 def _save_checkpoint(trainer, path: Path, name: str):
     """保存模型权重 (policy + belief)."""
     ckpt = {
-        'model': trainer.agent.model.state_dict(),
+        'model': trainer.agent.state_dict(),
     }
     if trainer.belief_net is not None:
         ckpt['belief_net'] = trainer.belief_net.state_dict()

@@ -197,7 +197,7 @@ class SubgameTrainer:
                 last_value, agent.config.gamma, agent.config.gae_lambda)
 
             # 3. 只更新 Critic (MSE vs GAE returns), 跳过 Actor
-            critic_optimizer = agent.critic_optimizer
+            # HAPPO: Critic 共享, 直接用 agent.critic_optimizer (不变)
             for batch in buffer.get_batches(agent.config.batch_size):
                 b_obs   = batch['obs']
                 b_hands = batch.get('all_hands')
@@ -206,11 +206,11 @@ class SubgameTrainer:
                 values = agent.model.critic(b_obs, b_hands).squeeze(-1)
                 loss = F.mse_loss(values, b_ret)
 
-                critic_optimizer.zero_grad()
+                agent.critic_optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     agent.model.critic.parameters(), self.config.max_grad_norm)
-                critic_optimizer.step()
+                agent.critic_optimizer.step()
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -224,29 +224,51 @@ class SubgameTrainer:
         """
         设置 BC 锚点模型 (Stage 1 结束时的快照).
 
+        HAPPO 改动 (P48): bc_model 从单个 PolicyNetwork 改为 per-player dict.
+          self.bc_model = {NORTH: bc_model_n, SOUTH: bc_model_s}
+
         调用后, safe_update() 会在 loss 中加入 KL 惩罚项:
           loss += kl_lambda * KL(pi_current || pi_bc)
 
-        只需要 Actor 部分计算参考 logits, 不需要 Critic.
-        从完整 state_dict 中提取 actor.* 前缀的参数即可,
-        避免 centralized_critic 结构不匹配的问题.
+        state_dict 支持:
+          - 新格式 (actor_n.* / actor_s.* / critic.*): 分别提取
+          - 旧格式 (actor.* / critic.*): actor 复制给 N 和 S 各一份
         """
         from networks.policy_net import PolicyNetwork
-        self.bc_model = PolicyNetwork(
-            hand_dim=self.config.hand_dim,
-            history_dim=self.config.history_dim,
-            hidden_dim=self.config.hidden_dim,
-        ).to(self.device)
-        # 从完整 ActorCritic state_dict 中提取 actor.* 参数
-        actor_state = {
-            k[len('actor.'):]: v
-            for k, v in state_dict.items()
-            if k.startswith('actor.')
+
+        def _make_bc_net(actor_state: dict) -> PolicyNetwork:
+            net = PolicyNetwork(
+                hand_dim=self.config.hand_dim,
+                history_dim=self.config.history_dim,
+                hidden_dim=self.config.hidden_dim,
+            ).to(self.device)
+            net.load_state_dict(actor_state)
+            net.eval()
+            for p in net.parameters():
+                p.requires_grad_(False)
+            return net
+
+        if any(k.startswith('actor_n.') for k in state_dict):
+            # 新格式: 各自提取
+            actor_n_state = {k[len('actor_n.'):]: v for k, v in state_dict.items()
+                             if k.startswith('actor_n.')}
+            actor_s_state = {k[len('actor_s.'):]: v for k, v in state_dict.items()
+                             if k.startswith('actor_s.')}
+        elif any(k.startswith('actor.') for k in state_dict):
+            # 旧格式: 共享 actor → 复制到 N 和 S
+            actor_state = {k[len('actor.'):]: v for k, v in state_dict.items()
+                           if k.startswith('actor.')}
+            actor_n_state = actor_state
+            actor_s_state = actor_state
+        else:
+            # 直接是 PolicyNetwork state_dict (无前缀)
+            actor_n_state = state_dict
+            actor_s_state = state_dict
+
+        self.bc_model = {
+            NORTH: _make_bc_net(actor_n_state),
+            SOUTH: _make_bc_net(actor_s_state),
         }
-        self.bc_model.load_state_dict(actor_state)
-        self.bc_model.eval()
-        for p in self.bc_model.parameters():
-            p.requires_grad_(False)
 
     def get_lambda(self, step: int) -> float:
         cfg = self.config
@@ -374,18 +396,20 @@ class SubgameTrainer:
 
                 # 检查是否是 agent 决策的 player
                 if player not in self.active_players:
-                    # 非 active player: 用 agent 当前策略 (deterministic)
-                    # 而非随机, 确保冻结的 player 保持 BC 学到的行为
+                    # 非 active player: 用该 player 自己的 actor (deterministic)
+                    # HAPPO: actor_n 和 actor_s 独立, 必须按 player 分发
+                    # 确保冻结的 player 保持 BC 学到的行为, 不被对方训练污染
                     all_hands = self.env._current_hands
-                    action, _ = self.agent.get_action(
-                        obs, all_hands=all_hands, deterministic=True)
+                    action, _ = self.agent.get_action_for_player(
+                        obs, player, all_hands=all_hands, deterministic=True)
                     obs, reward, done, info = self.env.step(action)
                     continue
 
                 history_before = self.env.history.copy()
 
                 all_hands = self.env._current_hands
-                action, extra = self.agent.get_action(obs, all_hands=all_hands)
+                action, extra = self.agent.get_action_for_player(
+                    obs, player, all_hands=all_hands)
                 extra['_all_hands'] = all_hands
 
                 obs_next, reward, done, info = self.env.step(action)
@@ -511,23 +535,23 @@ class SubgameTrainer:
                 buffer.reset()
                 continue
 
+            # HAPPO: 按 player 选择对应 actor 和 optimizer
+            actor = agent.get_actor(player)
+            actor_opt = agent.get_actor_optimizer(player)
+
             # ============================================================
             # 偷梁换柱: single_step → batch-mean baseline 替代 GAE
             # ============================================================
             if is_single:
-                # 1-step episode: Q(s,a) = r(s,a), 无需 bootstrapping
                 rewards = torch.tensor(buffer.rewards, dtype=torch.float32)
                 buffer.returns = rewards
-                # batch-mean baseline: advantage = reward - mean(reward)
                 baseline = rewards.mean()
                 advantages = rewards - baseline
-                # 标准化 (跨整个 buffer, 而非 mini-batch 内再做一次)
                 adv_std = advantages.std()
                 if torch.isfinite(adv_std) and adv_std > 1e-6:
                     advantages = advantages / (adv_std + 1e-8)
                 buffer.advantages = advantages
             else:
-                # 标准 GAE (Competitive 子博弈等 multi-step 场景)
                 with torch.no_grad():
                     last_obs = {k: v.unsqueeze(0).to(self.device)
                                 for k, v in buffer.observations[-1].items()}
@@ -541,14 +565,13 @@ class SubgameTrainer:
 
             for _ in range(agent.config.num_epochs):
                 for batch in buffer.get_batches(agent.config.batch_size):
-                    log_probs, entropy = agent.model.actor.evaluate_actions(
+                    # HAPPO: 用 player 对应的 actor evaluate actions
+                    log_probs, entropy = actor.evaluate_actions(
                         batch['obs'], batch['actions']
                     )
 
                     ratio = torch.exp(log_probs - batch['old_log_probs'])
 
-                    # Advantage: single_step 已在 buffer 级别标准化;
-                    # multi-step 仍需 mini-batch 级别标准化
                     adv = batch['advantages']
                     if not is_single:
                         if adv.numel() > 1:
@@ -567,43 +590,34 @@ class SubgameTrainer:
 
                     # ====================================================
                     # KL Anchor: KL(pi_current || pi_bc)
-                    # 目的: 防止 RL 摧毁 BC 学到的策略
-                    #
-                    # 手写 KL, 不用 F.kl_div:
-                    # F.kl_div(input, target) 中 target 被当作常数,
-                    # 梯度只流向 input. 我们的 input=bc_log_probs (冻结),
-                    # target=curr_probs (需要优化) → 梯度为零, 锚定完全失效.
-                    #
-                    # 正确写法: KL(curr||bc) = sum(P_curr * (logP_curr - logP_bc))
-                    # bc_logits 在 no_grad 里 (bc_model 冻结);
-                    # curr_logits 在 no_grad 外 → 梯度正确流回 actor.
+                    # HAPPO: 按 player 选对应的 bc_model
                     # ====================================================
                     kl_loss = torch.tensor(0.0, device=self.device)
                     if use_kl:
                         MASK_VAL = -1e9
+                        # bc_model 是 {NORTH: net, SOUTH: net} dict
+                        # 按 player 取对应锚点 (NORTH=bc_model[NORTH], 其余=SOUTH)
+                        bc_key = NORTH if player == NORTH else SOUTH
+                        bc_net = self.bc_model[bc_key]
 
-                        # bc 参考分布: 冻结, 不需要梯度
                         with torch.no_grad():
-                            bc_logits = self.bc_model(batch['obs'])
+                            bc_logits = bc_net(batch['obs'])
                             if 'legal_actions' in batch['obs']:
                                 illegal = batch['obs']['legal_actions'] < 0.5
                                 bc_logits = bc_logits.masked_fill(illegal, MASK_VAL)
                             bc_log_probs = F.log_softmax(bc_logits, dim=-1)
 
                         # curr 分布: 在计算图内, 梯度流回 actor
-                        curr_logits_kl = agent.model.actor(batch['obs'])
+                        curr_logits_kl = actor(batch['obs'])
                         if 'legal_actions' in batch['obs']:
                             illegal = batch['obs']['legal_actions'] < 0.5
                             curr_logits_kl = curr_logits_kl.masked_fill(illegal, MASK_VAL)
                         curr_log_probs_kl = F.log_softmax(curr_logits_kl, dim=-1)
                         curr_probs_kl = curr_log_probs_kl.exp()
 
-                        # KL(curr || bc) = Σ P_curr * (log P_curr - log P_bc), shape (B,)
                         kl_per_sample = (curr_probs_kl * (curr_log_probs_kl - bc_log_probs)
                                          ).sum(dim=-1)
 
-                        # 位置自适应权重: 基于叫牌历史的当前最高阶数 (context level)
-                        # 权重由状态决定, 非动作决定 (防 gradient exploit)
                         if 'history' in batch['obs']:
                             ctx_weights = self.compute_context_kl_weights(
                                 batch['obs']['history'].to(self.device))
@@ -614,30 +628,29 @@ class SubgameTrainer:
                         if not torch.isfinite(kl_loss):
                             kl_loss = torch.tensor(0.0, device=self.device)
 
-                    # Loss: single_step → 断开 Critic 梯度 (value_coef=0)
+                    # Loss: single_step → 断开 Critic 梯度
                     if is_single:
                         loss = (policy_loss
                                 - ent_coef * entropy.mean()
                                 + kl_lambda * kl_loss)
-                        agent.actor_optimizer.zero_grad()
+                        actor_opt.zero_grad()
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(
-                            agent.model.actor.parameters(), agent.config.max_grad_norm)
-                        agent.actor_optimizer.step()
+                            actor.parameters(), agent.config.max_grad_norm)
+                        actor_opt.step()
                         value_loss_val = 0.0
                     else:
-                        # Actor update (含 KL penalty)
+                        # Actor update: 只更新 player 对应的 actor
                         actor_loss = (policy_loss
                                       - ent_coef * entropy.mean()
                                       + kl_lambda * kl_loss)
-                        agent.actor_optimizer.zero_grad()
+                        actor_opt.zero_grad()
                         actor_loss.backward()
                         torch.nn.utils.clip_grad_norm_(
-                            agent.model.actor.parameters(), agent.config.max_grad_norm)
-                        agent.actor_optimizer.step()
+                            actor.parameters(), agent.config.max_grad_norm)
+                        actor_opt.step()
 
-                        # Critic update: 独立 optimizer + value clipping
-                        # value clipping 防止单步 Critic 更新幅度过大 (PPO2 风格)
+                        # Critic update: 共享 critic, 每个 player 都可以更新
                         values = agent.model.critic(
                             batch['obs'], batch.get('all_hands'))
                         old_values = values.detach()
@@ -654,7 +667,6 @@ class SubgameTrainer:
                         agent.critic_optimizer.step()
                         value_loss_val = value_loss.item()
 
-                    # 统计 (single_step 下 loss=actor_loss, multi-step 下分开记)
                     policy_loss_val = policy_loss.item()
                     total_loss += policy_loss_val + value_loss_val
                     total_policy += policy_loss_val
