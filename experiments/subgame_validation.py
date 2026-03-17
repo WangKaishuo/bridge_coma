@@ -104,9 +104,14 @@ class Phase2Config:
     # N-phase: 同理, 但N的vl历来稳定(低KL), ratio效果次要
     stage2_critic_lr_ratio: float = 5.0   # 默认5x; 可选3-10
 
-    # Critic 固定轮数预热 (每轮PPO前)
-    stage2_critic_prewarm_rounds: int = 3    # 固定预热轮数
-    stage2_critic_prewarm_deals: int = 128   # 每轮 deals 数
+    # Critic 自适应预热 (P51 — 大池子静态buffer)
+    stage2_critic_prewarm_max_rounds: int = 30    # 自适应预热外轮数上限
+    stage2_critic_prewarm_deals: int = 2048       # P51: 大池子 (原128→2048)
+    stage2_critic_prewarm_epochs: int = 10        # P51: 静态buffer拟合epoch数
+    stage2_critic_prewarm_conv_tol: float = 0.05  # 相对变化率收敛阈值
+
+    # BC 全局高压线 (P51)
+    stage2_bc_kl_max: float = 0.5  # 超过此值跳过actor更新
 
     # 课程学习前缀: 0=关闭 (KL已修好, CW经实验证明弊大于利)
     stage2_n_warmup_rounds: int = 0
@@ -137,6 +142,12 @@ class Phase2Config:
     jit_burnin_deals: int = 1000    # burn-in rollout 对局数
     jit_burnin_epochs: int = 3      # burn-in 训练轮数
     jit_burnin_lr: float = 1e-3     # burn-in 专用 lr (比正常 1e-4 大 10x)
+
+    # Belief Actor (注入 BeliefNetwork 推断到 Actor 输入)
+    # belief_actor_players: 哪些 player 的 actor 接受 belief 特征输入.
+    # None = 关闭. [SOUTH] = 只给 S 注入 N 的手牌推断 (当前实验配置).
+    # 扩展到 EW: [SOUTH, WEST] — S推断N, W推断E.
+    belief_actor_players: Optional[List[int]] = None   # 默认关闭, 需显式启用
 
     # Go/No-Go
     go_info_ratio: float = 1.0
@@ -235,9 +246,13 @@ def run_stage1(config: Phase2Config) -> dict:
                 'final_loss': (bc_stats_n['final_loss'] + bc_stats_s['final_loss']) / 2,
                 'final_acc':  (bc_stats_n['final_acc']  + bc_stats_s['final_acc'])  / 2}
 
-    # BC 后诊断
-    print("\n--- Post-BC Diagnostics (BC N + BC S, north_rule=False) ---")
-    _run_diagnostics(env, trainer, config.diag_deals)
+    # BC 后诊断 — 用 north_rule=True 隔离 S 策略质量
+    # 原因: actor_n BC 完毕后在宽松 action mask 下可能叫出 OOD bid,
+    # S 面对未见过的 history 会崩溃 (nofit→4M).
+    # 用规则 N 消除这个干扰, 只评估 S 的 BC 质量.
+    print("\n--- Post-BC Diagnostics (BC S + rule N, north_rule=True) ---")
+    env_rule_n_diag = StaymanSubgameEnv(config.stayman_data, north_rule=True)
+    _run_diagnostics(env_rule_n_diag, trainer, config.diag_deals)
 
     # ---------------------------------------------------------------
     # BC 质量对比: rule-N vs BC-N
@@ -385,8 +400,10 @@ def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
                      kl_lambda_start: float = None,
                      kl_lambda_end: float = None,
                      critic_lr_ratio: float = None,
-                     critic_prewarm_rounds: int = None,
-                     critic_prewarm_deals: int = None) -> SubgameConfig:
+                     critic_prewarm_max_rounds: int = None,
+                     critic_prewarm_deals: int = None,
+                     critic_prewarm_conv_tol: float = None,
+                     belief_actor_players: list = None) -> SubgameConfig:
     """构建单阶段 SubgameConfig 的 helper."""
     return SubgameConfig(
         num_steps=num_steps,
@@ -397,19 +414,28 @@ def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
         lr=lr,
         device=config.device,
         active_players=active_players,
-        single_step=False,   # Critic 已预热, 启用标准 GAE (不再用 batch-mean baseline)
+        single_step=False,
         belief_warmup_steps=belief_warmup,
         entropy_coef_start=entropy_start if entropy_start is not None else config.stage2_entropy_start,
         entropy_coef_end=entropy_end if entropy_end is not None else config.stage2_entropy_end,
         entropy_anneal_frac=config.stage2_entropy_anneal,
-        # KL anchor: 每个半轮独立退火 (每轮重新从 kl_lambda_start 开始)
         kl_lambda_start=kl_lambda_start if kl_lambda_start is not None else config.stage2_kl_lambda_start,
         kl_lambda_end=kl_lambda_end if kl_lambda_end is not None else config.stage2_kl_lambda_end,
         kl_anneal_frac=config.stage2_kl_anneal_frac,
-        # Critic LR 和预热
         critic_lr_ratio=critic_lr_ratio if critic_lr_ratio is not None else config.stage2_critic_lr_ratio,
-        critic_prewarm_rounds=critic_prewarm_rounds if critic_prewarm_rounds is not None else config.stage2_critic_prewarm_rounds,
-        critic_prewarm_deals=critic_prewarm_deals if critic_prewarm_deals is not None else config.stage2_critic_prewarm_deals,
+        # P51: 大池子自适应预热
+        critic_prewarm_max_rounds=(critic_prewarm_max_rounds if critic_prewarm_max_rounds is not None
+                                   else config.stage2_critic_prewarm_max_rounds),
+        critic_prewarm_deals=(critic_prewarm_deals if critic_prewarm_deals is not None
+                              else config.stage2_critic_prewarm_deals),
+        critic_prewarm_epochs=config.stage2_critic_prewarm_epochs,
+        critic_prewarm_conv_tol=(critic_prewarm_conv_tol if critic_prewarm_conv_tol is not None
+                                 else config.stage2_critic_prewarm_conv_tol),
+        # P51: KL 早停 (epoch-level) + BC 高压线
+        kl_early_stop_threshold=0.015,
+        bc_kl_max=config.stage2_bc_kl_max,
+        # Belief Actor: 哪些 player 在 rollout 时注入 belief 推断
+        belief_actor_players=belief_actor_players,
         eval_interval=100,
         log_interval=20,
     )
@@ -555,8 +581,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
     """
     print("\n" + "=" * 60)
     print("Stage 2: Alternating Fine-tuning")
-    print(f"  {config.stage2_alt_rounds} rounds × {config.stage2_alt_steps} steps"
-          f" + {config.stage2_joint_steps} joint")
+    print(f"  {config.stage2_alt_rounds} rounds × {config.stage2_alt_steps} steps")
     print("  A=MAPPO (control) vs B=MAPPO+r_info")
     print("=" * 60)
 
@@ -566,6 +591,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
     bc_state = copy.deepcopy(base_state)
 
     results = {}
+    results['_bc_trainer'] = base_trainer  # 供 Stage 3 三方对比用
 
     for name, use_info, beta in [
         ("A_control",     False, 0.0),
@@ -588,6 +614,11 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
         print(f"  [Entropy Revival] Applying temperature=2.0 to BC logits "
               f"before Stage 2 RL fine-tuning...")
         current_state = _revive_entropy(current_state, temperature=2.0)
+
+        # BC anchor 快照: revival 之后再取, 确保 KL anchor 指向与训练起点
+        # 一致的分布. revival 前取 snapshot 会导致 KL 惩罚对抗 entropy,
+        # 因为 anchor 的 entropy≈0 而训练策略的 entropy≈0.5+.
+        bc_state = copy.deepcopy(current_state)
 
         # ================================================================
         # 课程学习前缀 (可选): 冻结 N=规则, 只训 S
@@ -652,6 +683,8 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 # S-phase KL: 与 N 统一, 跨轮次递减, 轮内固定
                 kl_lambda_start=_kl,
                 kl_lambda_end=_kl,
+                # Belief Actor: 按全局配置决定是否为 S 注入 belief 推断
+                belief_actor_players=config.belief_actor_players,
             )
 
             trainer_s, _, eval_s = _run_one_phase(
@@ -684,6 +717,9 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 # N-phase KL: 与 S 统一, 跨轮次递减, 轮内固定
                 kl_lambda_start=_kl,
                 kl_lambda_end=_kl,
+                # N-phase 中 S 是冻结的 active_players 之外的 player,
+                # 但 S 的 actor 在 rollout 时仍需 belief 输入以保持行为一致
+                belief_actor_players=config.belief_actor_players,
             )
 
             trainer_n, log_n, eval_n = _run_one_phase(
@@ -705,77 +741,147 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
             })
 
         # ================================================================
-        # 联合微调收尾
+        # 结果汇总 — 去掉 Joint fine-tune (P49)
+        # 理由: 交替训练已协调好 N/S 协议; joint 同时更新两个 actor
+        #       会打破已稳定的信号-响应对, 且独立 critic 下 joint 的
+        #       value landscape 切换问题与 alternating 完全相同.
+        # final trainer = 最后一轮 N-phase trainer (含最新 N+S 策略)
         # ================================================================
-        print(f"\n  ── Joint fine-tune ({config.stage2_joint_steps} steps) ──")
+        final_eval_env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+        final_eval = _evaluate_stayman_full(final_eval_env, trainer_n, config.eval_deals)
 
-        env_j = StaymanSubgameEnv(config.stayman_data, north_rule=False)
-
-        cfg_j = _make_sub_config(
-            config, config.stage2_joint_steps, config.stage2_lr_joint,
-            active_players=[NORTH, SOUTH],
-            use_info=use_info,
-            beta=beta,
-            # 联合阶段: 低 entropy, 不退火
-            entropy_start=config.stage2_entropy_end,
-            entropy_end=config.stage2_entropy_end,
-            # 联合阶段: KL 系数降至 end 值 (策略已稳定, 轻锚定)
-            kl_lambda_start=config.stage2_kl_lambda_end,
-            kl_lambda_end=config.stage2_kl_lambda_end,
-        )
-
-        trainer_j, log_j, eval_j = _run_one_phase(
-            config, env_j, cfg_j, current_state,
-            belief_state=current_belief,
-            bc_state=bc_state,
-            phase_label="Joint",
-        )
-
-        # ================================================================
-        # 结果汇总
-        # ================================================================
-        belief_acc = trainer_j.evaluate_belief_accuracy(
-            num_deals=config.eval_deals
+        belief_acc = trainer_n.evaluate_belief_accuracy(
+            num_deals=200
         ) if use_info else 0.0
 
         info_metrics = {}
         if use_info and log_n:
             last = log_n[-1]
             info_metrics = {
-                'info_ratio': last.get('info_ratio', 0),
-                'partner_gain': last.get('partner_gain', 0),
+                'info_ratio':    last.get('info_ratio', 0),
+                'partner_gain':  last.get('partner_gain', 0),
                 'opponent_leak': last.get('opponent_leak', 0),
             }
 
         results[name] = {
-            'mean_imp': eval_j['mean_imp'],
-            'std_imp': eval_j['std_imp'],
+            'mean_imp':       final_eval['mean_imp'],
+            'std_imp':        final_eval['std_imp'],
             'belief_accuracy': belief_acc,
-            'round_imps': round_imps,
-            'final_log': log_j[-1] if log_j else {},
+            'round_imps':     round_imps,
+            'final_log':      log_n[-1] if log_n else {},
             **info_metrics,
         }
 
         print(f"\n  {name} progression:")
-        print(f"    BC base:  IMP ≈ -4.1")
         for ri in round_imps:
             rnd_label = ri['round']
             s_imp = ri['S_phase']
             n_imp = ri['N_phase']
             if n_imp is None:
-                print(f"    {rnd_label}: S→{s_imp:+.2f}  N→(frozen rule)")
+                print(f"    R{rnd_label}: S→{s_imp:+.2f}  N→(frozen rule)")
             else:
                 print(f"    R{rnd_label}: S→{s_imp:+.2f}  N→{n_imp:+.2f}")
-        print(f"    Joint:    IMP = {eval_j['mean_imp']:+.2f}")
+        print(f"    Final:    IMP = {final_eval['mean_imp']:+.2f}")
 
         # Diagnostics
         print(f"\n--- {name} Final Diagnostics ---")
-        diag = _run_diagnostics(env_j, trainer_j, config.diag_deals)
+        diag = _run_diagnostics(final_eval_env, trainer_n, config.diag_deals)
         results[name]['diagnostics'] = diag
 
-        results[name]['_trainer'] = trainer_j
+        results[name]['_trainer'] = trainer_n
 
     return results
+
+
+# ============================================================================
+# Three-way evaluation: BC vs A vs B on the same held-out deals
+# ============================================================================
+
+def _three_way_eval(config: 'Phase2Config',
+                    bc_trainer,
+                    trainer_a,
+                    trainer_b,
+                    num_deals: int = 500) -> dict:
+    """
+    三方对比评估: BC-only / Agent A / Agent B 在同一批测试牌上打牌.
+
+    设计原则:
+      - 同一副牌三个 agent 各打一次 (消除牌力噪声).
+      - 全部用 deterministic policy (argmax), 测试最终策略质量.
+      - 报告 mean IMP / std IMP, 以及 A-vs-BC 和 B-vs-BC 的 delta.
+
+    Args:
+        bc_trainer:  Stage 1 base trainer (pure BC + critic warmup, 无 RL)
+        trainer_a:   Agent A 最终 trainer (MAPPO control)
+        trainer_b:   Agent B 最终 trainer (MAPPO + r_info)
+        num_deals:   测试牌数 (建议 ≥ 500)
+
+    Returns:
+        dict with keys: bc / A / B / A_vs_BC / B_vs_BC / B_vs_A
+    """
+    env = StaymanSubgameEnv(config.stayman_data, north_rule=False)
+
+    bc_imps, a_imps, b_imps = [], [], []
+
+    for _ in range(num_deals):
+        hands, dd_table = env.generate_deal()
+
+        def _play_one(trainer) -> float:
+            agent = trainer.agent
+            obs = env.reset(hands, dd_table)
+            done = False
+            reward = 0.0
+            while not done:
+                player = env.current_player
+                obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
+                         for k, v in obs.items()}
+                all_h = torch.tensor(env._current_hands,
+                                     dtype=torch.float32).unsqueeze(0).to(agent.device)
+                with torch.no_grad():
+                    action, _, _, _ = agent.model.get_action_and_value(
+                        obs_t, all_h, deterministic=True, player=player)
+                obs, reward, done, info = env.step(action.item())
+            return float(info.get('imp', 0))
+
+        bc_imps.append(_play_one(bc_trainer))
+        a_imps.append(_play_one(trainer_a))
+        b_imps.append(_play_one(trainer_b))
+
+    bc_arr = np.array(bc_imps)
+    a_arr  = np.array(a_imps)
+    b_arr  = np.array(b_imps)
+
+    result = {
+        'bc':      {'mean': float(bc_arr.mean()), 'std': float(bc_arr.std())},
+        'A':       {'mean': float(a_arr.mean()),  'std': float(a_arr.std())},
+        'B':       {'mean': float(b_arr.mean()),  'std': float(b_arr.std())},
+        'A_vs_BC': float((a_arr - bc_arr).mean()),
+        'B_vs_BC': float((b_arr - bc_arr).mean()),
+        'B_vs_A':  float((b_arr - a_arr).mean()),
+    }
+
+    print(f"\n{'='*60}")
+    print(f"  Three-Way Evaluation ({num_deals} deals, deterministic)")
+    print(f"{'='*60}")
+    print(f"  BC-only:          IMP = {result['bc']['mean']:+.2f} ± {result['bc']['std']:.2f}")
+    print(f"  Agent A (MAPPO):  IMP = {result['A']['mean']:+.2f} ± {result['A']['std']:.2f}"
+          f"  (Δ vs BC: {result['A_vs_BC']:+.2f})")
+    print(f"  Agent B (+r_info):IMP = {result['B']['mean']:+.2f} ± {result['B']['std']:.2f}"
+          f"  (Δ vs BC: {result['B_vs_BC']:+.2f})")
+    print(f"  B vs A:           Δ = {result['B_vs_A']:+.2f}")
+
+    # 简单假设检验 (paired t-test, 非高斯但 n≥500 CLT 成立)
+    from scipy import stats as _stats
+    _, p_a_bc = _stats.ttest_rel(a_arr, bc_arr)
+    _, p_b_a  = _stats.ttest_rel(b_arr, a_arr)
+    print(f"\n  Paired t-test: A vs BC: p={p_a_bc:.3f}"
+          f"{'  ✓ sig' if p_a_bc < 0.05 else '  ✗ not sig'}")
+    print(f"  Paired t-test: B vs A:  p={p_b_a:.3f}"
+          f"{'  ✓ sig' if p_b_a  < 0.05 else '  ✗ not sig'}")
+
+    result['p_a_vs_bc'] = float(p_a_bc)
+    result['p_b_vs_a']  = float(p_b_a)
+    return result
 
 
 # ============================================================================
@@ -787,7 +893,7 @@ def run_stage3(config: Phase2Config, stage1_results: dict,
     """
     Stage 3: 核心指标评估 + 定性分析.
 
-    定量: IMP 对比
+    定量: 三方对比 BC / A / B (同一批测试牌, paired comparison)
     定性: N 的策略偏移 (Agent B 的 N 是否偏离标准规则?)
     """
     print("\n" + "=" * 60)
@@ -796,24 +902,20 @@ def run_stage3(config: Phase2Config, stage1_results: dict,
 
     analysis = {}
 
-    # 定量对比
-    s_base_imp = stage1_results['results']['mean_imp']
-    a_imp = stage2_results['A_control']['mean_imp']
-    b_imp = stage2_results['B_partner_only']['mean_imp']
+    # ── 三方对比 (核心定量结果) ────────────────────────────────────────────
+    bc_trainer = stage2_results.get('_bc_trainer') or stage1_results.get('trainer')
+    trainer_a  = stage2_results['A_control'].get('_trainer')
+    trainer_b  = stage2_results['B_partner_only'].get('_trainer')
 
-    analysis['quantitative'] = {
-        's_base_imp': s_base_imp,
-        'a_control_imp': a_imp,
-        'b_partner_only_imp': b_imp,
-        'a_vs_sbase': a_imp - s_base_imp,
-        'b_vs_sbase': b_imp - s_base_imp,
-        'b_vs_a': b_imp - a_imp,
-    }
-
-    print(f"\n  S_base (N=rule):  IMP = {s_base_imp:+.2f}")
-    print(f"  A (MAPPO):        IMP = {a_imp:+.2f} (Δ vs S_base: {a_imp - s_base_imp:+.2f})")
-    print(f"  B (MAPPO+r_info): IMP = {b_imp:+.2f} (Δ vs S_base: {b_imp - s_base_imp:+.2f})")
-    print(f"  B vs A:           Δ = {b_imp - a_imp:+.2f}")
+    if bc_trainer and trainer_a and trainer_b:
+        three_way = _three_way_eval(
+            config, bc_trainer, trainer_a, trainer_b,
+            num_deals=config.eval_deals,
+        )
+        analysis['three_way_eval'] = three_way
+    else:
+        print("  (three-way eval skipped: trainer not available)")
+        analysis['three_way_eval'] = {}
 
     # 定性分析: 完整叫牌协议 (N + S 条件分布, 叫牌树)
     print("\n--- Bidding Protocol Analysis ---")
@@ -899,7 +1001,7 @@ def _analyze_bidding_protocol(env, trainer, num_deals: int = 500) -> dict:
         with torch.no_grad():
             all_h = torch.tensor(hands, dtype=torch.float32).unsqueeze(0).to(agent.device)
             n_action, _, _, _ = agent.model.get_action_and_value(
-                obs_t, all_h, deterministic=True)
+                obs_t, all_h, deterministic=True, player=NORTH)
             n_action = n_action.item()
         n_bid_str = bid_to_string(n_action)
 
@@ -920,7 +1022,7 @@ def _analyze_bidding_protocol(env, trainer, num_deals: int = 500) -> dict:
                  for k, v in obs.items()}
         with torch.no_grad():
             s_action, _, _, _ = agent.model.get_action_and_value(
-                obs_t, all_h, deterministic=True)
+                obs_t, all_h, deterministic=True, player=SOUTH)
             s_action = s_action.item()
         s_bid_str = bid_to_string(s_action)
 
@@ -1239,13 +1341,14 @@ def _run_diagnostics(env, trainer, num_deals: int) -> dict:
         done = False
 
         while not done:
+            player = env.current_player
             obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
                      for k, v in obs.items()}
             with torch.no_grad():
                 all_hands = env._current_hands
                 all_h_t = torch.tensor(all_hands, dtype=torch.float32).unsqueeze(0).to(agent.device)
                 action, _, _, _ = agent.model.get_action_and_value(
-                    obs_t, all_h_t, deterministic=True)
+                    obs_t, all_h_t, deterministic=True, player=player)
                 action = action.item()
             obs, reward, done, info = env.step(action)
 
@@ -1357,13 +1460,14 @@ def _evaluate_stayman_full(env, trainer, num_deals: int) -> dict:
         done = False
 
         while not done:
+            player = env.current_player
             obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(agent.device)
                      for k, v in obs.items()}
             with torch.no_grad():
                 all_hands = env._current_hands
                 all_h_t = torch.tensor(all_hands, dtype=torch.float32).unsqueeze(0).to(agent.device)
                 action, _, _, _ = agent.model.get_action_and_value(
-                    obs_t, all_h_t, deterministic=True
+                    obs_t, all_h_t, deterministic=True, player=player
                 )
                 action = action.item()
 
@@ -1407,8 +1511,9 @@ def run_phase2(config: Phase2Config) -> dict:
     # Stage 2: A vs B (with pre-trained belief for B)
     stage2 = run_stage2(config, stage1['trainer'], belief_pretrain)
     report['stage2'] = {
-        name: {k: v for k, v in data.items() if k != '_trainer'}
+        name: {k: v for k, v in data.items() if not k.startswith('_')}
         for name, data in stage2.items()
+        if not name.startswith('_')
     }
 
     # Save Stage 2 checkpoints
@@ -1478,10 +1583,13 @@ def main():
     # Quick mode for testing
     p.add_argument('--quick', action='store_true',
                    help='Quick test run (fewer steps)')
+    p.add_argument('--belief_actor_south', action='store_true',
+                   help='Enable BeliefNet input for South actor (Bayesian actor)')
     args = p.parse_args()
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
+    from env import SOUTH as _SOUTH
     config = Phase2Config(
         stayman_data=args.stayman_data,
         competitive_data=args.competitive_data,
@@ -1493,6 +1601,7 @@ def main():
         stage2_joint_steps=args.joint_steps,
         eval_deals=args.eval_deals,
         diag_deals=args.diag_deals,
+        belief_actor_players=[_SOUTH] if args.belief_actor_south else None,
     )
 
     if args.quick:

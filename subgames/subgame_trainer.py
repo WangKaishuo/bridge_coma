@@ -83,11 +83,42 @@ class SubgameConfig:
     # 高 LR 加速收敛, 避免 vl 长期偏高压制 actor 梯度.
     critic_lr_ratio: float = 3.0
 
-    # Critic 预热 (轻量版, 仅在交替训练中使用)
-    # 在 PPO 训练前先做固定轮数的纯 Critic 更新, 让 vl 先收敛再更新 Actor.
-    # 0 = 关闭 (默认, 向后兼容)
-    critic_prewarm_rounds: int = 0    # 预热轮数; 0=关闭
-    critic_prewarm_deals: int = 128   # 每轮 rollout deals 数
+    # Critic 预热 — 自适应版本 (P50/P51)
+    # 大池子静态 buffer: 先收集 critic_prewarm_deals 局, actor 冻结,
+    # 在静态 buffer 上跑 critic_prewarm_epochs 轮, 直到 vl 相对变化率收敛.
+    # 相比旧版"采128局→扔掉"避免了严重过拟合 (统计灾难).
+    critic_prewarm_rounds: int = 0           # 已废弃, 保留向后兼容
+    critic_prewarm_deals: int = 2048         # P51: 大池子 (原128→2048)
+    critic_prewarm_epochs: int = 10          # P51: 静态buffer上的最大拟合epoch数
+    critic_prewarm_max_rounds: int = 30      # 自适应预热的最大外轮数上限
+    critic_prewarm_conv_tol: float = 0.05   # 相对变化率收敛阈值 (5%)
+
+    # KL Early Stopping (P50/P51)
+    # P51修正: epoch-level KL (不是batch-level).
+    # 每个epoch结束后计算整个buffer上的平均近似KL.
+    # 相对于采样时的old_log_probs, 若epoch累积KL > threshold, break.
+    # 防止跨epoch累积漂移摧毁策略 (单batch KL太小无法触发的根本原因).
+    # 0.0 = 关闭
+    kl_early_stop_threshold: float = 0.015
+
+    # BC 全局高压线 (P51)
+    # 每次 PPO update 后计算当前策略与 BC 锚点的全局 KL.
+    # 若超过此上限, 跳过本轮 actor 更新 (只更新 critic), 保持时间一致性.
+    # 0.0 = 关闭
+    bc_kl_max: float = 0.5
+
+    # Belief Actor 配置 (per-player)
+    # belief_actor_players: 哪些 player 的 actor 接受 BeliefNetwork 推断输入.
+    # 配合 belief_dims 使用: 这里控制"谁在 rollout 时计算 belief",
+    # belief_dims 控制"谁的 actor 网络有 belief 输入层" (透传到 MAPPOConfig).
+    # None = 不启用 belief actor (向后兼容).
+    # 典型配置: [SOUTH] — 只给 S 的 actor 注入 N 的手牌推断.
+    # 推广配置: [NORTH, SOUTH, EAST, WEST] — 四方互相推断 partner.
+    belief_actor_players: Optional[List[int]] = None
+    # belief_dims: player → belief_dim, 自动从 belief_actor_players 推导.
+    # 手动设置时可覆盖 (如不同 player 用不同 belief_dim).
+    # None = 从 belief_actor_players 自动推导.
+    belief_dims: Optional[Dict[int, int]] = None
 
     # Which players does the agent control?
     active_players: Optional[List[int]] = None
@@ -112,6 +143,16 @@ class SubgameTrainer:
         self.device = config.device
         self.active_players = config.active_players or list(range(NUM_PLAYERS))
 
+        # 推导 belief_dims: 从 belief_actor_players 自动生成 {player: BELIEF_DIM}
+        # 也支持手动设置 config.belief_dims 覆盖
+        from utils.hand_features import BELIEF_DIM as _BELIEF_DIM
+        if config.belief_dims is not None:
+            _belief_dims = config.belief_dims
+        elif config.belief_actor_players:
+            _belief_dims = {p: _BELIEF_DIM for p in config.belief_actor_players}
+        else:
+            _belief_dims = {}
+
         mappo_config = MAPPOConfig(
             hand_dim=config.hand_dim,
             history_dim=config.history_dim,
@@ -127,6 +168,7 @@ class SubgameTrainer:
             max_grad_norm=config.max_grad_norm,
             device=config.device,
             critic_lr_ratio=config.critic_lr_ratio,
+            belief_dims=_belief_dims if _belief_dims else None,
         )
         self.agent = MAPPOAgent(mappo_config)
 
@@ -155,30 +197,32 @@ class SubgameTrainer:
         self.log = []
         self._current_step = 0  # 当前训练步数, 用于 entropy annealing
 
-        # Reward 归一化: 在线 running stats, 将 IMP regret 归一化为 ~N(0,1)
-        # 与全环境训练方式一致 (普适化设计)
-        self.reward_stats = RunningStats()
+        # 注: reward 归一化由 stayman_env._compute_terminal_reward() 内的
+        # piecewise linear 映射完成 (→ [0.01, 1.0] 范围).
+        # RunningStats 在此不适用, 已移除以防误用.
 
-    def critic_warmup_step(self, num_deals: int = 256) -> float:
+    def critic_warmup_step(self, num_deals: int = 2048,
+                           num_epochs: int = 10) -> float:
         """
-        Critic 预热: 用 GAE returns 做纯 Critic MSE 更新, 不更新 Actor.
+        Critic 预热: 大池子静态 buffer + 多 epoch 拟合 (P51).
 
-        关键设计:
-        - target = GAE returns (与 PPO 主循环完全一致的 value target).
-          之前用 final_reward 平铺给所有时间步, 与 GAE returns 分布不同,
-          导致预热后 Critic 值域错误, PPO 开始后 advantage 偏差 → 性能下降.
-        - 走完整的 store_episodes → compute_returns_and_advantages 路径,
-          确保 target scale 与 PPO 一致.
-        - 只更新 Critic, 更新后清空 buffer (避免污染 PPO 的 buffer 状态).
+        P51 重构原因:
+        - 旧版"采 128 局 → 算一次梯度 → 扔掉": 128 局在 Stayman 的条件状态空间
+          (N 叫牌路径 × S 手牌分布) 下是统计灾难 → Critic 严重过拟合少量样本,
+          下一批 128 局一到分布稍变, vl 再次爆炸.
+        - 新版: 先收集 num_deals (默认 2048) 局的大 buffer, actor 冻结,
+          在静态 buffer 上跑至多 num_epochs 轮, 直到 vl 相对变化率 < conv_tol.
+        - Returns 在收集完后用当前 (冻结) actor 计算一次 GAE, 全程不 stale.
+        - 只更新 Critic, actor 不动, 保证 target 在整个预热期间稳定.
         """
         agent = self.agent
+        conv_tol = getattr(self.config, 'critic_prewarm_conv_tol', 0.05)
 
-        # 1. 收集 episodes 并存入 buffer (走标准路径, 含 GAE 所需的 value 估计)
+        # ── 1. 收集大池子, actor 冻结 (不更新) ─────────────────────────
         episodes = self.collect_episodes(num_deals)
         self.store_episodes(episodes)
 
-        total_loss = 0.0
-        num_batches = 0
+        final_loss = 0.0
 
         for player in self.active_players:
             buffer = agent.buffers[player]
@@ -186,39 +230,56 @@ class SubgameTrainer:
                 buffer.reset()
                 continue
 
-            # 2. 计算 GAE returns (与 safe_update 完全相同的路径)
+            # ── 2. 用当前 (冻结) actor/critic 计算一次 GAE returns ──────
+            # actor 在整个预热期间不更新 → returns 全程不 stale
+            critic = agent.get_critic(player)
             with torch.no_grad():
                 last_obs = {k: v.unsqueeze(0).to(self.device)
                             for k, v in buffer.observations[-1].items()}
                 last_hands = (buffer.all_hands[-1].unsqueeze(0).to(self.device)
                               if buffer.all_hands else None)
-                last_value = agent.model.critic(last_obs, last_hands).item()
+                last_value = critic(last_obs, last_hands).item()
             buffer.compute_returns_and_advantages(
                 last_value, agent.config.gamma, agent.config.gae_lambda)
 
-            # 3. 只更新 Critic (MSE vs GAE returns), 跳过 Actor
-            # HAPPO: Critic 共享, 直接用 agent.critic_optimizer (不变)
-            for batch in buffer.get_batches(agent.config.batch_size):
-                b_obs   = batch['obs']
-                b_hands = batch.get('all_hands')
-                b_ret   = batch['returns']
+            # ── 3. 静态 buffer 上多 epoch 拟合, 直到 vl 收敛 ───────────
+            critic_opt = agent.get_critic_optimizer(player)
+            prev_epoch_loss = None
 
-                values = agent.model.critic(b_obs, b_hands).squeeze(-1)
-                loss = F.mse_loss(values, b_ret)
+            for epoch in range(num_epochs):
+                epoch_loss = 0.0
+                n_batches = 0
+                for batch in buffer.get_batches(agent.config.batch_size):
+                    b_obs   = batch['obs']
+                    b_hands = batch.get('all_hands')
+                    b_ret   = batch['returns']
 
-                agent.critic_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    agent.model.critic.parameters(), self.config.max_grad_norm)
-                agent.critic_optimizer.step()
+                    values = critic(b_obs, b_hands).squeeze(-1)
+                    loss = F.mse_loss(values, b_ret)
 
-                total_loss += loss.item()
-                num_batches += 1
+                    critic_opt.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        critic.parameters(), self.config.max_grad_norm)
+                    critic_opt.step()
 
-            # 4. 清空 buffer, 避免污染后续 PPO 主循环的 buffer 状态
+                    epoch_loss += loss.item()
+                    n_batches += 1
+
+                epoch_loss /= max(1, n_batches)
+
+                # 相对变化率收敛检查
+                if prev_epoch_loss is not None and prev_epoch_loss > 1e-8:
+                    rel_change = abs(epoch_loss - prev_epoch_loss) / prev_epoch_loss
+                    if rel_change < conv_tol:
+                        break  # 收敛: 退出静态 buffer 的 epoch 循环
+
+                prev_epoch_loss = epoch_loss
+
+            final_loss = epoch_loss
             buffer.reset()
 
-        return total_loss / max(1, num_batches)
+        return final_loss
 
     def set_bc_anchor(self, state_dict: dict):
         """
@@ -375,6 +436,58 @@ class SubgameTrainer:
     # Rollout collection
     # ====================================================================
 
+
+    def _maybe_inject_belief(self, obs: dict, player: int,
+                              all_hands: np.ndarray) -> dict:
+        """
+        为指定 player 的 actor 注入 BeliefNetwork 推断特征.
+
+        架构设计:
+        - 支持任意 player 的双向推断 (N↔S, E↔W, N↔E 等)
+        - partner = (player + 2) % 4 (对家)
+        - 推断结果作为 obs['belief'] 注入, PolicyNetwork.forward 里 stop-gradient
+        - belief_actor_players=None 或 player 不在列表里时, 不修改 obs (零开销)
+
+        当前实验配置: belief_actor_players=[SOUTH]
+          → 只有 S 的 actor 接收 N 手牌的推断特征
+          → E/W 对话 (竞争子博弈) 可以扩展为 [SOUTH, WEST] 等
+
+        Args:
+            obs: 当前 player 的观测 dict (不 in-place 修改)
+            player: 当前决策 player
+            all_hands: (4, 52) 全局手牌 (rollout 时已知)
+
+        Returns:
+            注入了 'belief' 字段的新 obs dict, 或原 obs (未启用时)
+        """
+        cfg = self.config
+        if (self.belief_net is None
+                or cfg.belief_actor_players is None
+                or player not in cfg.belief_actor_players):
+            return obs
+
+        # partner = 对家
+        partner = (player + 2) % 4
+
+        # 用当前叫牌历史 (history_after = 决策前历史, 即 history_before)
+        # 此时 env.history 是该 player 决策前的历史
+        history = self._encode_history(self.env.history)
+
+        oh = torch.tensor(all_hands[player], dtype=torch.float32).unsqueeze(0).to(self.device)
+        h  = torch.tensor(history, dtype=torch.float32).unsqueeze(0).to(self.device)
+        op = torch.tensor([player],  dtype=torch.long).to(self.device)
+        tp = torch.tensor([partner], dtype=torch.long).to(self.device)
+
+        self.belief_net.eval()
+        with torch.no_grad():
+            belief_probs = self.belief_net.get_probs(oh, h, op, tp)  # (1, BELIEF_DIM)
+        self.belief_net.train()
+
+        # 注入到 obs (浅拷贝, 不污染原 obs dict)
+        obs = dict(obs)
+        obs['belief'] = belief_probs.squeeze(0).cpu().numpy()  # (BELIEF_DIM,)
+        return obs
+
     def collect_episodes(self, num_deals: int) -> List[Dict]:
         """
         采样 episode.
@@ -400,6 +513,7 @@ class SubgameTrainer:
                     # HAPPO: actor_n 和 actor_s 独立, 必须按 player 分发
                     # 确保冻结的 player 保持 BC 学到的行为, 不被对方训练污染
                     all_hands = self.env._current_hands
+                    obs = self._maybe_inject_belief(obs, player, all_hands)
                     action, _ = self.agent.get_action_for_player(
                         obs, player, all_hands=all_hands, deterministic=True)
                     obs, reward, done, info = self.env.step(action)
@@ -408,6 +522,12 @@ class SubgameTrainer:
                 history_before = self.env.history.copy()
 
                 all_hands = self.env._current_hands
+
+                # Belief Actor: 为指定 player 注入 BeliefNetwork 推断特征
+                # partner = (player+2)%4 — 对家手牌推断
+                # stop-gradient 在 PolicyNetwork.forward 里通过 .detach() 实现
+                obs = self._maybe_inject_belief(obs, player, all_hands)
+
                 action, extra = self.agent.get_action_for_player(
                     obs, player, all_hands=all_hands)
                 extra['_all_hands'] = all_hands
@@ -552,18 +672,66 @@ class SubgameTrainer:
                     advantages = advantages / (adv_std + 1e-8)
                 buffer.advantages = advantages
             else:
+                # P49: 独立 critic — 用该 player 自己的 critic 估 last_value
+                critic = agent.get_critic(player)
+                critic_opt = agent.get_critic_optimizer(player)
                 with torch.no_grad():
                     last_obs = {k: v.unsqueeze(0).to(self.device)
                                 for k, v in buffer.observations[-1].items()}
                     last_hands = (buffer.all_hands[-1].unsqueeze(0).to(self.device)
                                   if buffer.all_hands else None)
-                    last_value = agent.model.critic(last_obs, last_hands).item()
+                    last_value = critic(last_obs, last_hands).item()
 
                 buffer.compute_returns_and_advantages(
                     last_value, agent.config.gamma, agent.config.gae_lambda
                 )
 
-            for _ in range(agent.config.num_epochs):
+            kl_threshold = getattr(agent.config, 'kl_early_stop_threshold', 0.015)
+            bc_kl_max = getattr(self.config, 'bc_kl_max', 0.5)
+            kl_stopped = False
+            actor_skipped = False  # P51: BC高压线触发时跳过actor更新
+
+            # ── P51: 预先计算全局 BC-KL (更新前) ─────────────────────────
+            # 用于检测是否已超高压线, 决定是否允许本轮 actor 更新
+            if bc_kl_max > 0 and use_kl:
+                bc_key = NORTH if player == NORTH else SOUTH
+                bc_net = self.bc_model[bc_key]
+                with torch.no_grad():
+                    # 在整个 buffer 上抽样估算全局 BC-KL
+                    total_bc_kl = 0.0
+                    bc_kl_batches = 0
+                    for batch in buffer.get_batches(agent.config.batch_size):
+                        curr_logits = actor(batch['obs'])
+                        if 'legal_actions' in batch['obs']:
+                            illegal = batch['obs']['legal_actions'] < 0.5
+                            curr_logits = curr_logits.masked_fill(illegal, -1e9)
+                        curr_lp = F.log_softmax(curr_logits, dim=-1)
+                        curr_p  = curr_lp.exp()
+                        bc_logits = bc_net(batch['obs'])
+                        if 'legal_actions' in batch['obs']:
+                            bc_logits = bc_logits.masked_fill(illegal, -1e9)
+                        bc_lp = F.log_softmax(bc_logits, dim=-1)
+                        kl_batch = (curr_p * (curr_lp - bc_lp)).sum(dim=-1).mean().item()
+                        if torch.isfinite(torch.tensor(kl_batch)):
+                            total_bc_kl += kl_batch
+                            bc_kl_batches += 1
+                global_bc_kl = total_bc_kl / max(1, bc_kl_batches)
+                if global_bc_kl > bc_kl_max:
+                    actor_skipped = True  # 超高压线: 跳过 actor 更新, 只更新 critic
+            else:
+                global_bc_kl = 0.0
+
+            for epoch_idx in range(agent.config.num_epochs):
+                if kl_stopped:
+                    break
+
+                # ── P51: Epoch-level KL 累积统计 ──────────────────────────
+                # 在整个 epoch 结束后计算该 epoch 相对于 old_log_probs 的平均 KL.
+                # 相比 batch-level: 单 batch KL 因样本少而方差大 (可能 0.001),
+                # 但一个 epoch 累积下来策略已漂移 0.2+. Epoch-level 才能真实反映.
+                epoch_kl_sum = 0.0
+                epoch_kl_n = 0
+
                 for batch in buffer.get_batches(agent.config.batch_size):
                     # HAPPO: 用 player 对应的 actor evaluate actions
                     log_probs, entropy = actor.evaluate_actions(
@@ -571,6 +739,13 @@ class SubgameTrainer:
                     )
 
                     ratio = torch.exp(log_probs - batch['old_log_probs'])
+
+                    # 累积本 batch 的近似 KL (不立即 break, epoch 结束后再判断)
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1) - ratio.log()).mean().item()
+                        if torch.isfinite(torch.tensor(approx_kl)):
+                            epoch_kl_sum += approx_kl
+                            epoch_kl_n += 1
 
                     adv = batch['advantages']
                     if not is_single:
@@ -630,28 +805,30 @@ class SubgameTrainer:
 
                     # Loss: single_step → 断开 Critic 梯度
                     if is_single:
-                        loss = (policy_loss
-                                - ent_coef * entropy.mean()
-                                + kl_lambda * kl_loss)
-                        actor_opt.zero_grad()
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            actor.parameters(), agent.config.max_grad_norm)
-                        actor_opt.step()
+                        if not actor_skipped:
+                            loss = (policy_loss
+                                    - ent_coef * entropy.mean()
+                                    + kl_lambda * kl_loss)
+                            actor_opt.zero_grad()
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(
+                                actor.parameters(), agent.config.max_grad_norm)
+                            actor_opt.step()
                         value_loss_val = 0.0
                     else:
-                        # Actor update: 只更新 player 对应的 actor
-                        actor_loss = (policy_loss
-                                      - ent_coef * entropy.mean()
-                                      + kl_lambda * kl_loss)
-                        actor_opt.zero_grad()
-                        actor_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            actor.parameters(), agent.config.max_grad_norm)
-                        actor_opt.step()
+                        # P51: BC 高压线超限时跳过 actor 更新, 只更新 critic
+                        if not actor_skipped:
+                            actor_loss = (policy_loss
+                                          - ent_coef * entropy.mean()
+                                          + kl_lambda * kl_loss)
+                            actor_opt.zero_grad()
+                            actor_loss.backward()
+                            torch.nn.utils.clip_grad_norm_(
+                                actor.parameters(), agent.config.max_grad_norm)
+                            actor_opt.step()
 
-                        # Critic update: 共享 critic, 每个 player 都可以更新
-                        values = agent.model.critic(
+                        # Critic update: P49 独立 critic — 只更新该 player 的 critic
+                        values = critic(
                             batch['obs'], batch.get('all_hands'))
                         old_values = values.detach()
                         v_clipped = old_values + (values - old_values).clamp(
@@ -660,11 +837,11 @@ class SubgameTrainer:
                             F.mse_loss(values, batch['returns']),
                             F.mse_loss(v_clipped, batch['returns'])
                         )
-                        agent.critic_optimizer.zero_grad()
+                        critic_opt.zero_grad()
                         value_loss.backward()
                         torch.nn.utils.clip_grad_norm_(
-                            agent.model.critic.parameters(), agent.config.max_grad_norm)
-                        agent.critic_optimizer.step()
+                            critic.parameters(), agent.config.max_grad_norm)
+                        critic_opt.step()
                         value_loss_val = value_loss.item()
 
                     policy_loss_val = policy_loss.item()
@@ -674,6 +851,14 @@ class SubgameTrainer:
                     total_entropy += entropy.mean().item()
                     total_kl += kl_loss.item()
                     num_updates += 1
+
+                # ── P51: Epoch 结束后检查累积 KL ──────────────────────────
+                # 这是修复后的 epoch-level KL 早停:
+                # epoch 内所有 batch 的平均 KL 才真实反映策略漂移程度.
+                # 单 batch KL (P50) 因样本少方差大, 无法检测跨 epoch 累积漂移.
+                epoch_kl_avg = epoch_kl_sum / max(1, epoch_kl_n)
+                if kl_threshold > 0 and epoch_kl_avg > kl_threshold:
+                    kl_stopped = True
 
             buffer.reset()
 
@@ -688,6 +873,9 @@ class SubgameTrainer:
             'entropy_coef': ent_coef,
             'kl_loss': total_kl / num_updates,
             'kl_lambda': kl_lambda,
+            'kl_stopped': kl_stopped,      # P50/P51: epoch-level KL 早停
+            'actor_skipped': actor_skipped, # P51: BC 高压线超限跳过 actor
+            'global_bc_kl': global_bc_kl,  # P51: 更新前的全局 BC-KL
         }
 
     # ====================================================================
@@ -889,8 +1077,8 @@ class SubgameTrainer:
         belief_before = self.belief_net.get_probs(oh, hb, op, tp).clamp(1e-7, 1 - 1e-7)
         belief_after  = self.belief_net.get_probs(oh, ha, op, tp).clamp(1e-7, 1 - 1e-7)
 
-        ce_before = F.binary_cross_entropy(belief_before, th, reduction='none').sum(dim=-1)
-        ce_after  = F.binary_cross_entropy(belief_after,  th, reduction='none').sum(dim=-1)
+        ce_before = F.binary_cross_entropy(belief_before, th, reduction='none').mean(dim=-1)
+        ce_after  = F.binary_cross_entropy(belief_after,  th, reduction='none').mean(dim=-1)
 
         # 互信息在数学上 >= 0; 负值是 Belief Net 滞后产生的估算误差
         # ReLU 截断: 不惩罚探索, 只奖励成功传递信息
@@ -913,17 +1101,34 @@ class SubgameTrainer:
               f"accumulate={cfg.accumulate_steps}, "
               f"effective_deals/update={eff_deals}")
 
-        # ── Critic 预热 (固定轮数) ───────────────────────────────────────
-        # 在 PPO 主循环前做固定轮数的纯 Critic 更新 (不更新 Actor).
-        # 目的: partner 策略在上轮更新后, Critic 面对新的 value landscape,
-        #       预热让 vl 先收敛, 避免早期高 vl 压制 actor 梯度.
-        if cfg.critic_prewarm_rounds > 0:
+        # ── Critic 自适应预热 (P50) ──────────────────────────────────────
+        # 监控 vl 相对变化率, 收敛 (<5%) 后才开放 Actor 更新.
+        # 避免固定轮数带来的"等太少/等太多"问题:
+        #   - critic_n 本来就稳定 → 1-3 轮即可通过, 无额外时间开销
+        #   - critic_s 需要重建 → 自动等到真正收敛, 不再靠堆轮数
+        # 安全上限 max_rounds 防止无限等待.
+        if cfg.critic_prewarm_max_rounds > 0:
             prewarm_losses = []
-            for _ in range(cfg.critic_prewarm_rounds):
+            prev_vl = None
+            rounds_done = 0
+            for _ in range(cfg.critic_prewarm_max_rounds):
                 vl = self.critic_warmup_step(cfg.critic_prewarm_deals)
                 prewarm_losses.append(vl)
-            print(f"  [Critic Prewarm] {cfg.critic_prewarm_rounds} rounds × "
-                  f"{cfg.critic_prewarm_deals} deals: "
+                rounds_done += 1
+
+                if prev_vl is not None and prev_vl > 1e-8:
+                    rel_change = abs(vl - prev_vl) / prev_vl
+                    if rel_change < cfg.critic_prewarm_conv_tol:
+                        break  # 收敛: 相对变化率 < 5%
+
+                prev_vl = vl
+
+            conv_str = (f"converged at round {rounds_done}"
+                        if rounds_done < cfg.critic_prewarm_max_rounds
+                        else f"hit max {cfg.critic_prewarm_max_rounds} rounds")
+            print(f"  [Critic Prewarm] {rounds_done} rounds × "
+                  f"{cfg.critic_prewarm_deals} deals "
+                  f"({conv_str}): "
                   f"vl {prewarm_losses[0]:.3f} → {prewarm_losses[-1]:.3f}")
 
         all_episodes_window = []
@@ -986,6 +1191,13 @@ class SubgameTrainer:
                     if kl_lam > 0:
                         line += f" kl={kl_val:.4f}(λ={kl_lam:.3f})"
 
+                    # P50/P51: KL 早停 / BC 高压线触发标记
+                    if entry.get('kl_stopped', False):
+                        line += " ⚡KL-stop"
+                    if entry.get('actor_skipped', False):
+                        bc_kl_val = entry.get('global_bc_kl', 0)
+                        line += f" 🚫actor-skip(bc_kl={bc_kl_val:.3f})"
+
                     if cfg.use_info_bonus:
                         line += (f" bl={belief_loss:.4f}"
                                  f" ir={entry.get('info_ratio', 'N/A')}")
@@ -1025,9 +1237,10 @@ class SubgameTrainer:
                 obs = self.env.reset(hands, dd_table)
                 done = False
                 while not done:
+                    player = self.env.current_player
                     all_hands = self.env._current_hands
-                    action, _ = self.agent.get_action(
-                        obs, all_hands=all_hands, deterministic=True)
+                    action, _ = self.agent.get_action_for_player(
+                        obs, player, all_hands=all_hands, deterministic=True)
                     obs, _, done, _ = self.env.step(action)
 
                 history = self._encode_history(self.env.history)
@@ -1107,9 +1320,10 @@ class HeadToHeadEvaluator:
         reward = 0.0
 
         while not done:
+            player = env.current_player
             all_hands = env._current_hands
-            action, _ = trainer.agent.get_action(
-                obs, all_hands=all_hands, deterministic=True)
+            action, _ = trainer.agent.get_action_for_player(
+                obs, player, all_hands=all_hands, deterministic=True)
             obs, reward, done, _ = env.step(action)
 
         return float(reward)

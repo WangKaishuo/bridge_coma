@@ -70,16 +70,26 @@ class HistoryEncoder(nn.Module):
 
 
 class PolicyNetwork(nn.Module):
-    """策略网络"""
-    
-    def __init__(self, hand_dim: int = 256, history_dim: int = 256, hidden_dim: int = 256):
+    """策略网络
+
+    belief_dim > 0 时接受 obs['belief'] 作为额外输入.
+    belief 特征由外部 BeliefNetwork 推断后注入 obs, stop-gradient.
+
+    架构支持任意 player 的双向 belief 输入 (N推断S, S推断N, E推断W等).
+    当前实验只为 SOUTH 的 actor 启用 (belief_dim=BELIEF_DIM),
+    其余 player 的 actor 保持 belief_dim=0 (向后兼容).
+    """
+
+    def __init__(self, hand_dim: int = 256, history_dim: int = 256,
+                 hidden_dim: int = 256, belief_dim: int = 0):
         super().__init__()
         self.hand_encoder = HandEncoder(hand_dim)
         self.history_encoder = HistoryEncoder(NUM_BIDS, history_dim)
-        
-        # 融合: hand + history + position + vulnerability
-        input_dim = hand_dim + history_dim + 4 + 2
-        
+        self.belief_dim = belief_dim
+
+        # 融合: hand + history + position + vulnerability [+ belief (可选)]
+        input_dim = hand_dim + history_dim + 4 + 2 + belief_dim
+
         self.fc = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -87,12 +97,24 @@ class PolicyNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, NUM_BIDS),
         )
-    
+
     def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
         hand_feat = self.hand_encoder(obs['hand'])
         hist_feat = self.history_encoder(obs['history'])
-        
-        x = torch.cat([hand_feat, hist_feat, obs['position'], obs['vulnerability']], dim=-1)
+
+        features = [hand_feat, hist_feat, obs['position'], obs['vulnerability']]
+
+        if self.belief_dim > 0:
+            # belief: (B, belief_dim) — 由外部 BeliefNetwork 推断, stop-gradient
+            # BC 阶段 obs['belief'] 不存在时用零向量填充, 保持网络结构一致
+            if 'belief' in obs:
+                features.append(obs['belief'].detach())
+            else:
+                features.append(torch.zeros(
+                    hand_feat.shape[0], self.belief_dim,
+                    device=hand_feat.device, dtype=hand_feat.dtype))
+
+        x = torch.cat(features, dim=-1)
         return self.fc(x)
     
     def get_action(

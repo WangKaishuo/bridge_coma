@@ -305,40 +305,37 @@ def behavioral_cloning_warmup(
     lr: float = 1e-3,
     batch_size: int = 256,
     minority_weight: float = 2.0,
+    player: int = None,
     early_stop_acc: float = 0.98,
     early_stop_patience: int = 3,
-    player: int = None,
 ) -> dict:
     """
     对 agent 的 policy network 做交叉熵监督训练.
 
     Args:
-        agent: MAPPOAgent (HAPPO-style dual actor) or IPPOAgent
+        agent: MAPPOAgent or IPPOAgent
         dataset: BCDataset
         epochs: 训练轮数
         lr: 学习率
         batch_size: batch 大小
-        minority_weight: 少数类 (非 4H/4S 动作) 的 loss 权重.
-            默认 2.0: 让 3NT/2NT 等叫品的梯度贡献翻倍,
-            迫使网络不能靠猜多数派 (4M) 过关.
-        player: 指定训练哪个 player 的 actor (HAPPO 用).
-            - None 或无 get_actor 方法: 向后兼容, 用 agent.model.actor
-            - NORTH (0): 训练 actor_n
-            - SOUTH (2): 训练 actor_s
+        minority_weight: 少数类 (非 4H/4S 动作) 的 loss 权重
+        player: 指定训练哪个 player 的 actor (NORTH/SOUTH/EAST/WEST).
+                None = 向后兼容, 使用 model.actor (actor_s 别名).
+        early_stop_acc: 提前停止的准确率阈值 (默认 0.98)
+        early_stop_patience: 连续达标 epoch 数才停止
 
     Returns:
-        训练统计: {'final_loss', 'final_acc'}
+        训练统计: {'final_loss', 'final_acc', 'epochs_trained', 'stopped_early'}
     """
-    from env import string_to_bid
+    from env import string_to_bid, NORTH as _NORTH
     # 高花成局叫品 — 多数类, 权重 1.0
     majority_actions = {string_to_bid("4H"), string_to_bid("4S")}
 
-    # HAPPO: 按 player 选择对应 actor
+    # HAPPO: 按 player 选对应 actor; None 向后兼容
     if player is not None and hasattr(agent, 'get_actor'):
         model = agent.get_actor(player)
     else:
         model = agent.model.actor
-
     device = agent.device
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -346,22 +343,25 @@ def behavioral_cloning_warmup(
                         collate_fn=_collate_bc)
 
     model.train()
-    stats = {'losses': [], 'accs': [], 'entropies': []}
-
-    # Early stopping state
-    _patience_counter = 0
-    _stopped_early = False
+    stats = {'losses': [], 'accs': []}
+    consecutive_early = 0
 
     for epoch in range(epochs):
         epoch_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
-        epoch_entropy = 0.0
 
         for obs_batch, action_batch in loader:
             # Move to device
             obs_d = {k: v.to(device) for k, v in obs_batch.items()}
             targets = action_batch.to(device)
+
+            # BC 阶段无 belief 特征: 若 actor 有 belief_dim > 0, 填零向量
+            # 保持网络结构与 Stage 2 一致, 让 belief 层从零开始学
+            if hasattr(model, 'belief_dim') and model.belief_dim > 0:
+                if 'belief' not in obs_d:
+                    obs_d['belief'] = torch.zeros(
+                        targets.shape[0], model.belief_dim, device=device)
 
             # Forward
             logits = model(obs_d)  # (B, 38)
@@ -409,43 +409,30 @@ def behavioral_cloning_warmup(
             epoch_total += targets.size(0)
             epoch_loss += loss.item() * targets.size(0)
 
-            # Entropy: mean entropy of policy distribution over batch
-            with torch.no_grad():
-                probs = torch.softmax(logits, dim=-1)
-                ent = -(probs * (probs + 1e-8).log()).sum(dim=-1).mean()
-                epoch_entropy += ent.item() * targets.size(0)
-
         avg_loss = epoch_loss / max(1, epoch_total)
         avg_acc = epoch_correct / max(1, epoch_total)
-        avg_ent = epoch_entropy / max(1, epoch_total)
         stats['losses'].append(avg_loss)
         stats['accs'].append(avg_acc)
-        stats['entropies'].append(avg_ent)
 
-        print(f"  BC Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}, acc={avg_acc:.3f}, ent={avg_ent:.3f}")
+        print(f"  BC Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}, acc={avg_acc:.3f}")
 
-        # Early stopping: halt when acc >= threshold for `patience` consecutive epochs
-        # Goal: preserve ~2-3% stochasticity so RL can explore from BC init
+        # Early stopping
         if avg_acc >= early_stop_acc:
-            _patience_counter += 1
-            if _patience_counter >= early_stop_patience:
-                print(f"  ⏹ BC early stop at epoch {epoch+1}: "
-                      f"acc={avg_acc:.3f} >= {early_stop_acc:.2f} "
-                      f"for {early_stop_patience} consecutive epochs. "
-                      f"Entropy={avg_ent:.3f} preserved.")
-                _stopped_early = True
+            consecutive_early += 1
+            if consecutive_early >= early_stop_patience:
+                print(f"  Early stop at epoch {epoch+1} (acc={avg_acc:.3f} >= {early_stop_acc})")
                 break
         else:
-            _patience_counter = 0
+            consecutive_early = 0
 
     model.train()  # Restore train mode (critical: LSTM backward requires train mode)
+    epochs_trained = len(stats['losses'])
     return {
         'final_loss': stats['losses'][-1] if stats['losses'] else 0,
         'final_acc': stats['accs'][-1] if stats['accs'] else 0,
-        'final_entropy': stats['entropies'][-1] if stats['entropies'] else 0,
-        'epochs_trained': len(stats['losses']),
-        'stopped_early': _stopped_early,
-        'epochs': epochs,
+        'final_entropy': 0.0,
+        'epochs_trained': epochs_trained,
+        'stopped_early': epochs_trained < epochs,
     }
 
 
