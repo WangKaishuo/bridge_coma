@@ -26,7 +26,7 @@ import copy
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import Counter
-from typing import Tuple
+from typing import Tuple, Optional, List
 
 import numpy as np
 import torch
@@ -65,7 +65,7 @@ class Phase2Config:
     stage1_deals_per_step: int = 32
     stage1_accumulate: int = 4
     # 双轨预热: BC 和 Critic 交替训练
-    critic_warmup_rounds: int = 10    # 原 5; 给 Critic 更多收敛机会
+    critic_warmup_rounds: int = 3     # P52: MLP 收敛快, 3轮足够
     critic_warmup_deals: int = 512
     critic_warmup_log_interval: int = 2
 
@@ -74,18 +74,21 @@ class Phase2Config:
     belief_pretrain_epochs: int = 50     # 原 20, 充分收敛
     belief_pretrain_target_acc: float = 0.40  # Top-13 命中率目标 (随机基线=0.25, 有意义≥0.35)
 
-    # Stage 2: Alternating fine-tune (single_step, batch-mean baseline)
-    # S-N-S-N... 交替训练 + 联合微调收尾
-    stage2_alt_rounds: int = 6         # 交替轮数 (每轮 = 1×S + 1×N); 4→6 给收敛更多空间
-    stage2_alt_steps: int = 200        # 每个半轮的步数
-    stage2_joint_steps: int = 400      # 最终联合微调步数
+    # Stage 2: Alternating fine-tune (P52)
+    # P52 变更: lr 大幅降低 (3e-5→3e-6), 步数增加 (200→800), FSP
+    stage2_alt_rounds: int = 6         # 交替轮数 (每轮 = 1×S + 1×N)
+    stage2_alt_steps: int = 800        # P52: 200→800 (低lr需更多步数)
+    stage2_joint_steps: int = 400      # 已废弃 (joint fine-tune 已移除)
     stage2_deals_per_step: int = 32
     stage2_accumulate: int = 8         # 256 deals/update
-    stage2_lr: float = 3e-5            # 交替阶段用
-    stage2_lr_joint: float = 1e-5      # 联合微调用
-    stage2_entropy_start: float = 0.10 # 每轮重置到此值 (防 3-action 坍缩)
-    stage2_entropy_end: float = 0.05   # 每轮退火终点
+    stage2_lr: float = 3e-6            # P52: 3e-5→3e-6 (Kita: 1e-6, 适当放宽)
+    stage2_lr_joint: float = 1e-6      # 已废弃
+    stage2_entropy_start: float = 0.05 # P52: 降低 (MLP收敛更快, 不需要高探索)
+    stage2_entropy_end: float = 0.01   # P52
     stage2_entropy_anneal: float = 0.8 # 延后退火
+
+    # FSP (Fictitious Self-Play)
+    stage2_fsp_pool_size: int = 10     # pool 容量; 0 = 关闭 FSP
 
     # KL Anchor: Stage 2 中限制 RL 策略偏离 BC 的程度
     stage2_kl_lambda_start: float = 0.5  # 初始 KL 系数
@@ -104,10 +107,13 @@ class Phase2Config:
     # N-phase: 同理, 但N的vl历来稳定(低KL), ratio效果次要
     stage2_critic_lr_ratio: float = 5.0   # 默认5x; 可选3-10
 
-    # Critic 自适应预热 (P51 — 大池子静态buffer)
-    stage2_critic_prewarm_max_rounds: int = 30    # 自适应预热外轮数上限
-    stage2_critic_prewarm_deals: int = 2048       # P51: 大池子 (原128→2048)
-    stage2_critic_prewarm_epochs: int = 10        # P51: 静态buffer拟合epoch数
+    # Critic 预热 (P52: MLP 架构收敛快, 固定2轮×512 deals 足够)
+    # 旧版 P51 用 30轮×2048 deals 自适应收敛, 对 LSTM 必要但对 MLP 是巨大浪费
+    # Critic 预热 (P53 PopArt): PopArt让vl始终在归一化空间[0,1]附近
+    # phase切换不再导致vl从0.07跳到2.8, 2轮×512已足够
+    stage2_critic_prewarm_max_rounds: int = 2     # 固定2轮
+    stage2_critic_prewarm_deals: int = 512        # 512 deals/轮
+    stage2_critic_prewarm_epochs: int = 3         # 静态buffer拟合epoch数
     stage2_critic_prewarm_conv_tol: float = 0.05  # 相对变化率收敛阈值
 
     # BC 全局高压线 (P51)
@@ -144,10 +150,9 @@ class Phase2Config:
     jit_burnin_lr: float = 1e-3     # burn-in 专用 lr (比正常 1e-4 大 10x)
 
     # Belief Actor (注入 BeliefNetwork 推断到 Actor 输入)
-    # belief_actor_players: 哪些 player 的 actor 接受 belief 特征输入.
-    # None = 关闭. [SOUTH] = 只给 S 注入 N 的手牌推断 (当前实验配置).
-    # 扩展到 EW: [SOUTH, WEST] — S推断N, W推断E.
-    belief_actor_players: Optional[List[int]] = None   # 默认关闭, 需显式启用
+    # None = 关闭 (默认). [SOUTH] = 只给 S 注入对家(N)的手牌推断.
+    # 扩展: [SOUTH, WEST] 可同时给 S 和 W 启用.
+    belief_actor_players: Optional[List[int]] = None
 
     # Go/No-Go
     go_info_ratio: float = 1.0
@@ -434,10 +439,12 @@ def _make_sub_config(config: Phase2Config, num_steps: int, lr: float,
         # P51: KL 早停 (epoch-level) + BC 高压线
         kl_early_stop_threshold=0.015,
         bc_kl_max=config.stage2_bc_kl_max,
-        # Belief Actor: 哪些 player 在 rollout 时注入 belief 推断
+        # Belief Actor
         belief_actor_players=belief_actor_players,
+        # FSP
+        fsp_pool_size=getattr(config, 'stage2_fsp_pool_size', 10),
         eval_interval=100,
-        log_interval=20,
+        log_interval=50,
     )
 
 
@@ -498,8 +505,10 @@ def _run_one_phase(config: Phase2Config, env, sub_config: SubgameConfig,
     若提供 bc_state, 注入 KL anchor (防 RL 摧毁 BC 策略).
     """
     trainer = SubgameTrainer(env, sub_config)
-    # HAPPO: agent.load_state_dict 支持新格式 (actor_n.* / actor_s.* / critic.*)
     trainer.agent.load_state_dict(prev_state)
+    # FSP pool 初始时用当前策略填充一个条目, 避免第一轮完全没有历史策略
+    if sub_config.fsp_pool_size > 0:
+        trainer.agent.fsp_push()
 
     # 注入 KL anchor: BC 快照 = Stage 1 结束时的参数
     # 每个半轮重新注入同一个 bc_state, 确保 anchor 始终指向 BC 分布
@@ -539,12 +548,15 @@ def _jit_burn_in(config: Phase2Config, env, current_state: dict,
       Burn-in 让评估器与当前叫牌协议保持同步, 确保 ir 估计准确.
     """
     # 构建只用于 rollout 的临时 trainer (不训练 PPO)
+    # 必须传入 belief_actor_players, 使 burnin_trainer 的 actor_s 结构
+    # 与 current_state 一致 (同为 belief_dim=48), 避免 load_state_dict 形状不匹配
     burnin_cfg = SubgameConfig(
         num_steps=1,           # 占位, 不实际用
         deals_per_step=num_deals,
         use_info_bonus=True,
         device=config.device,
         active_players=[NORTH, SOUTH],
+        belief_actor_players=config.belief_actor_players,
     )
     burnin_trainer = SubgameTrainer(env, burnin_cfg)
     burnin_trainer.agent.load_state_dict(current_state)
@@ -683,8 +695,9 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 # S-phase KL: 与 N 统一, 跨轮次递减, 轮内固定
                 kl_lambda_start=_kl,
                 kl_lambda_end=_kl,
-                # Belief Actor: 按全局配置决定是否为 S 注入 belief 推断
                 belief_actor_players=config.belief_actor_players,
+                # P53 PopArt: value 在归一化空间学习, phase切换不再导致vl爆炸
+                # 不需要S-phase特殊prewarm配置, 统一用默认值即可
             )
 
             trainer_s, _, eval_s = _run_one_phase(
@@ -717,8 +730,7 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 # N-phase KL: 与 S 统一, 跨轮次递减, 轮内固定
                 kl_lambda_start=_kl,
                 kl_lambda_end=_kl,
-                # N-phase 中 S 是冻结的 active_players 之外的 player,
-                # 但 S 的 actor 在 rollout 时仍需 belief 输入以保持行为一致
+                # N-phase 中 S 是冻结 player, 但 rollout 时仍需 belief 输入保持行为一致
                 belief_actor_players=config.belief_actor_players,
             )
 
@@ -729,6 +741,11 @@ def run_stage2(config: Phase2Config, base_trainer: SubgameTrainer,
                 phase_label=f"R{rnd} N-phase",
             )
             current_state = copy.deepcopy(trainer_n.agent.state_dict())
+
+            # FSP: N-phase 结束后把当前 N/S actor 推入 pool
+            # 下一轮训练时非 active player 会从这个 pool 采样历史策略
+            if config.stage2_fsp_pool_size > 0:
+                trainer_n.agent.fsp_push()
 
             # 更新 belief state (如果有)
             if use_info and trainer_n.belief_net is not None:
@@ -1589,7 +1606,6 @@ def main():
 
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
-    from env import SOUTH as _SOUTH
     config = Phase2Config(
         stayman_data=args.stayman_data,
         competitive_data=args.competitive_data,
@@ -1601,13 +1617,13 @@ def main():
         stage2_joint_steps=args.joint_steps,
         eval_deals=args.eval_deals,
         diag_deals=args.diag_deals,
-        belief_actor_players=[_SOUTH] if args.belief_actor_south else None,
+        belief_actor_players=[SOUTH] if args.belief_actor_south else None,
     )
 
     if args.quick:
         config.stage1_steps = 0
         config.stage2_alt_rounds = 2
-        config.stage2_alt_steps = 50
+        config.stage2_alt_steps = 100
         config.stage2_joint_steps = 50
         config.stage2_accumulate = 4
         config.eval_deals = 50

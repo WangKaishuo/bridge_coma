@@ -332,6 +332,8 @@ def behavioral_cloning_warmup(
     majority_actions = {string_to_bid("4H"), string_to_bid("4S")}
 
     # HAPPO: 按 player 选对应 actor; None 向后兼容
+    # P52: PolicyNetwork 已换成 MLP+全局拼接, obs['history'] 仍为 (B, max_len, 38)
+    # encode_history_flat 在 PolicyNetwork.forward 内部调用, BC 无需改动
     if player is not None and hasattr(agent, 'get_actor'):
         model = agent.get_actor(player)
     else:
@@ -371,16 +373,12 @@ def behavioral_cloning_warmup(
             logits = logits - 1e9 * (1 - mask)
 
             # ========================================================
-            # Per-sample 权重 (双重加权):
+            # Per-sample 权重:
+            # 动作加权: 非 4H/4S 少数类 → minority_weight
+            # 迫使网络不能靠猜多数派过关.
             #
-            # 1) 动作加权: 非 4H/4S 少数类 → minority_weight
-            #    迫使网络不能靠猜多数派过关.
-            #
-            # 2) 玩家加权: S 的样本 → ×3
-            #    N 和 S 共享 HistoryEncoder, 但 N 的任务不需要 history
-            #    (N 只看手牌叫 2D/2H/2S). N 的 5000 个样本的梯度
-            #    告诉 HistoryEncoder "history 不重要", 直接和 S 的梯度
-            #    打架. S 的加权确保 HistoryEncoder 被 S 的需求主导.
+            # P52 注: 移除旧的"玩家加权×3" (原因: N/S 共享 LSTM → S 梯度被
+            # N 稀释). P52 中 N/S 完全独立 MLP, 此问题不存在.
             # ========================================================
             weights = torch.ones(targets.shape[0], device=device)
 
@@ -389,11 +387,6 @@ def behavioral_cloning_warmup(
             for maj_act in majority_actions:
                 is_minority = is_minority & (targets != maj_act)
             weights[is_minority] = minority_weight
-
-            # 玩家加权: position one-hot 的 argmax == SOUTH(2) 的样本
-            positions = obs_d['position']  # (B, 4)
-            is_south = positions.argmax(dim=-1) == 2  # SOUTH = 2
-            weights[is_south] = weights[is_south] * 3.0
 
             loss = F.cross_entropy(logits, targets, reduction='none')
             loss = (loss * weights).mean()

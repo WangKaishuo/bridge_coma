@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple
 
-from env import NUM_BIDS
+from env import NUM_BIDS, NUM_PLAYERS
 from utils.hand_features import (
     BELIEF_DIM, HONOR_DIM, build_pos_weight, belief_accuracy
 )
@@ -31,47 +31,37 @@ from utils.hand_features import (
 
 class BeliefNetwork(nn.Module):
     """
-    Belief Network: 预测目标玩家的 48 维二值语义特征。
+    Belief Network (P52): 预测目标玩家的 48 维二值语义特征。
 
-    输入: 观察者手牌 (52) + 叫牌历史 + 观察者位置 + 目标位置
+    P52 变更: 删除 LSTM history encoder, 改用 MLP + who-made-it 展平编码.
+    与 PolicyNetwork 保持一致的 history 表示.
+
+    输入:
+        observer_hand (52) + history_flat (NUM_BIDS×NUM_PLAYERS=152)
+        + observer_pos_embed (32) + target_pos_embed (32)
+        = 268 dims
     输出: (batch, 48) logits，未经 Sigmoid
-
-    pos_weight:
-        统一 3.0，(48,) tensor
-        荣誉牌理论值恰好 = 3.0 (P=0.25)
-        套长 one-hot 互斥特性使不平衡影响较小，3.0 作为统一值
-
-    评估指标 (替代旧版 top13_hit_rate):
-        honor_acc  — AKQJ 归属准确率 (threshold=0.5)
-        length_acc — 套长 argmax 准确率 (等价于分类准确率)
-        overall_acc — 全部48维准确率
     """
 
-    def __init__(self, hand_dim: int = 256, history_dim: int = 256, hidden_dim: int = 256):
+    def __init__(self, hand_dim: int = 256, history_dim: int = 256, hidden_dim: int = 512):
         super().__init__()
-
-        self.hand_encoder = nn.Sequential(
-            nn.Linear(52, 256),
-            nn.ReLU(),
-            nn.Linear(256, hand_dim),
-            nn.ReLU(),
-        )
-
-        self.history_encoder = nn.LSTM(NUM_BIDS, history_dim, num_layers=2, batch_first=True)
+        # hand_dim / history_dim 参数保留向后兼容，实际不再使用
+        from networks.policy_net import encode_history_flat, NUM_BIDS, NUM_PLAYERS
+        self._encode_history_flat = encode_history_flat
 
         self.position_embed = nn.Embedding(4, 32)
 
-        input_dim = hand_dim + history_dim + 32 + 32
+        # 输入: hand(52) + history_flat(NUM_BIDS*NUM_PLAYERS) + pos×2(64)
+        input_dim = 52 + NUM_BIDS * NUM_PLAYERS + 32 + 32
         self.fc = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, BELIEF_DIM),   # 52 → 48
+            nn.Linear(hidden_dim, BELIEF_DIM),
             # 不加 Sigmoid; forward 返回 logits
         )
 
-        # pos_weight 注册为 buffer（随模型保存/迁移设备）
         self.register_buffer('pos_weight', build_pos_weight())
 
     def forward(
@@ -82,22 +72,15 @@ class BeliefNetwork(nn.Module):
         target_pos: torch.Tensor,
     ) -> torch.Tensor:
         """
+        Args:
+            history: (batch, max_len, NUM_BIDS) one-hot 序列
         Returns:
-            logits: (batch, 48) — 未经 sigmoid 的 raw scores
+            logits: (batch, 48)
         """
-        hand_feat = self.hand_encoder(observer_hand)
-
-        lengths = (history.sum(dim=-1) > 0).sum(dim=-1).clamp(min=1)
-        packed = nn.utils.rnn.pack_padded_sequence(
-            history, lengths.cpu(), batch_first=True, enforce_sorted=False
-        )
-        _, (h_n, _) = self.history_encoder(packed)
-        hist_feat = h_n[-1]
-
+        hist_flat = self._encode_history_flat(history)   # (B, NUM_BIDS*NUM_PLAYERS)
         obs_embed = self.position_embed(observer_pos)
         tgt_embed = self.position_embed(target_pos)
-
-        x = torch.cat([hand_feat, hist_feat, obs_embed, tgt_embed], dim=-1)
+        x = torch.cat([observer_hand, hist_flat, obs_embed, tgt_embed], dim=-1)
         return self.fc(x)
 
     def get_probs(

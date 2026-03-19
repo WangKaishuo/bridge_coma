@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 from env import NUM_PLAYERS, NUM_BIDS, BID_PASS, NORTH, EAST, SOUTH, WEST
-from networks import ActorCritic, BeliefNetwork
+from networks import BeliefNetwork
 from networks.belief_net import DualInfoComputer
 from algorithms.ippo import PPOConfig, RolloutBuffer
 from algorithms.mappo import MAPPOAgent, MAPPOConfig, MAPPORolloutBuffer
@@ -30,13 +30,20 @@ from utils.hand_features import hand_to_belief_target, belief_accuracy
 
 @dataclass
 class SubgameConfig:
-    """子博弈训练配置."""
+    """子博弈训练配置 (P52).
+
+    P52 变更:
+    - lr 默认从 1e-4 → 3e-6 (Kita et al. 2024 水平, 防止RL破坏BC)
+    - num_steps 默认从 5000 → 1000 (外层轮次增多补偿)
+    - fsp_pool_size: FSP checkpoint pool 大小 (0=关闭)
+    - 删除 LSTM 相关参数 (hand_dim / history_dim 不再有意义)
+    """
     # Training
-    num_steps: int = 5000
+    num_steps: int = 1000
     deals_per_step: int = 32
     accumulate_steps: int = 4         # collect N steps before 1 PPO update
-    lr: float = 1e-4
-    belief_lr: float = 1e-4          # Stage 2 在线微调用低 lr, 防止 256-sample batch 震荡覆盖预训练
+    lr: float = 3e-6                  # P52: 大幅降低, 防止RL破坏BC (Kita: 1e-6)
+    belief_lr: float = 1e-4          # Stage 2 在线微调用低 lr
 
     # Info bonus
     use_info_bonus: bool = False
@@ -45,10 +52,14 @@ class SubgameConfig:
     lambda_end: float = 0.1
     belief_warmup_steps: int = 500
 
-    # Network
-    hand_dim: int = 256
-    history_dim: int = 256
-    hidden_dim: int = 256
+    # Network (P52: MLP 固定 1024×4, 无 LSTM)
+    # hand_dim / history_dim / hidden_dim 已废弃, 保留向后兼容
+    hand_dim: int = 256      # deprecated
+    history_dim: int = 256   # deprecated
+    hidden_dim: int = 1024   # P52: MLP hidden size
+
+    # FSP (Fictitious Self-Play)
+    fsp_pool_size: int = 10  # 0 = 关闭 FSP
 
     # PPO
     gamma: float = 0.99
@@ -154,9 +165,6 @@ class SubgameTrainer:
             _belief_dims = {}
 
         mappo_config = MAPPOConfig(
-            hand_dim=config.hand_dim,
-            history_dim=config.history_dim,
-            hidden_dim=config.hidden_dim,
             lr=config.lr,
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
@@ -169,6 +177,7 @@ class SubgameTrainer:
             device=config.device,
             critic_lr_ratio=config.critic_lr_ratio,
             belief_dims=_belief_dims if _belief_dims else None,
+            fsp_pool_size=config.fsp_pool_size,
         )
         self.agent = MAPPOAgent(mappo_config)
 
@@ -178,9 +187,8 @@ class SubgameTrainer:
         self.belief_optimizer = None
 
         if config.use_info_bonus:
+            # P52: BeliefNetwork 签名已简化, hand_dim/history_dim 不再有意义
             self.belief_net = BeliefNetwork(
-                hand_dim=config.hand_dim,
-                history_dim=config.history_dim,
                 hidden_dim=config.hidden_dim,
             ).to(self.device)
             self.dual_info = DualInfoComputer(self.belief_net, beta=config.beta)
@@ -298,10 +306,20 @@ class SubgameTrainer:
         from networks.policy_net import PolicyNetwork
 
         def _make_bc_net(actor_state: dict) -> PolicyNetwork:
+            # P52: PolicyNetwork 签名已改为 (hidden_dim, num_layers, belief_dim)
+            # belief_dim 从 actor_state 的第一层权重尺寸推断
+            first_w = next((v for k, v in actor_state.items()
+                            if 'net.0.weight' in k), None)
+            from networks.policy_net import BASE_INPUT_DIM
+            if first_w is not None:
+                total_in = first_w.shape[1]
+                bdim = max(0, total_in - BASE_INPUT_DIM)
+            else:
+                bdim = 0
             net = PolicyNetwork(
-                hand_dim=self.config.hand_dim,
-                history_dim=self.config.history_dim,
                 hidden_dim=self.config.hidden_dim,
+                num_layers=4,
+                belief_dim=bdim,
             ).to(self.device)
             net.load_state_dict(actor_state)
             net.eval()
@@ -509,12 +527,13 @@ class SubgameTrainer:
 
                 # 检查是否是 agent 决策的 player
                 if player not in self.active_players:
-                    # 非 active player: 用该 player 自己的 actor (deterministic)
-                    # HAPPO: actor_n 和 actor_s 独立, 必须按 player 分发
-                    # 确保冻结的 player 保持 BC 学到的行为, 不被对方训练污染
+                    # 非 active player: FSP — 从历史 checkpoint pool 采样策略执行
+                    # FSP 防止 policy cycling: 非 active player 不总是用最新策略,
+                    # 而是从历史快照池均匀采样, 使训练对更广泛的对手分布鲁棒.
+                    # pool 为空时 (训练初期) 退化为最新策略, 行为与旧版一致.
                     all_hands = self.env._current_hands
                     obs = self._maybe_inject_belief(obs, player, all_hands)
-                    action, _ = self.agent.get_action_for_player(
+                    action, _ = self.agent.get_action_for_player_fsp(
                         obs, player, all_hands=all_hands, deterministic=True)
                     obs, reward, done, info = self.env.step(action)
                     continue
@@ -827,15 +846,17 @@ class SubgameTrainer:
                                 actor.parameters(), agent.config.max_grad_norm)
                             actor_opt.step()
 
-                        # Critic update: P49 独立 critic — 只更新该 player 的 critic
-                        values = critic(
+                        # Critic update (PopArt): 归一化空间计算 loss
+                        critic.update_stats(batch['returns'])
+                        b_ret_norm = critic.normalize_target(batch['returns'])
+                        values = critic.normalized_forward(
                             batch['obs'], batch.get('all_hands'))
                         old_values = values.detach()
                         v_clipped = old_values + (values - old_values).clamp(
                             -agent.config.clip_ratio, agent.config.clip_ratio)
                         value_loss = torch.max(
-                            F.mse_loss(values, batch['returns']),
-                            F.mse_loss(v_clipped, batch['returns'])
+                            F.mse_loss(values, b_ret_norm),
+                            F.mse_loss(v_clipped, b_ret_norm)
                         )
                         critic_opt.zero_grad()
                         value_loss.backward()

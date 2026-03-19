@@ -13,7 +13,7 @@ from typing import Dict, Tuple
 from dataclasses import dataclass
 
 from env import NUM_PLAYERS
-from networks import ActorCritic
+from networks import PolicyNetwork, ValueNetwork
 
 
 @dataclass
@@ -109,12 +109,23 @@ class IPPOAgent:
         self.config = config
         self.device = config.device
         
-        self.model = ActorCritic(
-            hand_dim=config.hand_dim,
-            history_dim=config.history_dim,
-            hidden_dim=config.hidden_dim,
-            centralized_critic=False
-        ).to(self.device)
+        # P52: ActorCritic 已拆分为独立的 PolicyNetwork + ValueNetwork
+        self._actor  = PolicyNetwork(hidden_dim=1024, num_layers=4).to(self.device)
+        self._critic = ValueNetwork(hidden_dim=1024, num_layers=4, centralized=False).to(self.device)
+        # 兼容接口: model.actor / model.critic
+        class _ModelCompat:
+            def __init__(self, actor, critic):
+                self.actor = actor
+                self.critic = critic
+            def parameters(self):
+                import itertools
+                return itertools.chain(actor.parameters(), critic.parameters())
+            def get_action_and_value(self, obs, deterministic=False):
+                action, log_prob, entropy = actor.get_action(obs, deterministic)
+                value = critic(obs)
+                return action, log_prob, entropy, value
+        actor, critic = self._actor, self._critic
+        self.model = _ModelCompat(actor, critic)
         
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
         self.buffers = {p: RolloutBuffer(self.device) for p in range(NUM_PLAYERS)}

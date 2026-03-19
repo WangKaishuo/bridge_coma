@@ -282,6 +282,9 @@ class StaymanSubgameEnv:
         自动执行非 agent 控制的玩家:
         - EW 永远 auto-pass
         - north_rule=True 时, N 也用规则策略
+        - 成局后 (3NT / 4M已确定) 的后续叫牌轮次全部 auto-pass:
+          BC 和 RL 均未训练过"同伴接受邀请叫出 4H 后 S 的后续叫牌"这一 OOD 位置.
+          若不 auto-pass, agent 会在 OOD 历史下乱叫 (如 4S), 产生假 nofit→4M.
 
         返回下一个需要 agent 决策的 player 的 obs.
         legal_actions 直接使用桥牌规则合法性 mask (普适化, 无硬编码限制).
@@ -289,7 +292,24 @@ class StaymanSubgameEnv:
         while not done:
             player = self.env.state.current_player
 
-            if player in (EAST, WEST):
+            # 判断当前最高实质叫品是否已达成局级别 (3NT / 4阶及以上)
+            # 若是, 后续所有 player (含 agent) 均 auto-pass.
+            # 理由: Stayman 子博弈的训练序列在成局后即结束, 没有任何 agent 被训练
+            # 过在成局后继续叫牌. 强行让 agent 决策会产生 OOD 噪声.
+            history = self.env.state.history
+            game_reached = False
+            for bid in reversed(history):
+                if bid >= BID_1C:   # 实质叫品
+                    level = (bid - BID_1C) // 5 + 1
+                    suit  = (bid - BID_1C) % 5
+                    # 3NT (suit=4, level=3) 或 4阶及以上任意花色
+                    if (suit == 4 and level >= 3) or level >= 4:
+                        game_reached = True
+                    break
+
+            if game_reached:
+                obs, _, done, _ = self.env.step(BID_PASS)
+            elif player in (EAST, WEST):
                 obs, _, done, _ = self.env.step(BID_PASS)
             elif player == NORTH and self.north_rule:
                 bid = north_stayman_rule(self._current_hands, self.env.state.history)
@@ -361,24 +381,16 @@ class StaymanSubgameEnv:
 
     def _compute_terminal_reward(self) -> float:
         """
-        训练 reward: Piecewise linear, 映射 IMP regret → [0.01, 1.0].
+        训练 reward: 线性映射 IMP regret → [0.01, 1.0].
 
-        分段设计 (breakpoints 对应桥牌计分的自然不连续点):
-          IMP =  0  → 1.00  完美匹配受限 DDS 最优
-          IMP = -1  → 0.70  错选花色 (3NT vs 4M), 陡峭惩罚 (Δ=0.30)
-          IMP = -6  → 0.25  漏局 (Part-score vs Game)
-          IMP ≤ -13 → 0.01  灾难 (clamp, 保留微弱梯度)
+          IMP =   0  -> 1.00  完美匹配受限 DDS 最优
+          IMP = -13  -> 0.01  最差情形 (clamp, 保留微弱梯度)
 
-        关键: 0→-1 段斜率 (0.30/IMP) 远大于 -1→-6 段 (0.09/IMP),
-        迫使模型优先区分 N 的应叫语义, 而非恐惧大错.
+        公式: reward = max(imp / 13 + 1, 0.01)
+        保留 IMP 原有的线性梯度结构, 与 GAE 的理论假设兼容.
         """
         imp_diff = self._compute_imp_diff()
-        return float(self._piecewise_reward(imp_diff))
-
-    @staticmethod
-    def _piecewise_reward(imp_diff: float) -> float:
-        """Piecewise linear reward mapping."""
-        return max(imp_diff/13 + 1, 0.01)
+        return float(max(imp_diff / 13 + 1, 0.01))
 
     def _compute_imp_diff(self) -> float:
         """

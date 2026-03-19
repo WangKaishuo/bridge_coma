@@ -1,35 +1,23 @@
 """
-MAPPO (Multi-Agent PPO) — HAPPO: 独立 Actor + 独立 Centralized Critic
-======================================================================
+MAPPO (Multi-Agent PPO) — HAPPO + FSP
+======================================
 
-架构改动 (P49): 从共享 Critic 改为双独立 Critic.
-
-P48 的问题:
-  共享 Critic 在 S-phase 用 S 的状态数据更新, 切到 N-phase 时
-  Critic 面对完全不同的状态分布 → 灾难性遗忘 → vl 爆到 2000+.
-  根本原因是 N (round1/3) 和 S (round2) 的状态分布在叫牌树上
-  处于完全不同的深度, 一个 Critic 无法同时服务两个分布.
-
-P49 解法 (Gemini 建议 + HAPPO 标准操作):
-  N 和 S 各自拥有独立的 critic (critic_n, critic_s).
-  两个 critic 均接受全局状态 (all_hands + obs), 满足 CTDE 要求.
-  S-phase: critic_s 更新, critic_n 完全冻结.
-  N-phase: critic_n 更新, critic_s 完全冻结.
-  切换 phase 时 critic 从不相互污染 → vl 平滑衔接上轮状态.
-
-接口:
-  - agent.get_actor(player)          → actor_n / actor_s
-  - agent.get_critic(player)         → critic_n / critic_s
-  - agent.get_actor_optimizer(player)
-  - agent.get_critic_optimizer(player)
+P52 变更:
+- PolicyNetwork / ValueNetwork 换成 MLP+全局拼接版本 (无 LSTM)
+- 加入 Fictitious Self-Play (FSP) checkpoint pool
+  FSP 原理: 非 active player 从历史 checkpoint pool 中均匀采样策略执行,
+  而不是总用最新策略. 防止 policy cycling (交替训练的常见失效模式).
+- MAPPOConfig 新增 fsp_pool_size (默认 10)
 """
 
+import copy
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List
+from dataclasses import dataclass, field
 
 from env import NUM_PLAYERS, NORTH, SOUTH
 from networks.policy_net import PolicyNetwork, ValueNetwork
@@ -41,10 +29,10 @@ class MAPPOConfig(PPOConfig):
     """MAPPO 配置"""
     centralized_critic: bool = True
     critic_lr_ratio: float = 3.0
-    # belief_dim > 0: 为对应 player 的 actor 注入 BeliefNetwork 推断特征.
-    # 按 player 配置: {NORTH: 0, SOUTH: 48, EAST: 0, WEST: 0} 等.
-    # 默认全0 (向后兼容). 实验入口在 _make_sub_config 里按需传入.
-    belief_dims: Dict[int, int] = None   # player → belief_dim; None=全部0
+    # belief_dims: player → belief_dim; None = 全部0 (向后兼容)
+    belief_dims: Dict[int, int] = None
+    # FSP: checkpoint pool 最大容量. 0 = 关闭 FSP (纯 latest-policy self-play)
+    fsp_pool_size: int = 10
 
 
 class MAPPORolloutBuffer(RolloutBuffer):
@@ -81,12 +69,46 @@ class MAPPORolloutBuffer(RolloutBuffer):
             yield batch
 
 
+class FSPPool:
+    """
+    Fictitious Self-Play checkpoint pool.
+
+    维护最近 pool_size 个 actor 快照.
+    非 active player 调用 sample_actor() 从 pool 中均匀采样一个历史策略执行.
+    这样非 active player 的行为来自"过去自己的平均", 防止 policy cycling.
+    """
+
+    def __init__(self, pool_size: int, device: str):
+        self.pool_size = pool_size
+        self.device = device
+        self._pool: List[Dict] = []   # list of state_dicts
+
+    def push(self, actor_n_state: dict, actor_s_state: dict):
+        """把当前 N/S actor 快照加入 pool."""
+        if self.pool_size <= 0:
+            return
+        entry = {
+            NORTH: copy.deepcopy(actor_n_state),
+            SOUTH: copy.deepcopy(actor_s_state),
+        }
+        self._pool.append(entry)
+        if len(self._pool) > self.pool_size:
+            self._pool.pop(0)
+
+    def sample_actor_state(self, player: int) -> Optional[dict]:
+        """从 pool 中均匀采样一个历史 actor state_dict.
+        pool 为空时返回 None (caller 用最新策略)."""
+        if not self._pool:
+            return None
+        entry = random.choice(self._pool)
+        return entry[player]
+
+    def __len__(self):
+        return len(self._pool)
+
+
 class _HAPPOModel(nn.Module):
-    """
-    HAPPO 模型容器.
-    包含 actor_n, actor_s, critic_n, critic_s 四个独立子网络.
-    向后兼容: model.actor → actor_s, model.critic → critic_s.
-    """
+    """HAPPO 模型容器 (P52: MLP 版)."""
 
     def __init__(self, actor_n: PolicyNetwork, actor_s: PolicyNetwork,
                  critic_n: ValueNetwork, critic_s: ValueNetwork):
@@ -95,10 +117,9 @@ class _HAPPOModel(nn.Module):
         self.actor_s  = actor_s
         self.critic_n = critic_n
         self.critic_s = critic_s
-
         # 向后兼容别名
         self.actor  = actor_s
-        self.critic = critic_s   # 旧代码 agent.model.critic 默认指向 critic_s
+        self.critic = critic_s
 
     def get_action_and_value(self, obs, all_hands=None, deterministic=False,
                              player: int = SOUTH):
@@ -111,45 +132,43 @@ class _HAPPOModel(nn.Module):
 
 class MAPPOAgent:
     """
-    HAPPO Multi-Agent PPO: 独立 Actor + 独立 Centralized Critic.
-
-    N-phase: 只更新 actor_n + critic_n; actor_s + critic_s 完全冻结.
-    S-phase: 只更新 actor_s + critic_s; actor_n + critic_n 完全冻结.
+    HAPPO Multi-Agent PPO (P52):
+    - MLP+全局拼接 actor/critic (无 LSTM)
+    - FSP checkpoint pool (防 policy cycling)
     """
 
     def __init__(self, config: MAPPOConfig):
         self.config = config
         self.device = config.device
 
-        # belief_dims: player → belief_dim (None = 全部0, 向后兼容)
         _belief_dims = config.belief_dims or {}
 
-        def _make_actor(player: int):
+        def _make_actor(player: int) -> PolicyNetwork:
             bdim = _belief_dims.get(player, 0)
             return PolicyNetwork(
-                hand_dim=config.hand_dim,
-                history_dim=config.history_dim,
-                hidden_dim=config.hidden_dim,
+                hidden_dim=1024,
+                num_layers=4,
                 belief_dim=bdim,
             ).to(self.device)
 
-        def _make_critic():
+        def _make_critic() -> ValueNetwork:
             return ValueNetwork(
-                hand_dim=config.hand_dim,
-                history_dim=config.history_dim,
-                hidden_dim=config.hidden_dim,
+                hidden_dim=1024,
+                num_layers=4,
                 centralized=True,
             ).to(self.device)
 
         self.model = _HAPPOModel(
             actor_n=_make_actor(NORTH), actor_s=_make_actor(SOUTH),
-            critic_n=_make_critic(), critic_s=_make_critic(),
+            critic_n=_make_critic(),    critic_s=_make_critic(),
         ).to(self.device)
 
-        self.actor_n_optimizer  = torch.optim.Adam(self.model.actor_n.parameters(),  lr=config.lr)
-        self.actor_s_optimizer  = torch.optim.Adam(self.model.actor_s.parameters(),  lr=config.lr)
-        self.critic_n_optimizer = torch.optim.Adam(self.model.critic_n.parameters(), lr=config.lr * config.critic_lr_ratio)
-        self.critic_s_optimizer = torch.optim.Adam(self.model.critic_s.parameters(), lr=config.lr * config.critic_lr_ratio)
+        lr = config.lr
+        clr = config.lr * config.critic_lr_ratio
+        self.actor_n_optimizer  = torch.optim.Adam(self.model.actor_n.parameters(),  lr=lr)
+        self.actor_s_optimizer  = torch.optim.Adam(self.model.actor_s.parameters(),  lr=lr)
+        self.critic_n_optimizer = torch.optim.Adam(self.model.critic_n.parameters(), lr=clr)
+        self.critic_s_optimizer = torch.optim.Adam(self.model.critic_s.parameters(), lr=clr)
 
         # 向后兼容
         self.actor_optimizer  = self.actor_s_optimizer
@@ -158,9 +177,11 @@ class MAPPOAgent:
 
         self.buffers = {p: MAPPORolloutBuffer(self.device) for p in range(NUM_PLAYERS)}
 
-    # ------------------------------------------------------------------
-    # Per-player 接口
-    # ------------------------------------------------------------------
+        # FSP pool
+        fsp_size = getattr(config, 'fsp_pool_size', 10)
+        self.fsp_pool = FSPPool(pool_size=fsp_size, device=self.device)
+
+    # ── Per-player 接口 ───────────────────────────────────────────────────
 
     def get_actor(self, player: int) -> PolicyNetwork:
         return self.model.actor_n if player == NORTH else self.model.actor_s
@@ -174,31 +195,65 @@ class MAPPOAgent:
     def get_critic_optimizer(self, player: int):
         return self.critic_n_optimizer if player == NORTH else self.critic_s_optimizer
 
-    # ------------------------------------------------------------------
-    # Action sampling
-    # ------------------------------------------------------------------
+    # ── FSP ──────────────────────────────────────────────────────────────
 
-    def get_action(self, obs: Dict[str, np.ndarray], all_hands=None,
-                   deterministic: bool = False) -> Tuple[int, Dict]:
-        """向后兼容接口, 默认用 actor_s/critic_s."""
+    def fsp_push(self):
+        """将当前 actor_n / actor_s 快照加入 FSP pool."""
+        self.fsp_pool.push(
+            self.model.actor_n.state_dict(),
+            self.model.actor_s.state_dict(),
+        )
+
+    def get_fsp_actor(self, player: int) -> Optional[PolicyNetwork]:
+        """
+        返回一个临时 actor (从 FSP pool 采样的历史策略).
+        pool 为空时返回 None, caller 用最新策略.
+        """
+        state = self.fsp_pool.sample_actor_state(player)
+        if state is None:
+            return None
+        # 创建同结构网络并加载历史权重
+        actor = PolicyNetwork(
+            hidden_dim=1024,
+            num_layers=4,
+            belief_dim=self.get_actor(player).belief_dim,
+        ).to(self.device)
+        actor.load_state_dict(state)
+        actor.eval()
+        return actor
+
+    # ── Action sampling ──────────────────────────────────────────────────
+
+    def get_action(self, obs, all_hands=None, deterministic=False):
         return self._get_action_for_player(obs, SOUTH, all_hands, deterministic)
 
-    def get_action_for_player(self, obs: Dict[str, np.ndarray], player: int,
-                               all_hands=None,
-                               deterministic: bool = False) -> Tuple[int, Dict]:
+    def get_action_for_player(self, obs, player: int, all_hands=None,
+                               deterministic=False):
         return self._get_action_for_player(obs, player, all_hands, deterministic)
 
-    def _get_action_for_player(self, obs, player, all_hands, deterministic):
+    def _get_action_for_player(self, obs, player, all_hands, deterministic,
+                                actor_override=None):
         obs_t = {k: torch.tensor(v, dtype=torch.float32).unsqueeze(0).to(self.device)
                  for k, v in obs.items()}
         all_h_t = (torch.tensor(all_hands, dtype=torch.float32).unsqueeze(0).to(self.device)
                    if all_hands is not None else None)
-        actor  = self.get_actor(player)
+        actor  = actor_override if actor_override is not None else self.get_actor(player)
         critic = self.get_critic(player)
         with torch.no_grad():
             action, log_prob, _ = actor.get_action(obs_t, deterministic)
             value = critic(obs_t, all_h_t)
         return action.item(), {'log_prob': log_prob.squeeze(0), 'value': value.squeeze(0)}
+
+    def get_action_for_player_fsp(self, obs, player: int, all_hands=None,
+                                   deterministic=False):
+        """
+        FSP 版 action: 从 pool 采样历史策略.
+        用于非 active player 的 rollout 执行.
+        pool 为空时退化为最新策略.
+        """
+        fsp_actor = self.get_fsp_actor(player)
+        return self._get_action_for_player(obs, player, all_hands, deterministic,
+                                           actor_override=fsp_actor)
 
     def store_transition(self, player, obs, action, log_prob, reward, value, done,
                          all_hands=None):
@@ -206,9 +261,7 @@ class MAPPOAgent:
         self.buffers[player].add(obs_t, torch.tensor(action), log_prob, reward,
                                  value, done, all_hands)
 
-    # ------------------------------------------------------------------
-    # Standard update (向后兼容, SubgameTrainer.safe_update 优先)
-    # ------------------------------------------------------------------
+    # ── Standard update (向后兼容) ─────────────────────────────────────────
 
     def update(self) -> Dict[str, float]:
         total_loss = total_policy = total_value = total_entropy = num_updates = 0
@@ -234,7 +287,7 @@ class MAPPOAgent:
                     adv = (batch['advantages'] - batch['advantages'].mean()) / (batch['advantages'].std() + 1e-8)
                     policy_loss = -torch.min(
                         ratio * adv,
-                        torch.clamp(ratio, 1 - self.config.clip_ratio, 1 + self.config.clip_ratio) * adv
+                        torch.clamp(ratio, 1-self.config.clip_ratio, 1+self.config.clip_ratio) * adv
                     ).mean()
                     actor_loss = policy_loss - self.config.entropy_coef * entropy.mean()
                     actor_opt.zero_grad(); actor_loss.backward()
@@ -262,9 +315,7 @@ class MAPPOAgent:
         return {'loss': total_loss/num_updates, 'policy_loss': total_policy/num_updates,
                 'value_loss': total_value/num_updates, 'entropy': total_entropy/num_updates}
 
-    # ------------------------------------------------------------------
-    # Serialization
-    # ------------------------------------------------------------------
+    # ── Serialization ─────────────────────────────────────────────────────
 
     def save(self, path: str):
         torch.save({
@@ -272,10 +323,6 @@ class MAPPOAgent:
             'actor_s':  self.model.actor_s.state_dict(),
             'critic_n': self.model.critic_n.state_dict(),
             'critic_s': self.model.critic_s.state_dict(),
-            'actor_n_optimizer':  self.actor_n_optimizer.state_dict(),
-            'actor_s_optimizer':  self.actor_s_optimizer.state_dict(),
-            'critic_n_optimizer': self.critic_n_optimizer.state_dict(),
-            'critic_s_optimizer': self.critic_s_optimizer.state_dict(),
         }, path)
 
     def load(self, path: str):
@@ -285,22 +332,8 @@ class MAPPOAgent:
             self.model.actor_s.load_state_dict(ckpt['actor_s'])
             self.model.critic_n.load_state_dict(ckpt['critic_n'])
             self.model.critic_s.load_state_dict(ckpt['critic_s'])
-            for key in ('actor_n_optimizer', 'actor_s_optimizer',
-                        'critic_n_optimizer', 'critic_s_optimizer'):
-                if key in ckpt:
-                    getattr(self, key).load_state_dict(ckpt[key])
-        elif 'model' in ckpt:
-            # 旧格式迁移: 共享 actor/critic → 复制到 N 和 S
-            old = ckpt['model']
-            actor_state  = {k[len('actor.'):]:  v for k, v in old.items() if k.startswith('actor.')}
-            critic_state = {k[len('critic.'): ]: v for k, v in old.items() if k.startswith('critic.')}
-            self.model.actor_n.load_state_dict(actor_state)
-            self.model.actor_s.load_state_dict(actor_state)
-            self.model.critic_n.load_state_dict(critic_state)
-            self.model.critic_s.load_state_dict(critic_state)
 
     def state_dict(self) -> dict:
-        """合并 state dict: actor_n.* / actor_s.* / critic_n.* / critic_s.*"""
         d = {}
         for prefix, net in [('actor_n',  self.model.actor_n),
                              ('actor_s',  self.model.actor_s),
@@ -310,21 +343,49 @@ class MAPPOAgent:
                 d[f'{prefix}.{k}'] = v
         return d
 
+    @staticmethod
+    def _load_actor_state(actor: PolicyNetwork, state_dict: dict):
+        """兼容 belief_dim 扩展的 state_dict 加载 (支持双向尺寸不匹配)."""
+        current_sd = actor.state_dict()
+        new_sd = {}
+        for k, ckpt_v in state_dict.items():
+            if k not in current_sd:
+                continue
+            curr_v = current_sd[k]
+            if curr_v.shape == ckpt_v.shape:
+                new_sd[k] = ckpt_v
+            elif (curr_v.dim() == 2 and ckpt_v.dim() == 2
+                  and curr_v.shape[0] == ckpt_v.shape[0]):
+                if ckpt_v.shape[1] > curr_v.shape[1]:
+                    # 大→小: 截断
+                    new_sd[k] = ckpt_v[:, :curr_v.shape[1]]
+                else:
+                    # 小→大: 新增列保持随机初始化
+                    merged = curr_v.clone()
+                    merged[:, :ckpt_v.shape[1]] = ckpt_v
+                    new_sd[k] = merged
+            else:
+                import warnings
+                warnings.warn(f'_load_actor_state: skipping {k} '
+                              f'(ckpt {ckpt_v.shape} vs current {curr_v.shape})')
+                new_sd[k] = curr_v
+        actor.load_state_dict(new_sd, strict=False)
+
     def load_state_dict(self, state: dict):
         """兼容新格式 (actor_n.*/critic_n.*) 和旧格式 (actor.*/critic.*)."""
         if any(k.startswith('actor_n.') for k in state):
             def _extract(prefix):
-                return {k[len(prefix)+1:]: v for k, v in state.items() if k.startswith(prefix+'.')}
-            self.model.actor_n.load_state_dict(_extract('actor_n'))
-            self.model.actor_s.load_state_dict(_extract('actor_s'))
+                return {k[len(prefix)+1:]: v for k, v in state.items()
+                        if k.startswith(prefix+'.')}
+            self._load_actor_state(self.model.actor_n, _extract('actor_n'))
+            self._load_actor_state(self.model.actor_s, _extract('actor_s'))
             self.model.critic_n.load_state_dict(_extract('critic_n'))
             self.model.critic_s.load_state_dict(_extract('critic_s'))
         elif any(k.startswith('actor.') for k in state):
-            # 旧格式: 共享网络 → 复制到 N 和 S
             actor_state  = {k[len('actor.'):]:  v for k, v in state.items() if k.startswith('actor.')}
             critic_state = {k[len('critic.'): ]: v for k, v in state.items() if k.startswith('critic.')}
-            self.model.actor_n.load_state_dict(actor_state)
-            self.model.actor_s.load_state_dict(actor_state)
+            self._load_actor_state(self.model.actor_n, actor_state)
+            self._load_actor_state(self.model.actor_s, actor_state)
             self.model.critic_n.load_state_dict(critic_state)
             self.model.critic_s.load_state_dict(critic_state)
         else:
