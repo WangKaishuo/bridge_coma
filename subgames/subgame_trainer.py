@@ -1,1253 +1,1023 @@
 """
-Subgame Trainer
-===============
+Subgame Trainer  (新架构版)
+============================
 
-通用子博弈训练框架.
+适配 301 维 MLP Actor（无 LSTM），HAPPO 独立 Critic，FSP pool，KL anchor。
 
-关键设计:
-- active_players: 只训练指定玩家 (e.g., [SOUTH] for Stage 1)
-- accumulate_steps: 累积 N 步数据后做 1 次 PPO update
-- safe_update: 完全自主的 PPO update (不调 agent.update()),
-  有稳健 advantage 归一化 (防 std=0 NaN)
-- 可选 Dual-Info Bonus (BeliefNetwork + DualInfoComputer)
+核心变化（vs 旧版）:
+1. collect_episodes 用 encode_obs_flat 生成 flat_obs (301,)，
+   不再存 {'hand', 'history', 'position', 'vulnerability'} 字典。
+   Buffer 只存 flat_obs + legal_actions + all_hands。
+
+2. FSP pool 集成：每 fsp_add_interval 轮将 actor snapshot 存入 pool，
+   rollout 时对手从 pool 中随机采样（anti-cycling）。
+
+3. KL anchor：set_bc_anchor() 存储 BC checkpoint，
+   safe_update() 中 loss += kl_lambda * KL(pi_current ∥ pi_bc)，
+   kl_lambda 从 kl_lambda_start 线性退火到 kl_lambda_end。
+
+4. JIT Belief Burn-in：每次 N-phase 开始前对 Belief Net 做快速微调，
+   避免 N 策略更新后 Belief Net OOD。
+
+5. Critic warmup：大池子静态 buffer + 多 epoch 拟合（P51 设计保留）。
+
+6. Rule-based BC 预热：run_bc_warmup() 使用 competitive_env 的
+   generate_rule_based_bc_data()，不依赖外部数据集。
 """
+
+from __future__ import annotations
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 from env import NUM_PLAYERS, NUM_BIDS, BID_PASS, NORTH, EAST, SOUTH, WEST
-from networks import BeliefNetwork
-from networks.belief_net import DualInfoComputer
-from algorithms.ippo import PPOConfig, RolloutBuffer
-from algorithms.mappo import MAPPOAgent, MAPPOConfig, MAPPORolloutBuffer
+from networks.belief_net import BeliefNetwork, DualInfoComputer
+from networks.policy_net import (
+    MLPPolicyNetwork, MLPValueNetwork, encode_obs_flat, OBS_DIM
+)
+from algorithms.mappo import MAPPOAgent, MAPPOConfig
 from utils.running_stats import RunningStats
-from utils.hand_features import hand_to_belief_target, belief_accuracy
+from utils.hand_features import hand_to_belief_target, belief_accuracy, BELIEF_DIM
+from utils.fsp_pool import FSPPool
 
+
+# ==============================================================================
+# Config
+# ==============================================================================
 
 @dataclass
 class SubgameConfig:
-    """子博弈训练配置 (P52).
-
-    P52 变更:
-    - lr 默认从 1e-4 → 3e-6 (Kita et al. 2024 水平, 防止RL破坏BC)
-    - num_steps 默认从 5000 → 1000 (外层轮次增多补偿)
-    - fsp_pool_size: FSP checkpoint pool 大小 (0=关闭)
-    - 删除 LSTM 相关参数 (hand_dim / history_dim 不再有意义)
     """
-    # Training
-    num_steps: int = 1000
-    deals_per_step: int = 32
-    accumulate_steps: int = 4         # collect N steps before 1 PPO update
-    lr: float = 3e-6                  # P52: 大幅降低, 防止RL破坏BC (Kita: 1e-6)
-    belief_lr: float = 1e-4          # Stage 2 在线微调用低 lr
+    子博弈训练配置（新架构版）.
 
-    # Info bonus
-    use_info_bonus: bool = False
-    beta: float = 0.05   # info bonus 权重; 0.05-0.1 = "微风"; 0.5 会盖过 IMP 信号
-    lambda_start: float = 0.5
-    lambda_end: float = 0.1
-    belief_warmup_steps: int = 500
+    主要参数参考 README §4.2 / Kita et al. 2024.
+    """
+    # ── 训练规模 ────────────────────────────────────────────────────────────
+    num_rounds:       int   = 10          # IBR 轮数（外层循环）
+    steps_per_phase:  int   = 500         # 每 phase 采集步数（每步 deals_per_step 局）
+    deals_per_step:   int   = 32          # 每步并行 rollout 局数
+    accumulate_steps: int   = 4           # 累积 N 步数据后做 1 次 PPO update
 
-    # Network (P52: MLP 固定 1024×4, 无 LSTM)
-    # hand_dim / history_dim / hidden_dim 已废弃, 保留向后兼容
-    hand_dim: int = 256      # deprecated
-    history_dim: int = 256   # deprecated
-    hidden_dim: int = 1024   # P52: MLP hidden size
+    # ── 学习率 ──────────────────────────────────────────────────────────────
+    lr:              float  = 1e-6        # Actor lr（Kita et al. 2024）
+    critic_lr_ratio: float  = 3.0         # Critic lr = lr × critic_lr_ratio
+    belief_lr:       float  = 1e-4        # Belief Net 微调 lr
 
-    # FSP (Fictitious Self-Play)
-    fsp_pool_size: int = 10  # 0 = 关闭 FSP
+    # ── PPO ─────────────────────────────────────────────────────────────────
+    gamma:            float = 0.99
+    gae_lambda:       float = 0.95
+    clip_ratio:       float = 0.2
+    num_epochs:       int   = 4
+    batch_size:       int   = 256         # Kita et al. 2024
+    entropy_coef:     float = 1e-3        # Kita et al. 2024
+    value_coef:       float = 0.5
+    max_grad_norm:    float = 0.5
 
-    # PPO
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_ratio: float = 0.2
-    num_epochs: int = 4
-    batch_size: int = 64
-    entropy_coef: float = 0.01
-    entropy_coef_start: float = 0.05   # 探索期高 entropy (防止早期坍缩)
-    entropy_coef_end: float = 0.01     # 收敛期低 entropy
-    entropy_anneal_frac: float = 0.5   # 前 50% 步数做退火
-    value_coef: float = 0.5
-    max_grad_norm: float = 0.5
+    # ── KL Anchor ───────────────────────────────────────────────────────────
+    kl_lambda_start:  float = 0.5         # README §4.2：0.5 → 0.1 退火
+    kl_lambda_end:    float = 0.1
+    kl_anneal_frac:   float = 1.0         # 全程退火
 
-    # KL Anchor: 限制 RL 策略偏离 BC 策略的程度
-    # loss += kl_lambda * KL(pi_current || pi_bc)
-    # kl_lambda 从 kl_lambda_start 线性退火到 kl_lambda_end
-    # 设 0.0 = 关闭 (向后兼容)
-    kl_lambda_start: float = 0.0
-    kl_lambda_end: float = 0.0
-    kl_anneal_frac: float = 1.0        # KL 退火覆盖的训练比例
-
-    # Single-step (Contextual Bandit) mode
-    # 当 episode 中每个 player 仅做 1-2 步决策时启用.
-    # 用 batch-mean baseline 替代 GAE, 断开 Critic 梯度.
-    # Competitive 子博弈 (multi-step) 走标准 GAE, 此处设 False.
-    single_step: bool = False
-
-    # Critic LR 倍数: critic_lr = lr * critic_lr_ratio
-    # 分离 Actor/Critic LR, 让 Critic 在非平稳环境下快速重建价值估计.
-    # 交替训练中 partner 策略更新后, Critic 面对新 value landscape,
-    # 高 LR 加速收敛, 避免 vl 长期偏高压制 actor 梯度.
-    critic_lr_ratio: float = 3.0
-
-    # Critic 预热 — 自适应版本 (P50/P51)
-    # 大池子静态 buffer: 先收集 critic_prewarm_deals 局, actor 冻结,
-    # 在静态 buffer 上跑 critic_prewarm_epochs 轮, 直到 vl 相对变化率收敛.
-    # 相比旧版"采128局→扔掉"避免了严重过拟合 (统计灾难).
-    critic_prewarm_rounds: int = 0           # 已废弃, 保留向后兼容
-    critic_prewarm_deals: int = 2048         # P51: 大池子 (原128→2048)
-    critic_prewarm_epochs: int = 10          # P51: 静态buffer上的最大拟合epoch数
-    critic_prewarm_max_rounds: int = 30      # 自适应预热的最大外轮数上限
-    critic_prewarm_conv_tol: float = 0.05   # 相对变化率收敛阈值 (5%)
-
-    # KL Early Stopping (P50/P51)
-    # P51修正: epoch-level KL (不是batch-level).
-    # 每个epoch结束后计算整个buffer上的平均近似KL.
-    # 相对于采样时的old_log_probs, 若epoch累积KL > threshold, break.
-    # 防止跨epoch累积漂移摧毁策略 (单batch KL太小无法触发的根本原因).
-    # 0.0 = 关闭
+    # ── KL Early Stopping ───────────────────────────────────────────────────
     kl_early_stop_threshold: float = 0.015
 
-    # BC 全局高压线 (P51)
-    # 每次 PPO update 后计算当前策略与 BC 锚点的全局 KL.
-    # 若超过此上限, 跳过本轮 actor 更新 (只更新 critic), 保持时间一致性.
-    # 0.0 = 关闭
-    bc_kl_max: float = 0.5
+    # ── r_info ──────────────────────────────────────────────────────────────
+    use_info_bonus:   bool  = False
+    beta:             float = 0.05        # README: β=0.05 主配置
 
-    # Belief Actor 配置 (per-player)
-    # belief_actor_players: 哪些 player 的 actor 接受 BeliefNetwork 推断输入.
-    # 配合 belief_dims 使用: 这里控制"谁在 rollout 时计算 belief",
-    # belief_dims 控制"谁的 actor 网络有 belief 输入层" (透传到 MAPPOConfig).
-    # None = 不启用 belief actor (向后兼容).
-    # 典型配置: [SOUTH] — 只给 S 的 actor 注入 N 的手牌推断.
-    # 推广配置: [NORTH, SOUTH, EAST, WEST] — 四方互相推断 partner.
-    belief_actor_players: Optional[List[int]] = None
-    # belief_dims: player → belief_dim, 自动从 belief_actor_players 推导.
-    # 手动设置时可覆盖 (如不同 player 用不同 belief_dim).
-    # None = 从 belief_actor_players 自动推导.
-    belief_dims: Optional[Dict[int, int]] = None
+    # ── FSP ─────────────────────────────────────────────────────────────────
+    fsp_pool_size:    int   = 10          # Kita et al. 2024
+    fsp_add_interval: int   = 2           # 每 N 轮将 actor 存入 pool
 
-    # Which players does the agent control?
-    active_players: Optional[List[int]] = None
+    # ── JIT Belief Burn-in ──────────────────────────────────────────────────
+    jit_burnin_deals:  int  = 1000        # 每次 N-phase 前采集局数
+    jit_burnin_epochs: int  = 3           # 快速微调 epoch 数
 
-    # Minimum buffer size before PPO update
-    min_buffer_size: int = 4
+    # ── Critic Warmup ───────────────────────────────────────────────────────
+    critic_prewarm_deals:  int   = 2048
+    critic_prewarm_epochs: int   = 10
+    critic_prewarm_conv_tol: float = 0.05
 
-    # Eval
-    eval_interval: int = 500
-    log_interval: int = 50
+    # ── BC Warmup（rule-based）──────────────────────────────────────────────
+    bc_warmup_samples: int  = 5000        # rule-based BC 样本数
+    bc_warmup_epochs:  int  = 10          # BC 训练 epoch 数
+    bc_warmup_lr:      float = 1e-4
 
-    # Device
-    device: str = 'cpu'
+    # ── 网络 ────────────────────────────────────────────────────────────────
+    hidden_dim:       int   = 1024        # 4 × 1024 MLP
 
+    # ── 运行控制 ────────────────────────────────────────────────────────────
+    active_players:   Optional[List[int]] = None   # None = 全部四方
+    eval_interval:    int   = 200
+    log_interval:     int   = 50
+    device:           str   = 'cpu'
+
+
+# ==============================================================================
+# Rollout Buffer（适配 flat_obs）
+# ==============================================================================
+
+class FlatRolloutBuffer:
+    """
+    存储 flat_obs (301,) + legal_actions (38,) + all_hands (4,52).
+
+    区别于旧版 RolloutBuffer（存字典 obs）:
+        - flat_obs 已经是 tensor-ready 的一维向量，无需重新 encode
+        - 批量化更高效
+    """
+
+    def __init__(self, device: str):
+        self.device = device
+        self.reset()
+
+    def reset(self):
+        self.flat_obs:      List[torch.Tensor] = []
+        self.legal_actions: List[torch.Tensor] = []
+        self.actions:       List[torch.Tensor] = []
+        self.log_probs:     List[torch.Tensor] = []
+        self.rewards:       List[float]         = []
+        self.values:        List[torch.Tensor] = []
+        self.dones:         List[bool]          = []
+        self.all_hands:     List[torch.Tensor] = []   # (4, 52) 可选
+        self.advantages:    Optional[torch.Tensor] = None
+        self.returns:       Optional[torch.Tensor] = None
+
+    def add(self, flat_obs, legal_actions, action, log_prob, reward, value, done,
+            all_hands=None):
+        self.flat_obs.append(torch.tensor(flat_obs,      dtype=torch.float32))
+        self.legal_actions.append(torch.tensor(legal_actions, dtype=torch.float32))
+        self.actions.append(torch.tensor(action,         dtype=torch.int64))
+        self.log_probs.append(log_prob.detach().cpu() if hasattr(log_prob, 'detach')
+                              else torch.tensor(log_prob))
+        self.rewards.append(float(reward))
+        self.values.append(value.detach().cpu()   if hasattr(value,    'detach')
+                           else torch.tensor(value))
+        self.dones.append(bool(done))
+        if all_hands is not None:
+            self.all_hands.append(torch.tensor(all_hands, dtype=torch.float32))
+
+    def compute_returns_and_advantages(
+        self, last_value: float, gamma: float, gae_lambda: float
+    ):
+        n = len(self.rewards)
+        advantages = np.zeros(n, dtype=np.float32)
+        last_gae   = 0.0
+        values_np  = np.array([v.item() for v in self.values], dtype=np.float32)
+
+        for t in reversed(range(n)):
+            next_val  = last_value if t == n - 1 else values_np[t + 1]
+            next_done = self.dones[t + 1] if t < n - 1 else True
+            delta     = (self.rewards[t] + gamma * next_val * (1.0 - float(next_done))
+                         - values_np[t])
+            last_gae  = delta + gamma * gae_lambda * (1.0 - float(next_done)) * last_gae
+            advantages[t] = last_gae
+
+        returns = advantages + values_np
+        self.advantages = torch.tensor(advantages, dtype=torch.float32)
+        self.returns    = torch.tensor(returns,    dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.actions)
+
+    def get_batches(self, batch_size: int):
+        n       = len(self.actions)
+        indices = np.random.permutation(n)
+        device  = self.device
+
+        for start in range(0, n, batch_size):
+            idx = indices[start:start + batch_size]
+            batch = {
+                'flat_obs':      torch.stack([self.flat_obs[i]      for i in idx]).to(device),
+                'legal_actions': torch.stack([self.legal_actions[i] for i in idx]).to(device),
+                'actions':       torch.stack([self.actions[i]       for i in idx]).to(device),
+                'old_log_probs': torch.stack([self.log_probs[i]     for i in idx]).to(device),
+                'advantages':    self.advantages[idx].to(device),
+                'returns':       self.returns[idx].to(device),
+            }
+            if self.all_hands:
+                batch['all_hands'] = torch.stack(
+                    [self.all_hands[i] for i in idx]).to(device)
+            yield batch
+
+
+# ==============================================================================
+# SubgameTrainer
+# ==============================================================================
 
 class SubgameTrainer:
-    """通用子博弈训练器."""
+    """
+    通用子博弈训练器（新架构版）.
 
-    def __init__(self, env, config: SubgameConfig):
-        self.env = env
-        self.config = config
-        self.device = config.device
+    外部接口:
+        trainer = SubgameTrainer(env, config)
+        trainer.run_bc_warmup()          # BC 预热（rule-based，~5k 局）
+        trainer.run(num_rounds=10)       # IBR 交替训练
+        trainer.evaluate_oracle(...)     # DDS oracle 评估
+    """
+
+    def __init__(self, env, config: SubgameConfig,
+                 reward_stats: Optional[RunningStats] = None):
+        self.env     = env
+        self.config  = config
+        self.device  = config.device
         self.active_players = config.active_players or list(range(NUM_PLAYERS))
 
-        # 推导 belief_dims: 从 belief_actor_players 自动生成 {player: BELIEF_DIM}
-        # 也支持手动设置 config.belief_dims 覆盖
-        from utils.hand_features import BELIEF_DIM as _BELIEF_DIM
-        if config.belief_dims is not None:
-            _belief_dims = config.belief_dims
-        elif config.belief_actor_players:
-            _belief_dims = {p: _BELIEF_DIM for p in config.belief_actor_players}
-        else:
-            _belief_dims = {}
-
-        mappo_config = MAPPOConfig(
-            lr=config.lr,
-            gamma=config.gamma,
-            gae_lambda=config.gae_lambda,
-            clip_ratio=config.clip_ratio,
-            num_epochs=config.num_epochs,
-            batch_size=config.batch_size,
-            entropy_coef=config.entropy_coef,
-            value_coef=config.value_coef,
-            max_grad_norm=config.max_grad_norm,
-            device=config.device,
-            critic_lr_ratio=config.critic_lr_ratio,
-            belief_dims=_belief_dims if _belief_dims else None,
-            fsp_pool_size=config.fsp_pool_size,
+        # ── HAPPO Agent ────────────────────────────────────────────────────
+        mappo_cfg = MAPPOConfig(
+            lr              = config.lr,
+            gamma           = config.gamma,
+            gae_lambda      = config.gae_lambda,
+            clip_ratio      = config.clip_ratio,
+            num_epochs      = config.num_epochs,
+            batch_size      = config.batch_size,
+            entropy_coef    = config.entropy_coef,
+            value_coef      = config.value_coef,
+            max_grad_norm   = config.max_grad_norm,
+            device          = config.device,
+            critic_lr_ratio = config.critic_lr_ratio,
+            hidden_dim      = config.hidden_dim,
         )
-        self.agent = MAPPOAgent(mappo_config)
+        self.agent = MAPPOAgent(mappo_cfg)
 
-        # Belief network (optional)
-        self.belief_net = None
-        self.dual_info = None
+        # ── Per-player flat rollout buffers ────────────────────────────────
+        self.buffers: Dict[int, FlatRolloutBuffer] = {
+            p: FlatRolloutBuffer(self.device) for p in range(NUM_PLAYERS)
+        }
+
+        # ── Belief Network（可选）──────────────────────────────────────────
+        self.belief_net:     Optional[BeliefNetwork]     = None
+        self.dual_info:      Optional[DualInfoComputer]  = None
         self.belief_optimizer = None
 
         if config.use_info_bonus:
-            # P52: BeliefNetwork 签名已简化, hand_dim/history_dim 不再有意义
-            self.belief_net = BeliefNetwork(
-                hidden_dim=config.hidden_dim,
-            ).to(self.device)
-            self.dual_info = DualInfoComputer(self.belief_net, beta=config.beta)
+            self.belief_net  = BeliefNetwork(hidden_dim=config.hidden_dim).to(self.device)
+            self.dual_info   = DualInfoComputer(self.belief_net, beta=config.beta)
             self.belief_optimizer = torch.optim.Adam(
-                self.belief_net.parameters(), lr=config.belief_lr
-            )
-            self.partner_stats = RunningStats()
+                self.belief_net.parameters(), lr=config.belief_lr)
+            self.partner_stats  = RunningStats()
             self.opponent_stats = RunningStats()
 
-        # BC anchor model (frozen reference, 用于 KL penalty)
-        # 由外部调用者通过 set_bc_anchor() 设置
-        self.bc_model = None
+        # ── reward 归一化（外部传入，跨 phase 持久）────────────────────────
+        self.reward_stats: RunningStats = reward_stats or RunningStats()
 
-        self.log = []
-        self._current_step = 0  # 当前训练步数, 用于 entropy annealing
+        # ── FSP pool ───────────────────────────────────────────────────────
+        self.fsp_pool = FSPPool(max_size=config.fsp_pool_size)
 
-        # 注: reward 归一化由 stayman_env._compute_terminal_reward() 内的
-        # piecewise linear 映射完成 (→ [0.01, 1.0] 范围).
-        # RunningStats 在此不适用, 已移除以防误用.
+        # ── KL anchor（BC checkpoint，由外部 set_bc_anchor 设置）──────────
+        self.bc_actors: Optional[Dict[int, MLPPolicyNetwork]] = None
 
-    def critic_warmup_step(self, num_deals: int = 2048,
-                           num_epochs: int = 10) -> float:
+        # ── 日志 ───────────────────────────────────────────────────────────
+        self.log: List[dict] = []
+        self._global_step = 0
+
+    # ======================================================================
+    # BC 预热（rule-based）
+    # ======================================================================
+
+    def run_bc_warmup(self, num_samples: int = None, num_epochs: int = None,
+                      lr: float = None):
         """
-        Critic 预热: 大池子静态 buffer + 多 epoch 拟合 (P51).
+        使用 rule-based 策略生成数据，做轻量 BC 预热.
 
-        P51 重构原因:
-        - 旧版"采 128 局 → 算一次梯度 → 扔掉": 128 局在 Stayman 的条件状态空间
-          (N 叫牌路径 × S 手牌分布) 下是统计灾难 → Critic 严重过拟合少量样本,
-          下一批 128 局一到分布稍变, vl 再次爆炸.
-        - 新版: 先收集 num_deals (默认 2048) 局的大 buffer, actor 冻结,
-          在静态 buffer 上跑至多 num_epochs 轮, 直到 vl 相对变化率 < conv_tol.
-        - Returns 在收集完后用当前 (冻结) actor 计算一次 GAE, 全程不 stale.
-        - 只更新 Critic, actor 不动, 保证 target 在整个预热期间稳定.
+        不依赖外部 WBridge5 数据集；仅用于 competitive 子博弈初始化。
         """
-        agent = self.agent
-        conv_tol = getattr(self.config, 'critic_prewarm_conv_tol', 0.05)
+        from subgames.competitive_env import generate_rule_based_bc_data
 
-        # ── 1. 收集大池子, actor 冻结 (不更新) ─────────────────────────
-        episodes = self.collect_episodes(num_deals)
-        self.store_episodes(episodes)
+        num_samples = num_samples or self.config.bc_warmup_samples
+        num_epochs  = num_epochs  or self.config.bc_warmup_epochs
+        lr          = lr          or self.config.bc_warmup_lr
 
-        final_loss = 0.0
+        print(f"\n[BC Warmup] Generating {num_samples} rule-based samples...")
+        data = generate_rule_based_bc_data(self.env, num_samples)
 
-        for player in self.active_players:
-            buffer = agent.buffers[player]
-            if len(buffer.actions) < 2:
-                buffer.reset()
-                continue
+        if not data:
+            print("[BC Warmup] No data generated, skipping.")
+            return
 
-            # ── 2. 用当前 (冻结) actor/critic 计算一次 GAE returns ──────
-            # actor 在整个预热期间不更新 → returns 全程不 stale
-            critic = agent.get_critic(player)
-            with torch.no_grad():
-                last_obs = {k: v.unsqueeze(0).to(self.device)
-                            for k, v in buffer.observations[-1].items()}
-                last_hands = (buffer.all_hands[-1].unsqueeze(0).to(self.device)
-                              if buffer.all_hands else None)
-                last_value = critic(last_obs, last_hands).item()
-            buffer.compute_returns_and_advantages(
-                last_value, agent.config.gamma, agent.config.gae_lambda)
+        flat_obs_np = np.stack([d['flat_obs'] for d in data])  # (N, 301)
+        actions_np  = np.array([d['action']   for d in data], dtype=np.int64)
+        legal_np    = np.ones((len(data), NUM_BIDS), dtype=np.float32)  # BC 不限制
 
-            # ── 3. 静态 buffer 上多 epoch 拟合, 直到 vl 收敛 ───────────
-            critic_opt = agent.get_critic_optimizer(player)
-            prev_epoch_loss = None
+        flat_t   = torch.tensor(flat_obs_np, dtype=torch.float32)
+        actions_t = torch.tensor(actions_np, dtype=torch.int64)
+        legal_t  = torch.tensor(legal_np,    dtype=torch.float32)
+
+        print(f"[BC Warmup] Training {num_epochs} epochs on {len(data)} samples...")
+
+        for player in [NORTH, SOUTH]:  # 只训练 NS（训练方）
+            actor = self.agent.get_actor(player)
+            opt   = torch.optim.Adam(actor.parameters(), lr=lr)
 
             for epoch in range(num_epochs):
-                epoch_loss = 0.0
+                idx  = np.random.permutation(len(data))
+                loss_sum = 0.0
                 n_batches = 0
-                for batch in buffer.get_batches(agent.config.batch_size):
-                    b_obs   = batch['obs']
-                    b_hands = batch.get('all_hands')
-                    b_ret   = batch['returns']
 
-                    values = critic(b_obs, b_hands).squeeze(-1)
-                    loss = F.mse_loss(values, b_ret)
+                for start in range(0, len(data), self.config.batch_size):
+                    b_idx = idx[start:start + self.config.batch_size]
+                    b_flat   = flat_t[b_idx].to(self.device)
+                    b_legal  = legal_t[b_idx].to(self.device)
+                    b_act    = actions_t[b_idx].to(self.device)
 
-                    critic_opt.zero_grad()
+                    logits = actor(b_flat, b_legal)
+                    loss   = F.cross_entropy(logits, b_act)
+
+                    opt.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        critic.parameters(), self.config.max_grad_norm)
-                    critic_opt.step()
+                    nn.utils.clip_grad_norm_(actor.parameters(), self.config.max_grad_norm)
+                    opt.step()
 
-                    epoch_loss += loss.item()
+                    loss_sum += loss.item()
                     n_batches += 1
 
-                epoch_loss /= max(1, n_batches)
+                avg_loss = loss_sum / max(1, n_batches)
 
-                # 相对变化率收敛检查
-                if prev_epoch_loss is not None and prev_epoch_loss > 1e-8:
-                    rel_change = abs(epoch_loss - prev_epoch_loss) / prev_epoch_loss
-                    if rel_change < conv_tol:
-                        break  # 收敛: 退出静态 buffer 的 epoch 循环
+            print(f"  Player {'N' if player == NORTH else 'S'}: "
+                  f"epoch {num_epochs} loss={avg_loss:.4f}")
 
-                prev_epoch_loss = epoch_loss
+        print("[BC Warmup] Done.")
 
-            final_loss = epoch_loss
-            buffer.reset()
+    # ======================================================================
+    # KL Anchor
+    # ======================================================================
 
-        return final_loss
-
-    def set_bc_anchor(self, state_dict: dict):
+    def set_bc_anchor(self, agent_or_state_dict):
         """
-        设置 BC 锚点模型 (Stage 1 结束时的快照).
+        设置 BC 锚点（Stage 1 BC 结束时的快照）.
 
-        HAPPO 改动 (P48): bc_model 从单个 PolicyNetwork 改为 per-player dict.
-          self.bc_model = {NORTH: bc_model_n, SOUTH: bc_model_s}
-
-        调用后, safe_update() 会在 loss 中加入 KL 惩罚项:
-          loss += kl_lambda * KL(pi_current || pi_bc)
-
-        state_dict 支持:
-          - 新格式 (actor_n.* / actor_s.* / critic.*): 分别提取
-          - 旧格式 (actor.* / critic.*): actor 复制给 N 和 S 各一份
+        Args:
+            agent_or_state_dict: MAPPOAgent 或 state_dict dict
         """
-        from networks.policy_net import PolicyNetwork
-
-        def _make_bc_net(actor_state: dict) -> PolicyNetwork:
-            # P52: PolicyNetwork 签名已改为 (hidden_dim, num_layers, belief_dim)
-            # belief_dim 从 actor_state 的第一层权重尺寸推断
-            first_w = next((v for k, v in actor_state.items()
-                            if 'net.0.weight' in k), None)
-            from networks.policy_net import BASE_INPUT_DIM
-            if first_w is not None:
-                total_in = first_w.shape[1]
-                bdim = max(0, total_in - BASE_INPUT_DIM)
+        if isinstance(agent_or_state_dict, MAPPOAgent):
+            src_agent = agent_or_state_dict
+            n_state   = src_agent.model.actor_n.state_dict()
+            s_state   = src_agent.model.actor_s.state_dict()
+        else:
+            sd = agent_or_state_dict
+            def _extract(prefix):
+                return {k[len(prefix)+1:]: v for k, v in sd.items()
+                        if k.startswith(prefix + '.')}
+            if any(k.startswith('actor_n.') for k in sd):
+                n_state = _extract('actor_n')
+                s_state = _extract('actor_s')
             else:
-                bdim = 0
-            net = PolicyNetwork(
-                hidden_dim=self.config.hidden_dim,
-                num_layers=4,
-                belief_dim=bdim,
-            ).to(self.device)
-            net.load_state_dict(actor_state)
+                # 旧格式或直接 state dict
+                n_state = s_state = sd
+
+        def _frozen_copy(state_dict):
+            net = MLPPolicyNetwork(hidden_dim=self.config.hidden_dim).to(self.device)
+            net.load_state_dict(state_dict)
             net.eval()
             for p in net.parameters():
                 p.requires_grad_(False)
             return net
 
-        if any(k.startswith('actor_n.') for k in state_dict):
-            # 新格式: 各自提取
-            actor_n_state = {k[len('actor_n.'):]: v for k, v in state_dict.items()
-                             if k.startswith('actor_n.')}
-            actor_s_state = {k[len('actor_s.'):]: v for k, v in state_dict.items()
-                             if k.startswith('actor_s.')}
-        elif any(k.startswith('actor.') for k in state_dict):
-            # 旧格式: 共享 actor → 复制到 N 和 S
-            actor_state = {k[len('actor.'):]: v for k, v in state_dict.items()
-                           if k.startswith('actor.')}
-            actor_n_state = actor_state
-            actor_s_state = actor_state
-        else:
-            # 直接是 PolicyNetwork state_dict (无前缀)
-            actor_n_state = state_dict
-            actor_s_state = state_dict
-
-        self.bc_model = {
-            NORTH: _make_bc_net(actor_n_state),
-            SOUTH: _make_bc_net(actor_s_state),
+        self.bc_actors = {
+            NORTH: _frozen_copy(n_state),
+            SOUTH: _frozen_copy(s_state),
         }
+        print("[KL Anchor] BC anchor set.")
 
-    def get_lambda(self, step: int) -> float:
-        cfg = self.config
-        if step < cfg.belief_warmup_steps:
-            return 0.0
-        progress = min(1.0, (step - cfg.belief_warmup_steps) /
-                       max(1, cfg.num_steps - cfg.belief_warmup_steps))
-        return cfg.lambda_start + (cfg.lambda_end - cfg.lambda_start) * progress
-
-    def get_entropy_coef(self, step: int) -> float:
-        """
-        Entropy coefficient annealing.
-
-        前 entropy_anneal_frac 的步数: 从 entropy_coef_start 线性退到 entropy_coef_end.
-        之后: 固定为 entropy_coef_end.
-
-        防止 PPO 在小动作空间 (Stayman 7 choices) 中过早坍缩到单一动作.
-        """
-        cfg = self.config
-        anneal_steps = int(cfg.num_steps * cfg.entropy_anneal_frac)
-        if step >= anneal_steps:
-            return cfg.entropy_coef_end
-        progress = step / max(1, anneal_steps)
-        return cfg.entropy_coef_start + (cfg.entropy_coef_end - cfg.entropy_coef_start) * progress
-
-    def get_kl_lambda(self, step: int) -> float:
-        """
-        KL 锚定系数退火 (全局基准系数).
-
-        位置自适应 KL 的基准值, 由 compute_context_kl_weights() 在
-        mini-batch 级别进一步按叫牌阶数加权.
-        从 kl_lambda_start 线性退到 kl_lambda_end.
-        """
-        cfg = self.config
-        if cfg.kl_lambda_start == 0.0:
-            return 0.0
-        anneal_steps = int(cfg.num_steps * cfg.kl_anneal_frac)
-        if step >= anneal_steps:
-            return cfg.kl_lambda_end
-        progress = step / max(1, anneal_steps)
+    def _get_kl_lambda(self, round_idx: int) -> float:
+        cfg      = self.config
+        progress = min(1.0, round_idx / max(1, cfg.num_rounds - 1))
         return cfg.kl_lambda_start + (cfg.kl_lambda_end - cfg.kl_lambda_start) * progress
 
-    @staticmethod
-    def compute_context_kl_weights(history_obs: torch.Tensor) -> torch.Tensor:
+    # ======================================================================
+    # FSP
+    # ======================================================================
+
+    def _maybe_add_to_fsp(self, round_idx: int):
+        """每 fsp_add_interval 轮将当前 actor 存入 pool."""
+        if (self.config.fsp_pool_size > 0
+                and round_idx % self.config.fsp_add_interval == 0):
+            self.fsp_pool.add(self.agent)
+            print(f"  [FSP] Pool size: {len(self.fsp_pool)}")
+
+    def _apply_fsp_opponent(self):
         """
-        位置自适应 KL 权重 — 基于叫牌序列的当前最高阶数 (context level).
+        从 pool 中随机采样一个历史 checkpoint 作为 EW 对手.
 
-        设计原则 (Gemini / 桥牌知识):
-          1阶: 系统基石 (开叫/应叫), 偏离 BC 后同伴完全迷失 → 权重 1.5
-          2阶: 常规应叫续叫                                    → 权重 1.0
-          3阶: 逼叫序列, 仍需人类协定                          → 权重 0.5
-          4阶: 进局决策, 开始允许 RL 自主探索                  → 权重 0.25
-          5阶+: 高阶争叫/满贯, 完全交给 DDS 算力博弈           → 权重 0.1
-
-        关键: 权重由状态 (history) 决定, 而非由 agent 选择的动作决定.
-        若用动作决定权重, agent 会通过跳叫高阶来规避 KL 惩罚 (gradient exploit).
-
-        Args:
-            history_obs: (B, max_len, NUM_BIDS) one-hot 叫牌历史张量
-                         来自 batch['obs']['history']
-
-        Returns:
-            weights: (B,) 每个样本的 KL 权重, 值域 [0.1, 1.5]
+        只在 rollout 时临时替换 EW actor；
+        训练时恢复为当前 agent（EW 不训练，只是采样对手）。
+        返回 sampled state_dict 或 None（pool 为空时用 self）。
         """
-        B = history_obs.shape[0]
-        device = history_obs.device
+        if self.fsp_pool.is_empty():
+            return None
+        return self.fsp_pool.sample()
 
-        # BID_1C = 3 (index), 对应1阶最低叫品
-        # 实质叫品 index ∈ [3, 37] (BID_1C 到 7NT)
-        # one-hot 的列索引即 bid index
-        # bid level = (bid_index - 3) // 5 + 1  for bid_index in [3, 37]
+    # ======================================================================
+    # Critic Warmup
+    # ======================================================================
 
-        # 找到每个样本历史中最高实质叫品的 level
-        # history_obs: (B, T, 38) → argmax over bid dim: (B, T)
-        bid_indices = history_obs.argmax(dim=-1)  # (B, T)
+    def critic_warmup(self, num_deals: int = None, num_epochs: int = None):
+        """大池子静态 buffer + 多 epoch Critic 预热（P51 设计）."""
+        num_deals  = num_deals  or self.config.critic_prewarm_deals
+        num_epochs = num_epochs or self.config.critic_prewarm_epochs
+        conv_tol   = self.config.critic_prewarm_conv_tol
 
-        # 只考虑实质叫品 (index >= 3, 即 BID_1C+)
-        is_real_bid = (bid_indices >= 3)  # (B, T)
+        print(f"[Critic Warmup] Collecting {num_deals} deals...")
+        episodes = self._collect_episodes(num_deals, use_fsp_opponent=False)
+        self._store_episodes(episodes)
 
-        # 对每个样本, 找最大实质叫品 index
-        # 将非实质叫品位置置 0
-        real_bid_indices = bid_indices * is_real_bid.long()  # (B, T)
-        max_bid_idx = real_bid_indices.max(dim=-1).values    # (B,)
-
-        # 计算 context level: (bid_index - 3) // 5 + 1
-        # 若没有任何实质叫品 (全 Pass 前缀), level = 1
-        context_level = torch.where(
-            max_bid_idx >= 3,
-            (max_bid_idx - 3) // 5 + 1,
-            torch.ones(B, dtype=torch.long, device=device)
-        ).float()  # (B,)
-
-        # 映射到权重 (指数级衰减, 契合桥牌特性)
-        weights = torch.ones(B, device=device)
-        weights = torch.where(context_level <= 1, torch.full_like(weights, 1.5), weights)
-        weights = torch.where(context_level == 2, torch.full_like(weights, 1.0), weights)
-        weights = torch.where(context_level == 3, torch.full_like(weights, 0.5),  weights)
-        weights = torch.where(context_level == 4, torch.full_like(weights, 0.25), weights)
-        weights = torch.where(context_level >= 5, torch.full_like(weights, 0.1),  weights)
-
-        return weights
-
-    # ====================================================================
-    # Rollout collection
-    # ====================================================================
-
-
-    def _maybe_inject_belief(self, obs: dict, player: int,
-                              all_hands: np.ndarray) -> dict:
-        """
-        为指定 player 的 actor 注入 BeliefNetwork 推断特征.
-
-        架构设计:
-        - 支持任意 player 的双向推断 (N↔S, E↔W, N↔E 等)
-        - partner = (player + 2) % 4 (对家)
-        - 推断结果作为 obs['belief'] 注入, PolicyNetwork.forward 里 stop-gradient
-        - belief_actor_players=None 或 player 不在列表里时, 不修改 obs (零开销)
-
-        当前实验配置: belief_actor_players=[SOUTH]
-          → 只有 S 的 actor 接收 N 手牌的推断特征
-          → E/W 对话 (竞争子博弈) 可以扩展为 [SOUTH, WEST] 等
-
-        Args:
-            obs: 当前 player 的观测 dict (不 in-place 修改)
-            player: 当前决策 player
-            all_hands: (4, 52) 全局手牌 (rollout 时已知)
-
-        Returns:
-            注入了 'belief' 字段的新 obs dict, 或原 obs (未启用时)
-        """
-        cfg = self.config
-        if (self.belief_net is None
-                or cfg.belief_actor_players is None
-                or player not in cfg.belief_actor_players):
-            return obs
-
-        # partner = 对家
-        partner = (player + 2) % 4
-
-        # 用当前叫牌历史 (history_after = 决策前历史, 即 history_before)
-        # 此时 env.history 是该 player 决策前的历史
-        history = self._encode_history(self.env.history)
-
-        oh = torch.tensor(all_hands[player], dtype=torch.float32).unsqueeze(0).to(self.device)
-        h  = torch.tensor(history, dtype=torch.float32).unsqueeze(0).to(self.device)
-        op = torch.tensor([player],  dtype=torch.long).to(self.device)
-        tp = torch.tensor([partner], dtype=torch.long).to(self.device)
-
-        self.belief_net.eval()
-        with torch.no_grad():
-            belief_probs = self.belief_net.get_probs(oh, h, op, tp)  # (1, BELIEF_DIM)
-        self.belief_net.train()
-
-        # 注入到 obs (浅拷贝, 不污染原 obs dict)
-        obs = dict(obs)
-        obs['belief'] = belief_probs.squeeze(0).cpu().numpy()  # (BELIEF_DIM,)
-        return obs
-
-    def collect_episodes(self, num_deals: int) -> List[Dict]:
-        """
-        采样 episode.
-
-        env.step() 可能内部自动执行规则玩家 (e.g., north_rule in Stayman).
-        trainer 只记录 active_players 中由 agent 做出的决策.
-        """
-        episodes = []
-
-        for _ in range(num_deals):
-            hands, dd_table = self.env.generate_deal()
-            obs = self.env.reset(hands, dd_table)
-
-            player_trajs = {p: [] for p in self.active_players}
-            done = False
-
-            while not done:
-                player = self.env.current_player
-
-                # 检查是否是 agent 决策的 player
-                if player not in self.active_players:
-                    # 非 active player: FSP — 从历史 checkpoint pool 采样策略执行
-                    # FSP 防止 policy cycling: 非 active player 不总是用最新策略,
-                    # 而是从历史快照池均匀采样, 使训练对更广泛的对手分布鲁棒.
-                    # pool 为空时 (训练初期) 退化为最新策略, 行为与旧版一致.
-                    all_hands = self.env._current_hands
-                    obs = self._maybe_inject_belief(obs, player, all_hands)
-                    action, _ = self.agent.get_action_for_player_fsp(
-                        obs, player, all_hands=all_hands, deterministic=True)
-                    obs, reward, done, info = self.env.step(action)
-                    continue
-
-                history_before = self.env.history.copy()
-
-                all_hands = self.env._current_hands
-
-                # Belief Actor: 为指定 player 注入 BeliefNetwork 推断特征
-                # partner = (player+2)%4 — 对家手牌推断
-                # stop-gradient 在 PolicyNetwork.forward 里通过 .detach() 实现
-                obs = self._maybe_inject_belief(obs, player, all_hands)
-
-                action, extra = self.agent.get_action_for_player(
-                    obs, player, all_hands=all_hands)
-                extra['_all_hands'] = all_hands
-
-                obs_next, reward, done, info = self.env.step(action)
-                history_after = self.env.history.copy()
-
-                step_data = {
-                    'obs': obs,
-                    'action': action,
-                    'reward': reward,
-                    'done': done,
-                    'player': player,
-                    'hands': all_hands.copy(),
-                    'history_before': history_before,
-                    'history_after': history_after,
-                    **extra,
-                }
-                player_trajs[player].append(step_data)
-
-                obs = obs_next
-
-            # Backfill terminal reward
-            final_reward = reward
-            for p, traj in player_trajs.items():
-                if traj:
-                    r = final_reward if p % 2 == 0 else -final_reward
-                    traj[-1]['reward'] = float(r)
-
-            episodes.append({
-                'player_trajectories': player_trajs,
-                'hands': hands,
-                'dd_table': dd_table,
-                'final_reward': final_reward,
-            })
-
-        return episodes
-
-    def store_episodes(self, episodes: List[Dict]):
-        """存入 agent buffer, 只存 active players.
-
-        如果启用 info_bonus, 对 N (NORTH) 的 terminal reward 叠加
-        ReLU 截断后的 info gain:
-            r_total = r_IMP + β * max(0, I(bid;hand|partner) - β2*I(bid;hand|opp))
-        β 通常设为较小值 (0.05-0.1), 让信息奖励是"微风"而非"飓风".
-        """
-        for ep in episodes:
-            # 预计算 info bonus (只在 use_info_bonus 且 N 是 active player 时)
-            info_bonus_by_player = {}
-            if (self.config.use_info_bonus and self.belief_net is not None
-                    and NORTH in self.active_players):
-                hands = ep['hands']
-                for player, traj in ep['player_trajectories'].items():
-                    if player % 2 != 0:   # 只有 NS 方 (偶数 = N/S)
-                        continue
-                    if player not in self.active_players:
-                        continue
-                    total_gain = 0.0
-                    partner = (player + 2) % 4
-                    opponent = (player + 1) % 4
-                    self.belief_net.eval()
-                    with torch.no_grad():
-                        for step in traj:
-                            hb = self._encode_history(step['history_before'])
-                            ha = self._encode_history(step['history_after'])
-                            pg = self._compute_single_info_gain(
-                                hands[partner], hb, ha, partner, player, hands[player])
-                            ol = self._compute_single_info_gain(
-                                hands[opponent], hb, ha, opponent, player, hands[player])
-                            # ReLU 已在 _compute_single_info_gain 内执行
-                            total_gain += pg - self.config.beta * ol
-                    self.belief_net.train()
-                    info_bonus_by_player[player] = total_gain
-
-            for player, traj in ep['player_trajectories'].items():
-                if player not in self.active_players:
-                    continue
-                for i, step in enumerate(traj):
-                    reward = step['reward']
-                    is_terminal = (i == len(traj) - 1)
-                    if is_terminal and player in info_bonus_by_player:
-                        reward = reward + info_bonus_by_player[player]
-                    self.agent.store_transition(
-                        player,
-                        step['obs'],
-                        step['action'],
-                        step['log_prob'],
-                        reward,
-                        step['value'],
-                        step['done'],
-                        all_hands=step.get('_all_hands'),
-                    )
-
-    # ====================================================================
-    # Safe PPO Update (replaces agent.update())
-    # ====================================================================
-
-    def safe_update(self) -> Dict[str, float]:
-        """
-        稳健的 PPO update.
-
-        完全替代 agent.update(), 增加:
-        - 只更新 active_players
-        - 稳健 advantage 归一化 (防 std=0 NaN)
-        - Entropy coefficient annealing (防止小动作空间早期坍缩)
-        - single_step 模式: 用 batch-mean baseline 替代 GAE,
-          断开 Critic 梯度, 防止 Value Loss 爆炸污染共享编码器
-        - KL Anchor (可选): loss += kl_lambda * KL(pi_current || pi_bc)
-          防止 RL 摧毁 BC 策略 (如退化为无脑 4M)
-        """
-        agent = self.agent
-        min_size = self.config.min_buffer_size
-        ent_coef = self.get_entropy_coef(self._current_step)
-        kl_lambda = self.get_kl_lambda(self._current_step)
-        is_single = self.config.single_step
-        use_kl = (kl_lambda > 0.0 and self.bc_model is not None)
-
-        total_loss = total_policy = total_value = total_entropy = num_updates = 0
-        total_kl = 0.0
-
-        for player in range(NUM_PLAYERS):
-            buffer = agent.buffers[player]
-
-            if player not in self.active_players or len(buffer.actions) < min_size:
-                buffer.reset()
+        for player in self.active_players:
+            buf = self.buffers[player]
+            if len(buf) < 2:
+                buf.reset()
                 continue
 
-            # HAPPO: 按 player 选择对应 actor 和 optimizer
-            actor = agent.get_actor(player)
-            actor_opt = agent.get_actor_optimizer(player)
+            critic     = self.agent.get_critic(player)
+            critic_opt = self.agent.get_critic_optimizer(player)
 
-            # ============================================================
-            # 偷梁换柱: single_step → batch-mean baseline 替代 GAE
-            # ============================================================
-            if is_single:
-                rewards = torch.tensor(buffer.rewards, dtype=torch.float32)
-                buffer.returns = rewards
-                baseline = rewards.mean()
-                advantages = rewards - baseline
-                adv_std = advantages.std()
-                if torch.isfinite(adv_std) and adv_std > 1e-6:
-                    advantages = advantages / (adv_std + 1e-8)
-                buffer.advantages = advantages
-            else:
-                # P49: 独立 critic — 用该 player 自己的 critic 估 last_value
-                critic = agent.get_critic(player)
-                critic_opt = agent.get_critic_optimizer(player)
-                with torch.no_grad():
-                    last_obs = {k: v.unsqueeze(0).to(self.device)
-                                for k, v in buffer.observations[-1].items()}
-                    last_hands = (buffer.all_hands[-1].unsqueeze(0).to(self.device)
-                                  if buffer.all_hands else None)
-                    last_value = critic(last_obs, last_hands).item()
+            # Bootstrap last value
+            with torch.no_grad():
+                fo = buf.flat_obs[-1].unsqueeze(0).to(self.device)
+                ah = (buf.all_hands[-1].unsqueeze(0).to(self.device)
+                      if buf.all_hands else None)
+                last_val = critic(fo, ah).item()
 
-                buffer.compute_returns_and_advantages(
-                    last_value, agent.config.gamma, agent.config.gae_lambda
-                )
+            buf.compute_returns_and_advantages(
+                last_val, self.agent.config.gamma, self.agent.config.gae_lambda)
 
-            kl_threshold = getattr(agent.config, 'kl_early_stop_threshold', 0.015)
-            bc_kl_max = getattr(self.config, 'bc_kl_max', 0.5)
-            kl_stopped = False
-            actor_skipped = False  # P51: BC高压线触发时跳过actor更新
+            prev_loss = None
+            for epoch in range(num_epochs):
+                epoch_loss, n_batches = 0.0, 0
+                for batch in buf.get_batches(self.agent.config.batch_size):
+                    vals = critic(batch['flat_obs'], batch.get('all_hands'))
+                    loss = F.mse_loss(vals, batch['returns'])
+                    critic_opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(critic.parameters(), self.config.max_grad_norm)
+                    critic_opt.step()
+                    epoch_loss += loss.item()
+                    n_batches  += 1
+                epoch_loss /= max(1, n_batches)
+                if prev_loss is not None and prev_loss > 1e-8:
+                    if abs(epoch_loss - prev_loss) / prev_loss < conv_tol:
+                        print(f"  [Critic Warmup] Player {player} converged @ epoch {epoch+1}")
+                        break
+                prev_loss = epoch_loss
+            buf.reset()
 
-            # ── P51: 预先计算全局 BC-KL (更新前) ─────────────────────────
-            # 用于检测是否已超高压线, 决定是否允许本轮 actor 更新
-            if bc_kl_max > 0 and use_kl:
-                bc_key = NORTH if player == NORTH else SOUTH
-                bc_net = self.bc_model[bc_key]
-                with torch.no_grad():
-                    # 在整个 buffer 上抽样估算全局 BC-KL
-                    total_bc_kl = 0.0
-                    bc_kl_batches = 0
-                    for batch in buffer.get_batches(agent.config.batch_size):
-                        curr_logits = actor(batch['obs'])
-                        if 'legal_actions' in batch['obs']:
-                            illegal = batch['obs']['legal_actions'] < 0.5
-                            curr_logits = curr_logits.masked_fill(illegal, -1e9)
-                        curr_lp = F.log_softmax(curr_logits, dim=-1)
-                        curr_p  = curr_lp.exp()
-                        bc_logits = bc_net(batch['obs'])
-                        if 'legal_actions' in batch['obs']:
-                            bc_logits = bc_logits.masked_fill(illegal, -1e9)
-                        bc_lp = F.log_softmax(bc_logits, dim=-1)
-                        kl_batch = (curr_p * (curr_lp - bc_lp)).sum(dim=-1).mean().item()
-                        if torch.isfinite(torch.tensor(kl_batch)):
-                            total_bc_kl += kl_batch
-                            bc_kl_batches += 1
-                global_bc_kl = total_bc_kl / max(1, bc_kl_batches)
-                if global_bc_kl > bc_kl_max:
-                    actor_skipped = True  # 超高压线: 跳过 actor 更新, 只更新 critic
-            else:
-                global_bc_kl = 0.0
+    # ======================================================================
+    # JIT Belief Burn-in
+    # ======================================================================
 
-            for epoch_idx in range(agent.config.num_epochs):
-                if kl_stopped:
-                    break
-
-                # ── P51: Epoch-level KL 累积统计 ──────────────────────────
-                # 在整个 epoch 结束后计算该 epoch 相对于 old_log_probs 的平均 KL.
-                # 相比 batch-level: 单 batch KL 因样本少而方差大 (可能 0.001),
-                # 但一个 epoch 累积下来策略已漂移 0.2+. Epoch-level 才能真实反映.
-                epoch_kl_sum = 0.0
-                epoch_kl_n = 0
-
-                for batch in buffer.get_batches(agent.config.batch_size):
-                    # HAPPO: 用 player 对应的 actor evaluate actions
-                    log_probs, entropy = actor.evaluate_actions(
-                        batch['obs'], batch['actions']
-                    )
-
-                    ratio = torch.exp(log_probs - batch['old_log_probs'])
-
-                    # 累积本 batch 的近似 KL (不立即 break, epoch 结束后再判断)
-                    with torch.no_grad():
-                        approx_kl = ((ratio - 1) - ratio.log()).mean().item()
-                        if torch.isfinite(torch.tensor(approx_kl)):
-                            epoch_kl_sum += approx_kl
-                            epoch_kl_n += 1
-
-                    adv = batch['advantages']
-                    if not is_single:
-                        if adv.numel() > 1:
-                            adv_std = adv.std()
-                            if torch.isfinite(adv_std) and adv_std > 1e-6:
-                                adv = (adv - adv.mean()) / (adv_std + 1e-8)
-                            else:
-                                adv = adv - adv.mean()
-
-                    policy_loss = -torch.min(
-                        ratio * adv,
-                        torch.clamp(ratio,
-                                    1 - agent.config.clip_ratio,
-                                    1 + agent.config.clip_ratio) * adv
-                    ).mean()
-
-                    # ====================================================
-                    # KL Anchor: KL(pi_current || pi_bc)
-                    # HAPPO: 按 player 选对应的 bc_model
-                    # ====================================================
-                    kl_loss = torch.tensor(0.0, device=self.device)
-                    if use_kl:
-                        MASK_VAL = -1e9
-                        # bc_model 是 {NORTH: net, SOUTH: net} dict
-                        # 按 player 取对应锚点 (NORTH=bc_model[NORTH], 其余=SOUTH)
-                        bc_key = NORTH if player == NORTH else SOUTH
-                        bc_net = self.bc_model[bc_key]
-
-                        with torch.no_grad():
-                            bc_logits = bc_net(batch['obs'])
-                            if 'legal_actions' in batch['obs']:
-                                illegal = batch['obs']['legal_actions'] < 0.5
-                                bc_logits = bc_logits.masked_fill(illegal, MASK_VAL)
-                            bc_log_probs = F.log_softmax(bc_logits, dim=-1)
-
-                        # curr 分布: 在计算图内, 梯度流回 actor
-                        curr_logits_kl = actor(batch['obs'])
-                        if 'legal_actions' in batch['obs']:
-                            illegal = batch['obs']['legal_actions'] < 0.5
-                            curr_logits_kl = curr_logits_kl.masked_fill(illegal, MASK_VAL)
-                        curr_log_probs_kl = F.log_softmax(curr_logits_kl, dim=-1)
-                        curr_probs_kl = curr_log_probs_kl.exp()
-
-                        kl_per_sample = (curr_probs_kl * (curr_log_probs_kl - bc_log_probs)
-                                         ).sum(dim=-1)
-
-                        if 'history' in batch['obs']:
-                            ctx_weights = self.compute_context_kl_weights(
-                                batch['obs']['history'].to(self.device))
-                            kl_loss = (kl_per_sample * ctx_weights).mean()
-                        else:
-                            kl_loss = kl_per_sample.mean()
-
-                        if not torch.isfinite(kl_loss):
-                            kl_loss = torch.tensor(0.0, device=self.device)
-
-                    # Loss: single_step → 断开 Critic 梯度
-                    if is_single:
-                        if not actor_skipped:
-                            loss = (policy_loss
-                                    - ent_coef * entropy.mean()
-                                    + kl_lambda * kl_loss)
-                            actor_opt.zero_grad()
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(
-                                actor.parameters(), agent.config.max_grad_norm)
-                            actor_opt.step()
-                        value_loss_val = 0.0
-                    else:
-                        # P51: BC 高压线超限时跳过 actor 更新, 只更新 critic
-                        if not actor_skipped:
-                            actor_loss = (policy_loss
-                                          - ent_coef * entropy.mean()
-                                          + kl_lambda * kl_loss)
-                            actor_opt.zero_grad()
-                            actor_loss.backward()
-                            torch.nn.utils.clip_grad_norm_(
-                                actor.parameters(), agent.config.max_grad_norm)
-                            actor_opt.step()
-
-                        # Critic update (PopArt): 归一化空间计算 loss
-                        critic.update_stats(batch['returns'])
-                        b_ret_norm = critic.normalize_target(batch['returns'])
-                        values = critic.normalized_forward(
-                            batch['obs'], batch.get('all_hands'))
-                        old_values = values.detach()
-                        v_clipped = old_values + (values - old_values).clamp(
-                            -agent.config.clip_ratio, agent.config.clip_ratio)
-                        value_loss = torch.max(
-                            F.mse_loss(values, b_ret_norm),
-                            F.mse_loss(v_clipped, b_ret_norm)
-                        )
-                        critic_opt.zero_grad()
-                        value_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            critic.parameters(), agent.config.max_grad_norm)
-                        critic_opt.step()
-                        value_loss_val = value_loss.item()
-
-                    policy_loss_val = policy_loss.item()
-                    total_loss += policy_loss_val + value_loss_val
-                    total_policy += policy_loss_val
-                    total_value += value_loss_val
-                    total_entropy += entropy.mean().item()
-                    total_kl += kl_loss.item()
-                    num_updates += 1
-
-                # ── P51: Epoch 结束后检查累积 KL ──────────────────────────
-                # 这是修复后的 epoch-level KL 早停:
-                # epoch 内所有 batch 的平均 KL 才真实反映策略漂移程度.
-                # 单 batch KL (P50) 因样本少方差大, 无法检测跨 epoch 累积漂移.
-                epoch_kl_avg = epoch_kl_sum / max(1, epoch_kl_n)
-                if kl_threshold > 0 and epoch_kl_avg > kl_threshold:
-                    kl_stopped = True
-
-            buffer.reset()
-
-        if num_updates == 0:
-            return {}
-
-        return {
-            'loss': total_loss / num_updates,
-            'policy_loss': total_policy / num_updates,
-            'value_loss': total_value / num_updates,
-            'entropy': total_entropy / num_updates,
-            'entropy_coef': ent_coef,
-            'kl_loss': total_kl / num_updates,
-            'kl_lambda': kl_lambda,
-            'kl_stopped': kl_stopped,      # P50/P51: epoch-level KL 早停
-            'actor_skipped': actor_skipped, # P51: BC 高压线超限跳过 actor
-            'global_bc_kl': global_bc_kl,  # P51: 更新前的全局 BC-KL
-        }
-
-    # ====================================================================
-    # Belief training
-    # ====================================================================
-
-    def train_belief_step(self, episodes: List[Dict]) -> float:
-        if self.belief_net is None:
-            return 0.0
-
-        belief_data = self._extract_belief_data(episodes)
-        if not belief_data:
-            return 0.0
-
-        total_loss = 0.0
-        n = 0
-
-        for batch in self._iter_belief_batches(belief_data, batch_size=256):
-            loss = self.belief_net.compute_loss(
-                batch['observer_hand'], batch['history'],
-                batch['observer_pos'], batch['target_pos'],
-                batch['target_hand'],
-            )
-            self.belief_optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.belief_net.parameters(), 1.0)
-            self.belief_optimizer.step()
-            total_loss += loss.item()
-            n += 1
-
-        return total_loss / max(1, n)
-
-    def jit_belief_burnin(self, num_deals: int = 2000, epochs: int = 3,
-                          lr: float = 1e-3):
+    def jit_belief_burnin(self):
         """
-        JIT (Just-In-Time) Belief Burn-in.
+        每次 N-phase 开始前对 Belief Net 做快速微调.
 
-        在每轮 N-phase 开始前调用, 用当前策略的 rollout 快速更新 Belief Net,
-        使其与 N 的最新叫牌语言保持同步.
-
-        设计原则:
-        - 冻结 N 和 S (不更新 PPO), 只跑 rollout 采集数据
-        - 用较大的 lr (1e-3) 猛训 3-5 个 epoch, 快速追上语义漂移
-        - 完成后 lr 恢复到正常 belief_lr (1e-4)
-
-        Args:
-            num_deals:  用于 burn-in 的对局数 (建议 1000-3000)
-            epochs:     训练轮数 (建议 3-5)
-            lr:         burn-in 专用 lr (比正常 belief_lr 大 10x)
+        采集 jit_burnin_deals 局 rollout，训练 jit_burnin_epochs epoch。
+        防止 N 策略更新后 Belief Net OOD。
         """
         if self.belief_net is None or self.belief_optimizer is None:
             return
 
-        # 1. 采集当前策略的 rollout (不更新任何参数)
-        episodes = self.collect_episodes(num_deals)
-        belief_data = self._extract_belief_data(episodes)
+        print(f"  [JIT Burn-in] Collecting {self.config.jit_burnin_deals} deals...")
+        episodes = self._collect_episodes(self.config.jit_burnin_deals,
+                                          use_fsp_opponent=False)
+
+        belief_data = []
+        for ep in episodes:
+            for step in ep:
+                if 'belief_target' in step:
+                    belief_data.append(step)
+
         if not belief_data:
             return
 
-        # 2. 临时调大 lr
-        for pg in self.belief_optimizer.param_groups:
-            pg['lr'] = lr
+        self.belief_net.train()
+        criterion = nn.BCEWithLogitsLoss(
+            pos_weight=self.belief_net.pos_weight.to(self.device))
 
-        # 3. 多 epoch 猛训 Belief Net
-        total_loss = 0.0
-        for epoch in range(epochs):
-            epoch_loss = 0.0
-            n_batches = 0
-            for batch in self._iter_belief_batches(belief_data, batch_size=256):
-                loss = self.belief_net.compute_loss(
-                    batch['observer_hand'], batch['history'],
-                    batch['observer_pos'], batch['target_pos'],
-                    batch['target_hand'],
-                )
+        for epoch in range(self.config.jit_burnin_epochs):
+            np.random.shuffle(belief_data)
+            total_loss = 0.0
+            n = 0
+            for step in belief_data:
+                oh  = torch.tensor(step['observer_hand'], dtype=torch.float32
+                                   ).unsqueeze(0).to(self.device)
+                h   = torch.tensor(step['history'],       dtype=torch.float32
+                                   ).unsqueeze(0).to(self.device)
+                op  = torch.tensor([step['observer_pos']], dtype=torch.long).to(self.device)
+                tp  = torch.tensor([step['target_pos']],  dtype=torch.long).to(self.device)
+                tgt = torch.tensor(step['belief_target'], dtype=torch.float32
+                                   ).unsqueeze(0).to(self.device)
+
+                logits = self.belief_net(oh, h, op, tp)
+                loss   = criterion(logits, tgt)
                 self.belief_optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.belief_net.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(self.belief_net.parameters(), self.config.max_grad_norm)
                 self.belief_optimizer.step()
-                epoch_loss += loss.item()
-                n_batches += 1
-            total_loss = epoch_loss / max(1, n_batches)
+                total_loss += loss.item()
+                n += 1
 
-        # 4. 恢复正常 lr
-        normal_lr = getattr(self.config, 'belief_lr', 1e-4)
-        for pg in self.belief_optimizer.param_groups:
-            pg['lr'] = normal_lr
+        print(f"  [JIT Burn-in] Done. loss={total_loss/max(1,n):.4f}")
 
-        print(f"    [JIT Belief Burn-in] {num_deals} deals × {epochs} epochs "
-              f"→ belief_loss={total_loss:.4f}")
+    # ======================================================================
+    # Episode Collection
+    # ======================================================================
 
-    def _extract_belief_data(self, episodes: List[Dict]) -> List[Dict]:
-        data = []
-        for ep in episodes:
-            hands = ep['hands']
-            for player, traj in ep['player_trajectories'].items():
-                for step in traj:
-                    hist = step['history_after']
-                    for target in range(NUM_PLAYERS):
-                        if target == player:
-                            continue
-                        data.append({
-                            'observer_hand': hands[player],
-                            'history': self._encode_history(hist),
-                            'observer_pos': player,
-                            'target_pos': target,
-                            'target_hand': hand_to_belief_target(hands[target]),
+    def _collect_episodes(
+        self,
+        num_deals:         int,
+        use_fsp_opponent:  bool = True,
+        fsp_state_dict:    Optional[dict] = None,
+    ) -> List[List[dict]]:
+        """
+        收集 num_deals 局 rollout，返回 episode list.
+
+        每个 episode 是 step list，每个 step 含:
+            flat_obs, legal_actions, action, log_prob, value, reward, done,
+            all_hands, player, [belief_target, observer_hand, history, ...]
+        """
+        episodes   = []
+        dealer     = self.env.dealer  # NORTH (固定)
+
+        # FSP: 如果有对手 snapshot，临时加载到 EW actor
+        fsp_sd     = fsp_state_dict
+        if use_fsp_opponent and fsp_sd is None and not self.fsp_pool.is_empty():
+            fsp_sd = self.fsp_pool.sample()
+
+        for _ in range(num_deals):
+            hands, dd_table = self.env.generate_deal()
+            vul = (False, False)
+
+            obs  = self.env.reset(hands, dd_table, vulnerability=vul)
+            done = False
+            ep   = []
+            history_int = list(self.env.history_int)  # 含前缀
+
+            while not done:
+                player    = self.env.current_player
+                all_hands = self.env._current_hands.copy()
+
+                # 编码 flat obs
+                flat_obs     = encode_obs_flat(obs, dealer, history_int)
+                legal_actions = obs['legal_actions'].copy()
+
+                # 选 actor: FSP 对手 or 当前 agent
+                flat_t  = torch.tensor(flat_obs,      dtype=torch.float32
+                                       ).unsqueeze(0).to(self.device)
+                legal_t = torch.tensor(legal_actions, dtype=torch.float32
+                                       ).unsqueeze(0).to(self.device)
+                ah_t    = torch.tensor(all_hands,      dtype=torch.float32
+                                       ).unsqueeze(0).to(self.device)
+
+                is_opponent = (player in (EAST, WEST))
+                if is_opponent and fsp_sd is not None:
+                    # 临时加载 FSP snapshot 到 EW actor（只用于 get_action）
+                    actor = self._get_fsp_actor(player, fsp_sd)
+                else:
+                    actor = self.agent.get_actor(player)
+
+                critic = self.agent.get_critic(player)
+
+                with torch.no_grad():
+                    action, log_prob, _ = actor.get_action(flat_t, legal_t)
+                    value               = critic(flat_t, ah_t)
+
+                step = {
+                    'flat_obs':     flat_obs,
+                    'legal_actions': legal_actions,
+                    'action':       action.item(),
+                    'log_prob':     log_prob.squeeze(0),
+                    'value':        value.squeeze(0),
+                    'reward':       0.0,
+                    'done':         False,
+                    'all_hands':    all_hands,
+                    'player':       player,
+                }
+
+                # ── Belief 数据记录 ──────────────────────────────────────
+                if self.belief_net is not None:
+                    if player in (NORTH, SOUTH):
+                        # NS 决策步骤：记录完整 r_info 所需数据
+                        partner = (player + 2) % 4
+                        step.update({
+                            'observer_hand':      all_hands[player],
+                            'history':            self._encode_history(history_int),
+                            'observer_pos':       player,
+                            'target_pos':         partner,
+                            'belief_target':      hand_to_belief_target(all_hands[partner]),
+                            'history_int_before': history_int[:],
                         })
-        return data
+                    else:
+                        # EW 决策步骤：记录 NS 视角对 EW 手牌推断的诊断数据
+                        # 不参与 r_info 奖励，仅供 evaluate_ew_belief_update() 使用
+                        step.update({
+                            'ew_diagnostic':      True,
+                            'observer_hand':      all_hands[NORTH],
+                            'history':            self._encode_history(history_int),
+                            'observer_pos':       NORTH,
+                            'target_pos':         player,
+                            'belief_target':      hand_to_belief_target(all_hands[player]),
+                            'history_int_before': history_int[:],
+                        })
 
-    def _encode_history(self, history: List[int]) -> np.ndarray:
-        max_len = self.env.max_history_len
-        encoded = np.zeros((max_len, NUM_BIDS), dtype=np.float32)
-        for i, bid in enumerate(history[-max_len:]):
-            encoded[i, bid] = 1.0
-        return encoded
+                history_int.append(action.item())
 
-    def _iter_belief_batches(self, data: List[Dict], batch_size: int):
-        indices = np.random.permutation(len(data))
-        for start in range(0, len(data), batch_size):
-            batch_idx = indices[start:start + batch_size]
-            if len(batch_idx) < 2:
-                continue
-            yield {
-                'observer_hand': torch.tensor(
-                    np.array([data[i]['observer_hand'] for i in batch_idx]),
-                    dtype=torch.float32).to(self.device),
-                'history': torch.tensor(
-                    np.array([data[i]['history'] for i in batch_idx]),
-                    dtype=torch.float32).to(self.device),
-                'observer_pos': torch.tensor(
-                    [data[i]['observer_pos'] for i in batch_idx],
-                    dtype=torch.long).to(self.device),
-                'target_pos': torch.tensor(
-                    [data[i]['target_pos'] for i in batch_idx],
-                    dtype=torch.long).to(self.device),
-                'target_hand': torch.tensor(
-                    np.array([data[i]['target_hand'] for i in batch_idx]),
-                    dtype=torch.float32).to(self.device),
-            }
+                # 补充 history_int_after
+                if self.belief_net is not None:
+                    if player in (NORTH, SOUTH) or step.get('ew_diagnostic'):
+                        step['history_int_after'] = history_int[:]
+                obs, reward, done, info = self.env.step(action.item())
 
-    # ====================================================================
-    # Info bonus monitoring
-    # ====================================================================
+                step['reward'] = reward
+                step['done']   = done
+                ep.append(step)
 
-    def compute_info_bonus_for_episodes(self, episodes: List[Dict]) -> Dict[str, float]:
-        if self.belief_net is None:
-            return {'partner_gain': 0, 'opponent_leak': 0, 'info_ratio': 1.0}
+            episodes.append(ep)
 
-        partner_gains = []
-        opponent_leaks = []
+        return episodes
 
-        self.belief_net.eval()
+    def _get_fsp_actor(self, player: int, fsp_sd: dict) -> MLPPolicyNetwork:
+        """
+        获取 FSP snapshot 对应的 actor（临时对象，不影响 self.agent）.
+
+        注: 简单实现：每次创建临时网络并加载权重。
+        性能影响可接受（FSP actor 只用于推断，不需要梯度）。
+        """
+        role  = 'actor_n' if player == NORTH else 'actor_s'
+        # EW 也映射到 actor_n / actor_s（EW 的 policy 从 pool 中来）
+        if player == EAST:
+            role = 'actor_n'
+        elif player == WEST:
+            role = 'actor_s'
+
+        if role not in fsp_sd:
+            return self.agent.get_actor(player)
+
+        net = MLPPolicyNetwork(hidden_dim=self.config.hidden_dim).to(self.device)
+        sd  = {k: v.to(self.device) for k, v in fsp_sd[role].items()}
+        net.load_state_dict(sd)
+        net.eval()
+        return net
+
+    def _store_episodes(self, episodes: List[List[dict]]):
+        """将 episode list 存入各 player 的 buffer."""
+        for ep in episodes:
+            for step in ep:
+                p = step['player']
+                if p not in self.active_players:
+                    continue
+                buf = self.buffers[p]
+                buf.add(
+                    flat_obs      = step['flat_obs'],
+                    legal_actions = step['legal_actions'],
+                    action        = step['action'],
+                    log_prob      = step['log_prob'],
+                    reward        = step['reward'],
+                    value         = step['value'],
+                    done          = step['done'],
+                    all_hands     = step.get('all_hands'),
+                )
+
+    def _encode_history(self, history_int: list) -> np.ndarray:
+        """将整数历史列表编码为 (max_len, NUM_BIDS) one-hot（Belief Net 用）."""
+        max_len = 60
+        arr = np.zeros((max_len, NUM_BIDS), dtype=np.float32)
+        for i, bid in enumerate(history_int[-max_len:]):
+            arr[i, bid] = 1.0
+        return arr
+
+    # ======================================================================
+    # r_info 计算
+    # ======================================================================
+
+    def _compute_info_bonus(self, episodes: List[List[dict]]) -> List[List[float]]:
+        """
+        为每个 episode 的每个 step 计算 r_info.
+
+        r_info = I(bid; hand | partner) - β × I(bid; hand | opponent)
+               ≈ [CE(q_before, hand) - CE(q_after, hand)]_partner
+                 - β × [CE(q_before, hand) - CE(q_after, hand)]_opponent
+
+        ReLU 截断：max(0, ·)，互信息 ≥ 0
+        """
+        if self.dual_info is None:
+            return [[0.0] * len(ep) for ep in episodes]
+
+        bonus_episodes = []
+
+        for ep in episodes:
+            bonuses = []
+            for step in ep:
+                if 'belief_target' not in step or step['player'] not in (NORTH, SOUTH):
+                    bonuses.append(0.0)
+                    continue
+
+                player  = step['player']
+                partner = (player + 2) % 4
+                opp     = (player + 1) % 4  # 右侧对手
+
+                h_before_enc = self._encode_history(step.get('history_int_before', []))
+                h_after_enc  = self._encode_history(step.get('history_int_after',  []))
+
+                oh  = torch.tensor(step['observer_hand'], dtype=torch.float32
+                                   ).unsqueeze(0).to(self.device)
+                hb  = torch.tensor(h_before_enc, dtype=torch.float32
+                                   ).unsqueeze(0).to(self.device)
+                ha  = torch.tensor(h_after_enc,  dtype=torch.float32
+                                   ).unsqueeze(0).to(self.device)
+                tgt = torch.tensor(step['belief_target'], dtype=torch.float32
+                                   ).unsqueeze(0).to(self.device)
+
+                op_t = torch.tensor([player],  dtype=torch.long).to(self.device)
+                pp_t = torch.tensor([partner], dtype=torch.long).to(self.device)
+                oo_t = torch.tensor([opp],     dtype=torch.long).to(self.device)
+
+                with torch.no_grad():
+                    # Partner 信息增益
+                    b_before_partner = self.belief_net.get_probs(oh, hb, op_t, pp_t)
+                    b_after_partner  = self.belief_net.get_probs(oh, ha, op_t, pp_t)
+                    partner_gain = self.dual_info.compute_info_gain(
+                        b_before_partner, b_after_partner, tgt)
+
+                    # Opponent 信息泄露
+                    b_before_opp = self.belief_net.get_probs(oh, hb, op_t, oo_t)
+                    b_after_opp  = self.belief_net.get_probs(oh, ha, op_t, oo_t)
+                    # opponent target: 对手的手牌特征
+                    opp_tgt = torch.tensor(
+                        hand_to_belief_target(step['all_hands'][opp]),
+                        dtype=torch.float32).unsqueeze(0).to(self.device)
+                    opponent_leak = self.dual_info.compute_info_gain(
+                        b_before_opp, b_after_opp, opp_tgt)
+
+                    bonus, _ = self.dual_info.compute_dual_info_bonus(
+                        partner_gain, opponent_leak)
+
+                bonuses.append(float(bonus.item()))
+
+            bonus_episodes.append(bonuses)
+
+        return bonus_episodes
+
+    # ======================================================================
+    # PPO Update
+    # ======================================================================
+
+    def _safe_update(self, player: int, round_idx: int) -> dict:
+        """
+        单 player 的 PPO update.
+
+        包含:
+        - GAE returns & advantages
+        - Clipped policy loss + value loss + entropy bonus
+        - KL anchor penalty
+        - KL early stopping（epoch 级别）
+        """
+        buf   = self.buffers[player]
+        if len(buf) < self.config.batch_size:
+            buf.reset()
+            return {}
+
+        actor      = self.agent.get_actor(player)
+        critic     = self.agent.get_critic(player)
+        actor_opt  = self.agent.get_actor_optimizer(player)
+        critic_opt = self.agent.get_critic_optimizer(player)
+        kl_lambda  = self._get_kl_lambda(round_idx)
+
+        # Bootstrap last value
         with torch.no_grad():
-            for ep in episodes:
-                hands = ep['hands']
-                for player, traj in ep['player_trajectories'].items():
-                    if player % 2 == 1:
-                        continue
-                    partner = (player + 2) % 4
-                    opponent = (player + 1) % 4
-                    for step in traj:
-                        h_before = self._encode_history(step['history_before'])
-                        h_after = self._encode_history(step['history_after'])
-                        pg = self._compute_single_info_gain(
-                            hands[partner], h_before, h_after,
-                            partner, player, hands[player])
-                        partner_gains.append(pg)
-                        ol = self._compute_single_info_gain(
-                            hands[opponent], h_before, h_after,
-                            opponent, player, hands[player])
-                        opponent_leaks.append(ol)
-        self.belief_net.train()
+            fo  = buf.flat_obs[-1].unsqueeze(0).to(self.device)
+            ah  = (buf.all_hands[-1].unsqueeze(0).to(self.device)
+                   if buf.all_hands else None)
+            last_val = critic(fo, ah).item()
 
-        pg_mean = np.mean(partner_gains) if partner_gains else 0.0
-        ol_mean = np.mean(opponent_leaks) if opponent_leaks else 1e-8
-        ratio = pg_mean / (abs(ol_mean) + 1e-8)
+        buf.compute_returns_and_advantages(
+            last_val, self.agent.config.gamma, self.agent.config.gae_lambda)
+
+        total_policy = total_value = total_entropy = total_kl = 0.0
+        n_updates = 0
+
+        for epoch in range(self.config.num_epochs):
+            epoch_kl = 0.0
+            n_batch_kl = 0
+
+            for batch in buf.get_batches(self.agent.config.batch_size):
+                b_flat   = batch['flat_obs']
+                b_legal  = batch['legal_actions']
+                b_act    = batch['actions']
+                b_old_lp = batch['old_log_probs']
+                b_ret    = batch['returns']
+                b_adv    = batch['advantages']
+                b_ah     = batch.get('all_hands')
+
+                # Normalize advantage
+                adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
+
+                # Actor loss
+                log_probs, entropy = actor.evaluate_actions(b_flat, b_legal, b_act)
+                ratio = torch.exp(log_probs - b_old_lp)
+                policy_loss = -torch.min(
+                    ratio * adv,
+                    torch.clamp(ratio, 1 - self.config.clip_ratio,
+                                       1 + self.config.clip_ratio) * adv
+                ).mean()
+
+                # KL anchor
+                kl_loss = torch.tensor(0.0, device=self.device)
+                if self.bc_actors is not None and player in self.bc_actors and kl_lambda > 0:
+                    bc_actor = self.bc_actors[player]
+                    with torch.no_grad():
+                        bc_logits = bc_actor(b_flat, b_legal)
+                        bc_probs  = F.softmax(bc_logits, dim=-1).clamp(1e-8, 1.0)
+                    cur_logits = actor(b_flat, b_legal)
+                    cur_probs  = F.softmax(cur_logits, dim=-1).clamp(1e-8, 1.0)
+                    kl_loss    = F.kl_div(
+                        cur_probs.log(), bc_probs, reduction='batchmean')
+
+                actor_loss = (policy_loss
+                              - self.config.entropy_coef * entropy.mean()
+                              + kl_lambda * kl_loss)
+
+                actor_opt.zero_grad()
+                actor_loss.backward()
+                nn.utils.clip_grad_norm_(actor.parameters(), self.config.max_grad_norm)
+                actor_opt.step()
+
+                # Critic loss
+                vals    = critic(b_flat, b_ah)
+                old_v   = vals.detach()
+                v_clip  = old_v + (vals - old_v).clamp(
+                    -self.config.clip_ratio, self.config.clip_ratio)
+                value_loss = torch.max(F.mse_loss(vals, b_ret),
+                                       F.mse_loss(v_clip, b_ret))
+                critic_opt.zero_grad()
+                value_loss.backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), self.config.max_grad_norm)
+                critic_opt.step()
+
+                # Approx KL for early stopping
+                with torch.no_grad():
+                    approx_kl = ((b_old_lp - log_probs).mean()).item()
+                epoch_kl   += approx_kl
+                n_batch_kl += 1
+
+                total_policy  += policy_loss.item()
+                total_value   += value_loss.item()
+                total_entropy += entropy.mean().item()
+                total_kl      += kl_loss.item()
+                n_updates     += 1
+
+            # Epoch-level KL early stopping
+            epoch_kl /= max(1, n_batch_kl)
+            if (self.config.kl_early_stop_threshold > 0
+                    and epoch_kl > self.config.kl_early_stop_threshold):
+                break
+
+        buf.reset()
+
+        if n_updates == 0:
+            return {}
 
         return {
-            'partner_gain': float(pg_mean),
-            'opponent_leak': float(ol_mean),
-            'info_ratio': float(ratio),
+            'policy_loss': total_policy  / n_updates,
+            'value_loss':  total_value   / n_updates,
+            'entropy':     total_entropy / n_updates,
+            'kl_loss':     total_kl      / n_updates,
+            'kl_lambda':   kl_lambda,
         }
 
-    def _compute_single_info_gain(self, observer_hand, history_before,
-                                   history_after, observer_pos, target_pos,
-                                   target_hand) -> float:
-        oh = torch.tensor(observer_hand, dtype=torch.float32).unsqueeze(0).to(self.device)
-        hb = torch.tensor(history_before, dtype=torch.float32).unsqueeze(0).to(self.device)
-        ha = torch.tensor(history_after, dtype=torch.float32).unsqueeze(0).to(self.device)
-        op = torch.tensor([observer_pos], dtype=torch.long).to(self.device)
-        tp = torch.tensor([target_pos], dtype=torch.long).to(self.device)
-        th = torch.tensor(
-            hand_to_belief_target(target_hand) if target_hand.shape[-1] == 52
-            else target_hand,
-            dtype=torch.float32).unsqueeze(0).to(self.device)
+    # ======================================================================
+    # 主训练循环：IBR 交替训练
+    # ======================================================================
 
-        # 用 get_probs (sigmoid 概率), 而非 forward (logits)
-        # BCE 需要 [0,1] 的概率输入, logits 会产生 NaN
-        belief_before = self.belief_net.get_probs(oh, hb, op, tp).clamp(1e-7, 1 - 1e-7)
-        belief_after  = self.belief_net.get_probs(oh, ha, op, tp).clamp(1e-7, 1 - 1e-7)
+    def run(self, num_rounds: int = None) -> List[dict]:
+        """
+        IBR 交替训练:
 
-        ce_before = F.binary_cross_entropy(belief_before, th, reduction='none').mean(dim=-1)
-        ce_after  = F.binary_cross_entropy(belief_after,  th, reduction='none').mean(dim=-1)
+        Round k:
+          S-phase:  训练 NS（S 先决策，N 后 rebid）
+          N-phase:  训练 NS（N-phase JIT Belief Burn-in → 更新 N + S）
+                    Agent B：在此阶段激活 r_info
+          每 fsp_add_interval 轮将 actor snapshot 存入 FSP pool
+        """
+        num_rounds = num_rounds or self.config.num_rounds
 
-        # 互信息在数学上 >= 0; 负值是 Belief Net 滞后产生的估算误差
-        # ReLU 截断: 不惩罚探索, 只奖励成功传递信息
-        gain = float((ce_before - ce_after).item())
-        return max(0.0, gain)
+        # 初始 Critic warmup
+        print("\n[Trainer] Critic warmup...")
+        self.critic_warmup()
 
-    # ====================================================================
-    # Main training loop
-    # ====================================================================
+        for rnd in range(num_rounds):
+            print(f"\n══════ Round {rnd+1}/{num_rounds} ══════")
 
-    def train(self) -> List[Dict]:
-        cfg = self.config
-        active_str = ','.join(str(p) for p in self.active_players)
-        eff_deals = cfg.deals_per_step * cfg.accumulate_steps
-        mode_str = "single_step (batch-mean baseline)" if cfg.single_step else "GAE+Critic"
-        print(f"SubgameTrainer: {cfg.num_steps} steps, "
-              f"mode={mode_str}, "
-              f"info_bonus={cfg.use_info_bonus}, beta={cfg.beta}, "
-              f"active_players=[{active_str}], "
-              f"accumulate={cfg.accumulate_steps}, "
-              f"effective_deals/update={eff_deals}")
+            # FSP snapshot
+            self._maybe_add_to_fsp(rnd)
+            fsp_sd = self._apply_fsp_opponent()
 
-        # ── Critic 自适应预热 (P50) ──────────────────────────────────────
-        # 监控 vl 相对变化率, 收敛 (<5%) 后才开放 Actor 更新.
-        # 避免固定轮数带来的"等太少/等太多"问题:
-        #   - critic_n 本来就稳定 → 1-3 轮即可通过, 无额外时间开销
-        #   - critic_s 需要重建 → 自动等到真正收敛, 不再靠堆轮数
-        # 安全上限 max_rounds 防止无限等待.
-        if cfg.critic_prewarm_max_rounds > 0:
-            prewarm_losses = []
-            prev_vl = None
-            rounds_done = 0
-            for _ in range(cfg.critic_prewarm_max_rounds):
-                vl = self.critic_warmup_step(cfg.critic_prewarm_deals)
-                prewarm_losses.append(vl)
-                rounds_done += 1
+            # ── S-phase ────────────────────────────────────────────────────
+            print("  [S-phase] Collecting episodes...")
+            s_episodes = self._collect_episodes(
+                self.config.steps_per_phase * self.config.deals_per_step,
+                use_fsp_opponent=True, fsp_state_dict=fsp_sd)
 
-                if prev_vl is not None and prev_vl > 1e-8:
-                    rel_change = abs(vl - prev_vl) / prev_vl
-                    if rel_change < cfg.critic_prewarm_conv_tol:
-                        break  # 收敛: 相对变化率 < 5%
+            if self.config.use_info_bonus:
+                bonuses = self._compute_info_bonus(s_episodes)
+                for ep, bs in zip(s_episodes, bonuses):
+                    for step, b in zip(ep, bs):
+                        step['reward'] += b  # 逐步分配 r_info，beta 已在 compute_dual_info_bonus 内应用
 
-                prev_vl = vl
+            self._store_episodes(s_episodes)
+            s_metrics = {}
+            for p in self.active_players:
+                m = self._safe_update(p, rnd)
+                if m:
+                    s_metrics[p] = m
 
-            conv_str = (f"converged at round {rounds_done}"
-                        if rounds_done < cfg.critic_prewarm_max_rounds
-                        else f"hit max {cfg.critic_prewarm_max_rounds} rounds")
-            print(f"  [Critic Prewarm] {rounds_done} rounds × "
-                  f"{cfg.critic_prewarm_deals} deals "
-                  f"({conv_str}): "
-                  f"vl {prewarm_losses[0]:.3f} → {prewarm_losses[-1]:.3f}")
+            # ── N-phase: JIT Belief Burn-in → 收集 → 更新 ─────────────────
+            if self.belief_net is not None:
+                print("  [N-phase] JIT Belief Burn-in...")
+                self.jit_belief_burnin()
 
-        all_episodes_window = []
-        latest_update_stats = {}  # 缓存最新 PPO update 指标
+            print("  [N-phase] Collecting episodes...")
+            n_episodes = self._collect_episodes(
+                self.config.steps_per_phase * self.config.deals_per_step,
+                use_fsp_opponent=True, fsp_state_dict=fsp_sd)
 
-        for step in range(1, cfg.num_steps + 1):
-            self._current_step = step
-            episodes = self.collect_episodes(cfg.deals_per_step)
-            all_episodes_window.extend(episodes)
+            if self.config.use_info_bonus:
+                bonuses = self._compute_info_bonus(n_episodes)
+                for ep, bs in zip(n_episodes, bonuses):
+                    for step, b in zip(ep, bs):
+                        step['reward'] += b  # 逐步分配 r_info，beta 已在 compute_dual_info_bonus 内应用
 
-            belief_loss = 0.0
-            if cfg.use_info_bonus:
-                belief_loss = self.train_belief_step(episodes)
+            self._store_episodes(n_episodes)
+            n_metrics = {}
+            for p in self.active_players:
+                m = self._safe_update(p, rnd)
+                if m:
+                    n_metrics[p] = m
 
-            self.store_episodes(episodes)
+            # 日志
+            all_rewards = [
+                step['reward']
+                for ep in (s_episodes + n_episodes)
+                for step in ep
+                if step.get('done')
+            ]
+            mean_r = np.mean(all_rewards) if all_rewards else 0.0
+            std_r  = np.std(all_rewards)  if all_rewards else 0.0
 
-            # PPO update every accumulate_steps
-            if step % cfg.accumulate_steps == 0:
-                stats = self.safe_update()
-                if stats:
-                    latest_update_stats = stats
-
-            # Logging
-            if step % cfg.log_interval == 0:
-                rewards = [ep['final_reward'] for ep in all_episodes_window]
-                rw_arr = np.array(rewards) if rewards else np.array([0.0])
-                info_metrics = self.compute_info_bonus_for_episodes(episodes) \
-                    if cfg.use_info_bonus else {}
-
-                entry = {
-                    'step': step,
-                    'mean_reward': float(rw_arr.mean()),
-                    'std_reward': float(rw_arr.std()),
-                    'p25_reward': float(np.percentile(rw_arr, 25)),
-                    'p75_reward': float(np.percentile(rw_arr, 75)),
-                    'belief_loss': float(belief_loss),
-                    'lambda': self.get_lambda(step),
-                    **info_metrics,
-                    **latest_update_stats,
-                }
-                self.log.append(entry)
-
-                if step % cfg.eval_interval == 0:
-                    # 紧凑的多指标日志行
-                    ent_str = f"ent={entry.get('entropy', 0):.2f}"
-                    ec_str = f"ec={entry.get('entropy_coef', 0):.3f}"
-                    vl_str = f"vl={entry.get('value_loss', 0):.3f}"
-                    pl_str = f"pl={entry.get('policy_loss', 0):.3f}"
-                    p25 = entry['p25_reward']
-                    p75 = entry['p75_reward']
-
-                    line = (f"  [Step {step}/{cfg.num_steps}] "
-                            f"r={entry['mean_reward']:+.2f}±{entry['std_reward']:.2f} "
-                            f"[p25={p25:.2f} p75={p75:.2f}] "
-                            f"{ent_str} {ec_str} {vl_str} {pl_str}")
-
-                    # KL anchor 监控
-                    kl_val = entry.get('kl_loss', 0)
-                    kl_lam = entry.get('kl_lambda', 0)
-                    if kl_lam > 0:
-                        line += f" kl={kl_val:.4f}(λ={kl_lam:.3f})"
-
-                    # P50/P51: KL 早停 / BC 高压线触发标记
-                    if entry.get('kl_stopped', False):
-                        line += " ⚡KL-stop"
-                    if entry.get('actor_skipped', False):
-                        bc_kl_val = entry.get('global_bc_kl', 0)
-                        line += f" 🚫actor-skip(bc_kl={bc_kl_val:.3f})"
-
-                    if cfg.use_info_bonus:
-                        line += (f" bl={belief_loss:.4f}"
-                                 f" ir={entry.get('info_ratio', 'N/A')}")
-
-                    print(line)
-
-                all_episodes_window = []
+            log_entry = {
+                'round':       rnd + 1,
+                'mean_reward': mean_r,
+                'std_reward':  std_r,
+                's_metrics':   s_metrics,
+                'n_metrics':   n_metrics,
+                'fsp_pool_size': len(self.fsp_pool),
+            }
+            self.log.append(log_entry)
+            self._print_log(log_entry)
 
         return self.log
 
-    def evaluate_belief_accuracy(self, num_deals: int = 50) -> float:
-        """
-        评估 Belief Network 质量 — Top-13 命中率.
+    def _print_log(self, entry: dict):
+        rnd  = entry['round']
+        mr   = entry['mean_reward']
+        sr   = entry['std_reward']
+        fsp  = entry['fsp_pool_size']
+        # 取 S 的 policy_loss / value_loss（典型 player）
+        s_m  = entry['s_metrics'].get(SOUTH, {})
+        pl   = s_m.get('policy_loss', 0)
+        vl   = s_m.get('value_loss',  0)
+        ent  = s_m.get('entropy',     0)
+        kl   = s_m.get('kl_loss',     0)
+        klam = s_m.get('kl_lambda',   0)
+        print(f"  [Round {rnd}] r={mr:+.3f}±{sr:.3f} "
+              f"pl={pl:.4f} vl={vl:.4f} ent={ent:.4f} "
+              f"kl={kl:.5f}(λ={klam:.3f}) fsp={fsp}")
 
-        修复两个问题:
-        1. 评估动作: 用 agent 当前策略 (deterministic) 而非随机动作.
-           随机叫牌 history 无信息, 导致指标永远等于先验基线.
-        2. 评估指标: 用 Top-13 命中率替代 threshold acc.
-           旧指标: (pred>0.5)==target, 随机基线=75%, 无法区分好坏.
-           新指标: 取 top-13 概率最高的牌与真实手牌求交集.
-                   随机基线 = 13×13/52 = 3.25/13 ≈ 25%.
-                   完美预测 = 13/13 = 100%.
-                   实际有意义的网络应达到 35-50%+.
+    # ======================================================================
+    # 评估
+    # ======================================================================
 
-        Returns:
-            top13_hit_rate: 0.0 (随机) ~ 1.0 (完美), 随机基线 ≈ 0.25
+    def evaluate_oracle(self, num_deals: int = 1000) -> dict:
         """
+        DDS oracle 评估（主要指标）.
+
+        IMP regret = actual_imp - dds_optimal_imp  (≤ 0，越高越好)
+        """
+        from subgames.competitive_env import (
+            dds_oracle_evaluate, make_agent_policy
+        )
+        policy = make_agent_policy(self.agent, deterministic=True)
+        result = dds_oracle_evaluate(self.env, policy, num_deals)
+
+        print(f"\n  [Oracle Eval] mean_regret={result['mean_regret']:+.3f} "
+              f"± {result['std_regret']:.3f} IMP  "
+              f"95% CI [{result['ci_lo']:+.3f}, {result['ci_hi']:+.3f}]")
+        return result
+
+    def evaluate_belief(self, num_deals: int = 50) -> dict:
+        """评估 Belief Network 质量."""
         if self.belief_net is None:
-            return 0.0
+            return {}
 
         self.belief_net.eval()
         all_probs, all_targets = [], []
@@ -1255,26 +1025,34 @@ class SubgameTrainer:
         with torch.no_grad():
             for _ in range(num_deals):
                 hands, dd_table = self.env.generate_deal()
-                obs = self.env.reset(hands, dd_table)
+                obs  = self.env.reset(hands, dd_table)
                 done = False
+                hist = list(self.env.history_int)
+
                 while not done:
-                    player = self.env.current_player
-                    all_hands = self.env._current_hands
-                    action, _ = self.agent.get_action_for_player(
-                        obs, player, all_hands=all_hands, deterministic=True)
-                    obs, _, done, _ = self.env.step(action)
+                    player   = self.env.current_player
+                    flat_obs = encode_obs_flat(obs, NORTH, hist)
+                    flat_t   = torch.tensor(flat_obs, dtype=torch.float32
+                                            ).unsqueeze(0).to(self.device)
+                    legal_t  = torch.tensor(obs['legal_actions'], dtype=torch.float32
+                                            ).unsqueeze(0).to(self.device)
+                    actor    = self.agent.get_actor(player)
+                    action, _, _ = actor.get_action(flat_t, legal_t, deterministic=True)
+                    hist.append(action.item())
+                    obs, _, done, _ = self.env.step(action.item())
 
-                history = self._encode_history(self.env.history)
-                oh = torch.tensor(hands[NORTH], dtype=torch.float32).unsqueeze(0).to(self.device)
-                h  = torch.tensor(history,      dtype=torch.float32).unsqueeze(0).to(self.device)
-                op = torch.tensor([NORTH],       dtype=torch.long).to(self.device)
-                tp = torch.tensor([SOUTH],       dtype=torch.long).to(self.device)
+                h_enc = self._encode_history(hist)
+                oh    = torch.tensor(hands[NORTH], dtype=torch.float32
+                                     ).unsqueeze(0).to(self.device)
+                h_t   = torch.tensor(h_enc, dtype=torch.float32
+                                     ).unsqueeze(0).to(self.device)
+                op    = torch.tensor([NORTH], dtype=torch.long).to(self.device)
+                tp    = torch.tensor([SOUTH], dtype=torch.long).to(self.device)
 
-                # get_probs 返回 sigmoid 概率 (不再用 forward/logits)
-                probs  = self.belief_net.get_probs(oh, h, op, tp)
+                probs  = self.belief_net.get_probs(oh, h_t, op, tp)
                 target = torch.tensor(
-                    hand_to_belief_target(hands[SOUTH]),
-                    dtype=torch.float32).unsqueeze(0).to(self.device)
+                    hand_to_belief_target(hands[SOUTH]), dtype=torch.float32
+                ).unsqueeze(0).to(self.device)
 
                 all_probs.append(probs)
                 all_targets.append(target)
@@ -1282,131 +1060,122 @@ class SubgameTrainer:
         self.belief_net.train()
 
         if not all_probs:
-            return 0.0
+            return {}
 
-        probs_cat   = torch.cat(all_probs,   dim=0)   # (N, 48)
-        targets_cat = torch.cat(all_targets, dim=0)   # (N, 48)
-        acc_dict = belief_accuracy(probs_cat, targets_cat)
-        print(f"  [BeliefNet] honor_acc={acc_dict['honor_acc']:.3f} "
-              f" length_acc={acc_dict['length_acc']:.3f} "
-              f" overall_acc={acc_dict['overall_acc']:.3f}")
-        return acc_dict['overall_acc']
+        probs_cat   = torch.cat(all_probs,   dim=0)
+        targets_cat = torch.cat(all_targets, dim=0)
+        acc = belief_accuracy(probs_cat, targets_cat)
+        print(f"  [BeliefNet] honor={acc['honor_acc']:.3f} "
+              f"length={acc['length_acc']:.3f} overall={acc['overall_acc']:.3f}")
+        return acc
 
-
-# ============================================================================
-# Head-to-Head Evaluator
-# ============================================================================
-
-class HeadToHeadEvaluator:
-    """
-    双桌 IMP 对比评估框架 (普适化).
-
-    原理: 同一副牌在两桌同时打, Agent A 和 Agent B 分别担任 NS 方,
-    EW 方用相同的固定策略 (规则/frozen policy).
-    双桌 IMP 差 = B_score - A_score, 消除牌力方差.
-
-    这是真实团队赛 (Team Match) 的评估方式, 是论文核心对比指标.
-    与子博弈类型无关, 只要 env 有 generate_deal() 和 reset() 接口即可.
-
-    用法:
-        evaluator = HeadToHeadEvaluator(env_factory, trainer_a, trainer_b)
-        result = evaluator.evaluate(num_deals=500)
-        print(f"B vs A: {result['mean_imp_diff']:+.2f} IMP")
-    """
-
-    def __init__(self, env_factory, trainer_a: SubgameTrainer,
-                 trainer_b: SubgameTrainer, device: str = 'cpu'):
+    def evaluate_ew_belief_update(self, num_deals: int = 200) -> dict:
         """
-        Args:
-            env_factory: 无参数可调用对象, 返回一个新的子博弈 env 实例.
-                         每次 evaluate() 用同一副牌在两个独立 env 里运行.
-            trainer_a: Agent A (对照组, 无 r_info)
-            trainer_b: Agent B (实验组, 有 r_info)
-            device: torch device
+        诊断指标：NS视角对EW手牌的推断更新量。
+
+        在每一个EW叫品发生前后，用Belief Net计算NS对该EW手牌的
+        交叉熵变化（信息增益）。这个量反映了EW叫品对NS推断的贡献：
+            - 正值：EW的叫品帮助NS更好地推断EW手牌（EW在"暴露"）
+            - 接近零：EW的叫品信息量低（比如在高阶Pass）
+
+        这是论文RQ2（机制验证）的辅助证据：
+        Agent B的β term是否有效惩罚了EW暴露，
+        应该表现为B的opponent_leak比A更低。
+
+        Returns:
+            {
+              'mean_ew_gain':    float,  # NS从EW叫品中平均获得的信息增益
+              'std_ew_gain':     float,
+              'per_action_type': dict,   # Pass/实质叫品/X分类统计
+            }
         """
-        self.env_factory = env_factory
-        self.trainer_a = trainer_a
-        self.trainer_b = trainer_b
-        self.device = device
+        if self.belief_net is None:
+            return {}
 
-    def _run_one_agent_on_env(self, env, trainer,
-                              hands: np.ndarray, dd_table: np.ndarray) -> float:
-        """
-        用指定 trainer 在已有 env 实例上打一副牌.
-        返回 terminal reward (raw IMP regret, ≤ 0).
-        使用 deterministic policy (argmax).
-        """
-        obs = env.reset(hands, dd_table)
-        done = False
-        reward = 0.0
+        self.belief_net.eval()
+        from env import BID_PASS, BID_DOUBLE, BID_1C
 
-        while not done:
-            player = env.current_player
-            all_hands = env._current_hands
-            action, _ = trainer.agent.get_action_for_player(
-                obs, player, all_hands=all_hands, deterministic=True)
-            obs, reward, done, _ = env.step(action)
+        gains_all   = []
+        gains_pass  = []
+        gains_real  = []
+        gains_double= []
 
-        return float(reward)
+        with torch.no_grad():
+            for _ in range(num_deals):
+                hands, dd_table = self.env.generate_deal()
+                obs  = self.env.reset(hands, dd_table)
+                done = False
+                hist = list(self.env.history_int)  # 含前缀
 
-    def evaluate(self, num_deals: int = 500) -> dict:
-        """
-        双桌对比评估.
+                while not done:
+                    player  = self.env.current_player
+                    flat_t  = torch.tensor(
+                        encode_obs_flat(obs, NORTH, hist),
+                        dtype=torch.float32).unsqueeze(0).to(self.device)
+                    legal_t = torch.tensor(
+                        obs['legal_actions'], dtype=torch.float32
+                    ).unsqueeze(0).to(self.device)
 
-        对每副牌:
-          - A 打一遍, 得到 imp_a (terminal reward = raw IMP regret)
-          - B 打同一副牌, 得到 imp_b
-          - diff = imp_b - imp_a (正数 = B 更好)
+                    actor  = self.agent.get_actor(player)
+                    action, _, _ = actor.get_action(flat_t, legal_t, deterministic=True)
+                    action_int = action.item()
 
-        复用同一对 env 实例, 避免每副牌重建 env 触发大量初始化 print.
-        """
-        # 创建一次 env, 整个评估过程复用
-        env_a = self.env_factory()
-        env_b = self.env_factory()
+                    # 只在 EW 步骤计算诊断
+                    if player in (EAST, WEST):
+                        h_before = self._encode_history(hist)
+                        hist_after = hist + [action_int]
+                        h_after  = self._encode_history(hist_after)
 
-        imp_a_list, imp_b_list, diff_list = [], [], []
+                        oh  = torch.tensor(hands[NORTH], dtype=torch.float32
+                                           ).unsqueeze(0).to(self.device)
+                        hb  = torch.tensor(h_before, dtype=torch.float32
+                                           ).unsqueeze(0).to(self.device)
+                        ha  = torch.tensor(h_after,  dtype=torch.float32
+                                           ).unsqueeze(0).to(self.device)
+                        op  = torch.tensor([NORTH],  dtype=torch.long).to(self.device)
+                        tp  = torch.tensor([player], dtype=torch.long).to(self.device)
+                        tgt = torch.tensor(
+                            hand_to_belief_target(hands[player]),
+                            dtype=torch.float32).unsqueeze(0).to(self.device)
 
-        for _ in range(num_deals):
-            hands, dd_table = env_a.generate_deal()
+                        b_before = self.belief_net.get_probs(oh, hb, op, tp)
+                        b_after  = self.belief_net.get_probs(oh, ha, op, tp)
+                        gain = self.dual_info.compute_info_gain(
+                            b_before, b_after, tgt).item()
 
-            imp_a = self._run_one_agent_on_env(env_a, self.trainer_a, hands, dd_table)
-            imp_b = self._run_one_agent_on_env(env_b, self.trainer_b, hands, dd_table)
-            diff  = imp_b - imp_a
+                        gains_all.append(gain)
+                        if action_int == BID_PASS:
+                            gains_pass.append(gain)
+                        elif action_int == BID_DOUBLE or action_int == BID_DOUBLE + 1:
+                            gains_double.append(gain)
+                        else:
+                            gains_real.append(gain)
 
-            imp_a_list.append(imp_a)
-            imp_b_list.append(imp_b)
-            diff_list.append(diff)
+                    hist.append(action_int)
+                    obs, _, done, _ = self.env.step(action_int)
 
-        imp_a_arr  = np.array(imp_a_list)
-        imp_b_arr  = np.array(imp_b_list)
-        diff_arr   = np.array(diff_list)
+        self.belief_net.train()
 
-        win_rate_b = float((diff_arr > 0).mean())
-        tie_rate   = float((diff_arr == 0).mean())
+        def _stats(lst):
+            if not lst:
+                return {'mean': 0.0, 'std': 0.0, 'n': 0}
+            a = np.array(lst)
+            return {'mean': float(a.mean()), 'std': float(a.std()), 'n': len(lst)}
 
-        return {
-            'mean_imp_a':    float(imp_a_arr.mean()),
-            'std_imp_a':     float(imp_a_arr.std()),
-            'mean_imp_b':    float(imp_b_arr.mean()),
-            'std_imp_b':     float(imp_b_arr.std()),
-            'mean_imp_diff': float(diff_arr.mean()),
-            'std_imp_diff':  float(diff_arr.std()),
-            'win_rate_b':    win_rate_b,
-            'tie_rate':      tie_rate,
-            'lose_rate_b':   float((diff_arr < 0).mean()),
-            'n_deals':       num_deals,
+        result = {
+            'mean_ew_gain': float(np.mean(gains_all)) if gains_all else 0.0,
+            'std_ew_gain':  float(np.std(gains_all))  if gains_all else 0.0,
+            'per_action_type': {
+                'pass':        _stats(gains_pass),
+                'real_bid':    _stats(gains_real),
+                'double':      _stats(gains_double),
+            },
+            'n_ew_steps': len(gains_all),
         }
 
-    def print_summary(self, result: dict, label_a: str = 'A (MAPPO)',
-                      label_b: str = 'B (MAPPO+r_info)'):
-        """打印对比摘要."""
-        print(f"\n  ── Head-to-Head: {label_b} vs {label_a} ──")
-        print(f"  {label_a:25s}: {result['mean_imp_a']:+.2f} ± {result['std_imp_a']:.2f} IMP")
-        print(f"  {label_b:25s}: {result['mean_imp_b']:+.2f} ± {result['std_imp_b']:.2f} IMP")
-        print(f"  Δ (B − A):               {result['mean_imp_diff']:+.2f} ± {result['std_imp_diff']:.2f} IMP")
-        print(f"  Win rate (B > A):         {result['win_rate_b']:.1%}")
-        print(f"  Tie rate (B = A):         {result['tie_rate']:.1%}")
-        print(f"  Lose rate (B < A):        {result['lose_rate_b']:.1%}")
-        print(f"  Deals evaluated:          {result['n_deals']}")
-        verdict = "✅ B WINS" if result['mean_imp_diff'] > 0 else "❌ A WINS / TIE"
-        print(f"  Verdict:                  {verdict}")
+        print(f"  [EW Belief Update] mean_gain={result['mean_ew_gain']:.4f} "
+              f"(pass={result['per_action_type']['pass']['mean']:.4f} "
+              f"real={result['per_action_type']['real_bid']['mean']:.4f} "
+              f"X={result['per_action_type']['double']['mean']:.4f}) "
+              f"n={result['n_ew_steps']}")
+        return result

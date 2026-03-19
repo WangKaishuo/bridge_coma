@@ -1,26 +1,31 @@
 """
-Policy and Value Networks
-=========================
+Policy and Value Networks — 301-dim MLP Architecture
+=====================================================
 
-Actor-Critic 网络架构 (P52 重构)
+对齐 README §3.1 / Kita et al. 2024.
 
-P52 变更:
-- 删除 HandEncoder / HistoryEncoder (LSTM)
-- 改用 MLP + 全局输入拼接 (Kita et al. 2024 风格)
-- history 编码: per-bid who-made-it binary (38×4=152 dims)
-  "哪个 player 叫了叫品 b" 对桥牌叫牌是充分且无损的编码,
-  因为叫牌严格单调递增且每个实质叫品在序列中最多出现一次.
-- 整体输入: 52 (hand) + 152 (history) + 4 (position) + 4 (vuln) = 212 dims
-  + belief_dim (可选, 默认0)
-- 网络深度: 4层 MLP × 1024 units, ReLU
+输入向量 (301 维，固定长度，无 LSTM):
+    vulnerability             :   4 维 (one-hot，4 种局况组合)
+    当前玩家手牌 (one-hot)     :  52 维
+    每个 bid 谁叫 (35 × 4)   : 140 维 — 4 维 one-hot，表示 N/E/S/W 谁叫
+    每个 bid 的加倍状态 (35×3): 105 维 — 3 维 one-hot，未加倍/加倍/再加倍
+    ─────────────────────────────────
+    合计                      : 301 维
 
-设计理由:
-  LSTM 在 Stayman/Competitive 子博弈中无额外价值:
-  - 序列极短 (≤12 token), 无长程依赖
-  - LSTM 两层占原 actor 74% 参数, 训练不稳定
-  - 全局拼接输入下 MLP 更快收敛, value loss 更稳定
+设计说明:
+    - 展开历史替代 LSTM: 批量 rollout 无需 padding，与 OpenSpiel 格式对齐
+    - 每个 bid 的"谁叫"信息天然编码叫牌顺序（位置蕴含轮次）
+    - 加倍状态用 35×3 one-hot，每个实质叫品独立被加倍/再加倍
+    - Actor: 4 × 1024 MLP + ReLU + 38 维 logits + action mask
+    - Critic: 同 Actor 结构，额外接收 AllHandsEncoder (4×52 → 256)
+
+Belief Network 保留 LSTM (推断任务叫牌顺序有语义).
+
+注: 旧的 HandEncoder/HistoryEncoder/PolicyNetwork 已废弃.
+    向后兼容别名保留在文件末尾.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,235 +33,304 @@ from typing import Dict, Tuple, Optional
 
 from env import NUM_BIDS, NUM_PLAYERS
 
-
 # ── 常量 ──────────────────────────────────────────────────────────────────────
-HAND_DIM     = 52           # one-hot 手牌
-HISTORY_DIM  = NUM_BIDS * NUM_PLAYERS   # 38×4 = 152, per-bid who-made-it
-POSITION_DIM = 4
-VULN_DIM     = 2
-BASE_INPUT_DIM = HAND_DIM + HISTORY_DIM + POSITION_DIM + VULN_DIM  # 210
+NUM_REAL_BIDS = 35      # 1C–7NT (bid index 3–37)
+OBS_DIM       = 301     # 4 + 52 + 35×4 + 35×3
 
 
-def encode_history_flat(history_obs: torch.Tensor) -> torch.Tensor:
+# ==============================================================================
+# 观测编码工具
+# ==============================================================================
+
+def encode_obs_flat(obs: Dict[str, np.ndarray], dealer: int, history_int: list) -> np.ndarray:
     """
-    将 (B, max_len, NUM_BIDS) one-hot 历史序列转换为
-    (B, NUM_BIDS × NUM_PLAYERS) who-made-it 二值向量.
+    将环境 obs 字典转换为 301 维固定向量.
 
-    对每个叫品 b: 找到历史中第一次叫 b 的位置 t,
-    则 player = (dealer + t) % 4.
-    由于叫牌单调递增, 每个实质叫品最多出现一次.
-    Pass (bid=0) 可被多家叫, 取最后一次 Pass 的 player (近似).
+    此函数在 rollout 时调用，由 SubgameTrainer 负责传入 dealer 和 history_int.
 
-    输出 shape: (B, NUM_BIDS * NUM_PLAYERS), 值为 0/1.
+    Args:
+        obs        : BridgeBiddingEnv._get_observation() 返回的字典
+        dealer     : 发牌人 (0=N, 1=E, 2=S, 3=W)，用于推算每步叫牌人
+        history_int: 当前完整叫牌历史（整数列表，包含 Pass/X/XX/实质叫品）
+
+    Returns:
+        flat: (301,) float32
+
+    注: 此函数在 Python 层逐样本调用，效率够用 (batch rollout 按环境并行，
+        而非按时间步并行)。如果需要批量编码，直接 stack 结果即可。
     """
-    B, T, _ = history_obs.shape
-    device = history_obs.device
+    vul  = obs['vulnerability']       # (2,) → 扩展为 (4,)
+    hand = obs['hand']                # (52,)
 
-    # (B, T) — 每步叫的是哪个 bid
-    bid_indices = history_obs.argmax(dim=-1)   # 0 = 全零padding (当作 Pass)
+    # vulnerability: 4 维 one-hot (4 种局况组合)
+    # 索引: 0=无, 1=NS有利, 2=EW有利, 3=双方有利
+    ns_vul, ew_vul = bool(vul[0] > 0.5), bool(vul[1] > 0.5)
+    vul4 = np.zeros(4, dtype=np.float32)
+    vul4[int(ns_vul) * 2 + int(ew_vul)] = 1.0
 
-    # 有效步 mask: history_obs.sum(dim=-1) > 0
-    valid = (history_obs.sum(dim=-1) > 0)      # (B, T)
+    # 只考虑 35 个实质叫品 (index 3–37 → 0–34)
+    who_called   = np.zeros((NUM_REAL_BIDS, 4),  dtype=np.float32)  # (35, 4)
+    double_state = np.zeros((NUM_REAL_BIDS, 3),  dtype=np.float32)  # (35, 3)
 
-    # 为每个时间步分配 player id (假设 dealer=NORTH=0, 轮流叫牌)
-    # player_at_step[t] = t % NUM_PLAYERS
-    step_ids = torch.arange(T, device=device) % NUM_PLAYERS  # (T,)
-    step_ids = step_ids.unsqueeze(0).expand(B, -1)            # (B, T)
+    # 追踪每个实质叫品的加倍状态
+    # double_state[i]: one-hot [未加倍, 已加倍, 已再加倍]
+    real_bid_indices = {}   # bid_int → real_idx (0-34)
 
-    # 结果: (B, NUM_BIDS, NUM_PLAYERS)
-    result = torch.zeros(B, NUM_BIDS, NUM_PLAYERS, device=device)
+    last_real_bid_real_idx = -1
 
-    for t in range(T):
-        mask = valid[:, t]                  # (B,)
-        bids = bid_indices[:, t]            # (B,)
-        players = step_ids[:, t]            # (B,) — 标量 player id
+    for step_idx, bid in enumerate(history_int):
+        caller = (dealer + step_idx) % NUM_PLAYERS
 
-        # scatter: result[b, bids[b], players[b]] = 1
-        # 用 scatter_ 实现批量赋值
-        b_idx = torch.arange(B, device=device)[mask]
-        if b_idx.numel() == 0:
-            continue
-        b_bids    = bids[mask]
-        b_players = players[mask]
-        result[b_idx, b_bids, b_players] = 1.0
+        if bid >= 3:  # 实质叫品 (1C=3 … 7NT=37)
+            real_idx = bid - 3  # 0–34
+            real_bid_indices[real_idx] = step_idx
+            who_called[real_idx, caller] = 1.0
+            double_state[real_idx, 0]   = 1.0   # 默认：未加倍
+            last_real_bid_real_idx = real_idx
 
-    return result.view(B, -1)   # (B, NUM_BIDS * NUM_PLAYERS)
+        elif bid == 1 and last_real_bid_real_idx >= 0:  # Double
+            ri = last_real_bid_real_idx
+            double_state[ri, 0] = 0.0
+            double_state[ri, 1] = 1.0
+
+        elif bid == 2 and last_real_bid_real_idx >= 0:  # Redouble
+            ri = last_real_bid_real_idx
+            double_state[ri, 1] = 0.0
+            double_state[ri, 2] = 1.0
+
+    flat = np.concatenate([
+        vul4,                           # 4
+        hand,                           # 52
+        who_called.flatten(),           # 140
+        double_state.flatten(),         # 105
+    ])
+    assert flat.shape == (OBS_DIM,), f"Expected {OBS_DIM}, got {flat.shape}"
+    return flat
 
 
-class PolicyNetwork(nn.Module):
+def batch_encode_obs(obs_list, dealers, history_ints):
+    """批量编码: 返回 (B, 301) float32 ndarray."""
+    return np.stack([
+        encode_obs_flat(o, d, h)
+        for o, d, h in zip(obs_list, dealers, history_ints)
+    ])
+
+
+def encode_history_flat(history: 'torch.Tensor') -> 'torch.Tensor':
     """
-    Actor 策略网络 (P52).
+    将叫牌历史序列压缩为固定维度向量，供 BeliefNetwork 使用.
 
-    输入 (全局拼接):
-      hand (52) + history_flat (152) + position (4) + vulnerability (2)
-      [+ belief (可选, 默认0)]
-    输出: (B, 38) logits
+    Args:
+        history: (B, max_len, NUM_BIDS) float32 one-hot tensor
 
-    belief_dim > 0 时接受 obs['belief'], stop-gradient.
-    架构支持任意 player 的双向 belief (N↔S, E↔W 等).
+    Returns:
+        flat: (B, NUM_BIDS * NUM_PLAYERS) float32
+
+    实现：对时间轴做 max-pool（判断每个 bid 是否出现过），
+    然后 tile NUM_PLAYERS 次构成固定向量。
+    BeliefNetwork 的 input_dim = 52 + NUM_BIDS*NUM_PLAYERS + 32 + 32 = 268。
+    """
+    import torch
+    bid_presence = history.max(dim=1).values   # (B, NUM_BIDS)
+    return bid_presence.repeat(1, NUM_PLAYERS)  # (B, NUM_BIDS * NUM_PLAYERS)
+
+
+# ==============================================================================
+# AllHandsEncoder  (仅 Critic 使用)
+# ==============================================================================
+
+class AllHandsEncoder(nn.Module):
+    """
+    集中式 Critic 专用: 将全局 4 张手牌编码为 256 维向量.
+
+    输入:  (batch, 4, 52) float32
+    输出:  (batch, 256)
     """
 
-    def __init__(self, hidden_dim: int = 1024, num_layers: int = 4,
-                 belief_dim: int = 0):
+    def __init__(self, output_dim: int = 256):
         super().__init__()
-        self.belief_dim = belief_dim
-        input_dim = BASE_INPUT_DIM + belief_dim
+        self.net = nn.Sequential(
+            nn.Linear(4 * 52, 512),
+            nn.ReLU(),
+            nn.Linear(512, output_dim),
+            nn.ReLU(),
+        )
 
-        layers = []
-        in_dim = input_dim
-        for _ in range(num_layers - 1):
-            layers += [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
-            in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, NUM_BIDS))
-        self.net = nn.Sequential(*layers)
+    def forward(self, all_hands: torch.Tensor) -> torch.Tensor:
+        # all_hands: (batch, 4, 52)
+        return self.net(all_hands.view(all_hands.size(0), -1))
 
-    def _build_input(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        hist_flat = encode_history_flat(obs['history'])
-        parts = [obs['hand'], hist_flat, obs['position'], obs['vulnerability']]
-        if self.belief_dim > 0:
-            if 'belief' in obs:
-                parts.append(obs['belief'].detach())
-            else:
-                parts.append(torch.zeros(
-                    obs['hand'].shape[0], self.belief_dim,
-                    device=obs['hand'].device, dtype=obs['hand'].dtype))
-        return torch.cat(parts, dim=-1)
 
-    def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        return self.net(self._build_input(obs))
+# ==============================================================================
+# MLPPolicyNetwork  (Actor)
+# ==============================================================================
 
-    def get_action(self, obs, deterministic=False):
-        logits = self.forward(obs)
-        mask   = obs['legal_actions']
-        logits = logits - 1e9 * (1 - mask)
+class MLPPolicyNetwork(nn.Module):
+    """
+    Actor 网络: 4 × 1024 MLP, 输入 301 维固定向量.
+
+    输入: flat_obs (batch, 301)  +  legal_actions (batch, 38)
+    输出: logits (batch, 38)，已 mask 非法动作
+
+    get_action / evaluate_actions 接口与旧 PolicyNetwork 兼容.
+    """
+
+    def __init__(self, obs_dim: int = OBS_DIM, hidden_dim: int = 1024,
+                 num_actions: int = NUM_BIDS):
+        super().__init__()
+        self.obs_dim     = obs_dim
+        self.num_actions = num_actions
+
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_actions),
+        )
+
+    def _masked_logits(self, flat_obs: torch.Tensor,
+                       legal_actions: torch.Tensor) -> torch.Tensor:
+        logits = self.net(flat_obs)
+        return logits - 1e9 * (1.0 - legal_actions)
+
+    def forward(self, flat_obs: torch.Tensor,
+                legal_actions: torch.Tensor) -> torch.Tensor:
+        """返回 masked logits."""
+        return self._masked_logits(flat_obs, legal_actions)
+
+    def get_action(
+        self,
+        flat_obs: torch.Tensor,
+        legal_actions: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        采样动作.
+
+        Returns:
+            action   : (batch,) int64
+            log_prob : (batch,) float32
+            entropy  : (batch,) float32
+        """
+        logits = self._masked_logits(flat_obs, legal_actions)
         probs  = F.softmax(logits, dim=-1)
         dist   = torch.distributions.Categorical(probs)
-        action = logits.argmax(dim=-1) if deterministic else dist.sample()
+
+        if deterministic:
+            action = logits.argmax(dim=-1)
+        else:
+            action = dist.sample()
+
         return action, dist.log_prob(action), dist.entropy()
 
-    def evaluate_actions(self, obs, actions):
-        logits = self.forward(obs)
-        mask   = obs['legal_actions']
-        logits = logits - 1e9 * (1 - mask)
+    def evaluate_actions(
+        self,
+        flat_obs: torch.Tensor,
+        legal_actions: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        评估已有动作的 log_prob 和 entropy (PPO update 用).
+
+        Returns:
+            log_prob : (batch,)
+            entropy  : (batch,)
+        """
+        logits = self._masked_logits(flat_obs, legal_actions)
         probs  = F.softmax(logits, dim=-1)
         dist   = torch.distributions.Categorical(probs)
         return dist.log_prob(actions), dist.entropy()
 
 
+# ==============================================================================
+# MLPValueNetwork  (Critic)
+# ==============================================================================
 
-class PopArtLayer(nn.Module):
+class MLPValueNetwork(nn.Module):
     """
-    PopArt 自适应 value 归一化层 (Yu et al. 2021, MAPPO Suggestion #1).
+    Critic 网络: 4 × 1024 MLP + 可选 AllHandsEncoder (CTDE).
 
-    原理:
-      - 维护 returns 的 running mean μ 和 std σ
-      - critic 在归一化空间 [-3,3] 内学习, 避免 value scale 随 reward 分布漂移
-      - 每次更新 μ/σ 时同步调整线性层权重, 保证去归一化输出不变 (Art步骤)
-      - forward 返回去归一化值 (供 GAE 使用); normalized_forward 返回归一化值 (供 loss 使用)
-
-    Phase 切换时 value landscape 剧变 → 原始 critic 的 vl 会从 0.07 跳到 2.8.
-    PopArt 自动吸收这个 scale 变化, vl 始终在 [0, 1] 附近.
-    """
-
-    def __init__(self, in_features: int, beta: float = 3e-4, epsilon: float = 1e-5):
-        super().__init__()
-        self.linear = nn.Linear(in_features, 1)
-        self.beta    = beta       # running stats 更新速率
-        self.epsilon = epsilon
-
-        # running stats (non-trainable buffers)
-        self.register_buffer('mu',    torch.zeros(1))
-        self.register_buffer('nu',    torch.ones(1))   # E[x²], 用于计算 σ
-        self.register_buffer('sigma', torch.ones(1))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """返回去归一化 value (用于 GAE bootstrap)."""
-        return self.linear(x).squeeze(-1) * self.sigma + self.mu
-
-    def normalized_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """返回归一化 value (用于 loss 计算)."""
-        return self.linear(x).squeeze(-1)
-
-    def normalize_target(self, targets: torch.Tensor) -> torch.Tensor:
-        """将 returns 归一化为训练目标."""
-        return (targets - self.mu) / (self.sigma + self.epsilon)
-
-    @torch.no_grad()
-    def update_stats(self, targets: torch.Tensor):
-        """
-        用新一批 returns 更新 μ/σ, 并同步调整线性层权重 (Art步骤).
-
-        调用时机: 每次 critic 更新前 (在 critic_warmup_step 和 safe_update 里).
-        """
-        batch_mean = targets.mean()
-        batch_sq   = (targets ** 2).mean()
-
-        old_sigma = self.sigma.clone()
-        old_mu    = self.mu.clone()
-
-        # EMA 更新
-        self.mu.copy_((1 - self.beta) * self.mu + self.beta * batch_mean)
-        self.nu.copy_((1 - self.beta) * self.nu + self.beta * batch_sq)
-        self.sigma.copy_(
-            torch.clamp((self.nu - self.mu ** 2).sqrt(), min=self.epsilon)
-        )
-
-        # Art: 同步调整权重, 保证去归一化输出在更新前后连续
-        # w_new = w_old * old_sigma / new_sigma
-        # b_new = (b_old * old_sigma + old_mu - new_mu) / new_sigma
-        if old_sigma.item() > self.epsilon:
-            scale = old_sigma / self.sigma
-            self.linear.weight.data.mul_(scale)
-            self.linear.bias.data.mul_(scale)
-            self.linear.bias.data.add_((old_mu - self.mu) / self.sigma)
-
-
-class ValueNetwork(nn.Module):
-    """
-    Critic 价值网络 (P52).
-
-    集中式 (CTDE): 接收 all_hands (4×52) 展平后拼入输入.
-    输入: hand(52) + history_flat(152) + position(4) + vuln(2) + all_hands(208) = 418
+    输入:
+        flat_obs  : (batch, 301)
+        all_hands : (batch, 4, 52)  — 仅 centralized=True 时需要
+    输出:
+        value     : (batch,)
     """
 
-    def __init__(self, hidden_dim: int = 1024, num_layers: int = 4,
+    def __init__(self, obs_dim: int = OBS_DIM, hidden_dim: int = 1024,
                  centralized: bool = True):
         super().__init__()
         self.centralized = centralized
-        input_dim = BASE_INPUT_DIM
+
         if centralized:
-            input_dim += 4 * HAND_DIM   # 208
+            self.all_hands_encoder = AllHandsEncoder(output_dim=256)
+            input_dim = obs_dim + 256
+        else:
+            input_dim = obs_dim
 
-        # 主干: (num_layers-1) 层 MLP, 最后一层用 PopArtLayer 替代普通 Linear
-        layers = []
-        in_dim = input_dim
-        for _ in range(num_layers - 1):
-            layers += [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
-            in_dim = hidden_dim
-        self.trunk = nn.Sequential(*layers)
-        self.popart = PopArtLayer(in_dim)   # 替代原来的 nn.Linear(in_dim, 1)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
-    def _featurize(self, obs: Dict[str, torch.Tensor],
-                   all_hands: Optional[torch.Tensor] = None) -> torch.Tensor:
-        hist_flat = encode_history_flat(obs['history'])
-        parts = [obs['hand'], hist_flat, obs['position'], obs['vulnerability']]
-        if self.centralized and all_hands is not None:
-            B = all_hands.shape[0]
-            parts.append(all_hands.view(B, -1))
-        return self.trunk(torch.cat(parts, dim=-1))
-
-    def forward(self, obs: Dict[str, torch.Tensor],
+    def forward(self, flat_obs: torch.Tensor,
                 all_hands: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """返回去归一化 value (供 GAE bootstrap / collect_episodes 使用)."""
-        return self.popart(self._featurize(obs, all_hands))
+        if self.centralized and all_hands is not None:
+            hand_feat = self.all_hands_encoder(all_hands)
+            x = torch.cat([flat_obs, hand_feat], dim=-1)
+        else:
+            x = flat_obs
 
-    def normalized_forward(self, obs: Dict[str, torch.Tensor],
-                           all_hands: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """返回归一化 value (供 loss 计算使用)."""
-        return self.popart.normalized_forward(self._featurize(obs, all_hands))
+        return self.net(x).squeeze(-1)
 
-    def normalize_target(self, targets: torch.Tensor) -> torch.Tensor:
-        return self.popart.normalize_target(targets)
 
-    def update_stats(self, targets: torch.Tensor):
-        self.popart.update_stats(targets)
+# ==============================================================================
+# 向后兼容别名 (旧代码使用 PolicyNetwork / ValueNetwork / ActorCritic)
+# ==============================================================================
+
+PolicyNetwork = MLPPolicyNetwork
+ValueNetwork  = MLPValueNetwork
+
+
+class ActorCritic(nn.Module):
+    """
+    向后兼容容器.
+
+    新代码应直接使用 MLPPolicyNetwork + MLPValueNetwork.
+    此类仅供不想改调用方的旧接口使用.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int = OBS_DIM,
+        hidden_dim: int = 1024,
+        centralized_critic: bool = True,
+        **_ignored,
+    ):
+        super().__init__()
+        self.actor  = MLPPolicyNetwork(obs_dim, hidden_dim)
+        self.critic = MLPValueNetwork(obs_dim, hidden_dim, centralized_critic)
+
+    def get_action_and_value(
+        self,
+        flat_obs: torch.Tensor,
+        legal_actions: torch.Tensor,
+        all_hands: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        action, log_prob, entropy = self.actor.get_action(
+            flat_obs, legal_actions, deterministic)
+        value = self.critic(flat_obs, all_hands)
+        return action, log_prob, entropy, value
