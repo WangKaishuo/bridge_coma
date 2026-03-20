@@ -539,8 +539,6 @@ class SubgameTrainer:
         """
         from subgames.competitive_env import CompetitiveSubgameEnv
 
-        dealer = self.env.dealer  # NORTH
-
         # ── 初始化 batch_size 个独立环境 ────────────────────────────────
         envs = [CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
                 for _ in range(batch_size)]
@@ -548,25 +546,28 @@ class SubgameTrainer:
             e.loader          = self.env.loader
             e.env             = __import__('env', fromlist=['BridgeBiddingEnv']).BridgeBiddingEnv(60)
             e.max_history_len = 60
-            e.dealer          = dealer
+            e.dealer          = NORTH
+            e._sampled_dealer  = NORTH
             e._is_constrained_data = self.env._is_constrained_data
             e._filtered_deals      = self.env._filtered_deals
             e._current_hands = None; e._current_dd = None
             e._vulnerability = (False, False); e.history_int = []
 
-        slot_obs  = [None] * batch_size
-        slot_hist = [None] * batch_size
-        slot_ep   = [[]   for _ in range(batch_size)]
-        slot_done = [True] * batch_size
+        slot_obs    = [None] * batch_size
+        slot_hist   = [None] * batch_size
+        slot_dealer = [NORTH] * batch_size   # per-slot dealer (set on reset)
+        slot_ep     = [[]   for _ in range(batch_size)]
+        slot_done   = [True] * batch_size
 
         all_episodes: List[List[dict]] = []
         collected = 0
 
         def _reset(i):
             obs = envs[i].reset()
-            slot_hist[i] = list(envs[i].history_int)
-            slot_ep[i]   = []
-            slot_done[i] = False
+            slot_hist[i]   = list(envs[i].history_int)
+            slot_dealer[i] = envs[i].dealer   # dealer chosen by generate_deal()
+            slot_ep[i]     = []
+            slot_done[i]   = False
             return obs
 
         slot_obs = [_reset(i) for i in range(batch_size)]
@@ -616,7 +617,7 @@ class SubgameTrainer:
                                      role.replace('actor','critic'))
 
                 flat_batch  = np.stack([
-                    encode_obs_flat(slot_obs[i], dealer, slot_hist[i])
+                    encode_obs_flat(slot_obs[i], slot_dealer[i], slot_hist[i])
                     for i in slots])
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
@@ -649,8 +650,10 @@ class SubgameTrainer:
                 }
 
                 # Belief 数据记录
+                _dealer_i      = slot_dealer[i]
+                opener_seats_i = {_dealer_i, (_dealer_i + 2) % 4}
                 if self.belief_net is not None:
-                    if player in (NORTH, SOUTH):
+                    if player in opener_seats_i:
                         partner = (player + 2) % 4
                         step.update({
                             'observer_hand': all_hands[player],
@@ -660,18 +663,19 @@ class SubgameTrainer:
                             'history_int_before': slot_hist[i][:],
                         })
                     else:
+                        observer = _dealer_i
                         step.update({
                             'ew_diagnostic': True,
-                            'observer_hand': all_hands[NORTH],
+                            'observer_hand': all_hands[observer],
                             'history':       self._encode_history(slot_hist[i]),
-                            'observer_pos':  NORTH, 'target_pos': player,
+                            'observer_pos':  observer, 'target_pos': player,
                             'belief_target': hand_to_belief_target(all_hands[player]),
                             'history_int_before': slot_hist[i][:],
                         })
 
                 slot_hist[i].append(action)
                 if self.belief_net is not None:
-                    if player in (NORTH, SOUTH) or step.get('ew_diagnostic'):
+                    if player in opener_seats_i or step.get('ew_diagnostic'):
                         step['history_int_after'] = slot_hist[i][:]
 
                 # CompetitiveSubgameEnv.step() 正确计算 DDS oracle reward
@@ -704,7 +708,6 @@ class SubgameTrainer:
             all_hands, player, [belief_target, observer_hand, history, ...]
         """
         episodes   = []
-        dealer     = self.env.dealer  # NORTH (固定)
 
         # FSP: 如果有对手 snapshot，临时加载到 EW actor
         fsp_sd     = fsp_state_dict
@@ -713,6 +716,7 @@ class SubgameTrainer:
 
         for _ in range(num_deals):
             hands, dd_table = self.env.generate_deal()
+            dealer = self.env.dealer   # set by generate_deal() via _sampled_dealer
             vul = (False, False)
 
             obs  = self.env.reset(hands, dd_table, vulnerability=vul)
@@ -736,7 +740,8 @@ class SubgameTrainer:
                 ah_t    = torch.tensor(all_hands,      dtype=torch.float32
                                        ).unsqueeze(0).to(self.device)
 
-                is_opponent = (player in (EAST, WEST))
+                overcaller_seats = {(dealer + 1) % 4, (dealer + 3) % 4}
+                is_opponent = (player in overcaller_seats)
                 if is_opponent and fsp_sd is not None:
                     # 临时加载 FSP snapshot 到 EW actor（只用于 get_action）
                     actor = self._get_fsp_actor(player, fsp_sd)
@@ -762,9 +767,10 @@ class SubgameTrainer:
                 }
 
                 # ── Belief 数据记录 ──────────────────────────────────────
+                opener_seats     = {dealer, (dealer + 2) % 4}
                 if self.belief_net is not None:
-                    if player in (NORTH, SOUTH):
-                        # NS 决策步骤：记录完整 r_info 所需数据
+                    if player in opener_seats:
+                        # 开叫方阵营决策步骤：记录完整 r_info 所需数据
                         partner = (player + 2) % 4
                         step.update({
                             'observer_hand':      all_hands[player],
@@ -775,13 +781,13 @@ class SubgameTrainer:
                             'history_int_before': history_int[:],
                         })
                     else:
-                        # EW 决策步骤：记录 NS 视角对 EW 手牌推断的诊断数据
-                        # 不参与 r_info 奖励，仅供 evaluate_ew_belief_update() 使用
+                        # 争叫方决策步骤：记录开叫方视角对争叫方手牌推断的诊断数据
+                        observer = dealer   # opener = observer for EW diagnostic
                         step.update({
                             'ew_diagnostic':      True,
-                            'observer_hand':      all_hands[NORTH],
+                            'observer_hand':      all_hands[observer],
                             'history':            self._encode_history(history_int),
-                            'observer_pos':       NORTH,
+                            'observer_pos':       observer,
                             'target_pos':         player,
                             'belief_target':      hand_to_belief_target(all_hands[player]),
                             'history_int_before': history_int[:],
@@ -791,7 +797,7 @@ class SubgameTrainer:
 
                 # 补充 history_int_after
                 if self.belief_net is not None:
-                    if player in (NORTH, SOUTH) or step.get('ew_diagnostic'):
+                    if player in opener_seats or step.get('ew_diagnostic'):
                         step['history_int_after'] = history_int[:]
                 obs, reward, done, info = self.env.step(action.item())
 
@@ -1169,12 +1175,14 @@ class SubgameTrainer:
         """
         DDS oracle 评估（主要指标）.
 
-        IMP regret = actual_imp - dds_optimal_imp  (≤ 0，越高越好)
+        IMP regret = score_to_imp(score_ns − dds_optimal)  (≤ 0，越高越好)
+        使用 make_dynamic_agent_policy：每局从 env.dealer 读取当前 dealer，
+        encode_obs_flat 始终正确（dealer rotation 感知）。
         """
         from subgames.competitive_env import (
-            dds_oracle_evaluate, make_agent_policy
+            dds_oracle_evaluate, make_dynamic_agent_policy
         )
-        policy = make_agent_policy(self.agent, deterministic=True)
+        policy = make_dynamic_agent_policy(self.agent, self.env, deterministic=True)
         result = dds_oracle_evaluate(self.env, policy, num_deals)
 
         print(f"\n  [Oracle Eval] mean_regret={result['mean_regret']:+.3f} "
@@ -1195,11 +1203,14 @@ class SubgameTrainer:
                 hands, dd_table = self.env.generate_deal()
                 obs  = self.env.reset(hands, dd_table)
                 done = False
-                hist = list(self.env.history_int)
+                hist   = list(self.env.history_int)
+                dealer = self.env.dealer                    # dynamic after generate_deal
+                opener = dealer                             # opener = dealer
+                partner_of_opener = (dealer + 2) % 4       # target for belief
 
                 while not done:
                     player   = self.env.current_player
-                    flat_obs = encode_obs_flat(obs, NORTH, hist)
+                    flat_obs = encode_obs_flat(obs, dealer, hist)
                     flat_t   = torch.tensor(flat_obs, dtype=torch.float32
                                             ).unsqueeze(0).to(self.device)
                     legal_t  = torch.tensor(obs['legal_actions'], dtype=torch.float32
@@ -1210,16 +1221,16 @@ class SubgameTrainer:
                     obs, _, done, _ = self.env.step(action.item())
 
                 h_enc = self._encode_history(hist)
-                oh    = torch.tensor(hands[NORTH], dtype=torch.float32
+                oh    = torch.tensor(hands[opener], dtype=torch.float32
                                      ).unsqueeze(0).to(self.device)
                 h_t   = torch.tensor(h_enc, dtype=torch.float32
                                      ).unsqueeze(0).to(self.device)
-                op    = torch.tensor([NORTH], dtype=torch.long).to(self.device)
-                tp    = torch.tensor([SOUTH], dtype=torch.long).to(self.device)
+                op    = torch.tensor([opener],            dtype=torch.long).to(self.device)
+                tp    = torch.tensor([partner_of_opener], dtype=torch.long).to(self.device)
 
                 probs  = self.belief_net.get_probs(oh, h_t, op, tp)
                 target = torch.tensor(
-                    hand_to_belief_target(hands[SOUTH]), dtype=torch.float32
+                    hand_to_belief_target(hands[partner_of_opener]), dtype=torch.float32
                 ).unsqueeze(0).to(self.device)
 
                 all_probs.append(probs)
@@ -1273,12 +1284,15 @@ class SubgameTrainer:
                 hands, dd_table = self.env.generate_deal()
                 obs  = self.env.reset(hands, dd_table)
                 done = False
-                hist = list(self.env.history_int)  # 含前缀
+                hist   = list(self.env.history_int)  # 含前缀
+                dealer = self.env.dealer
+                opener = dealer
+                overcaller_seats = {(dealer + 1) % 4, (dealer + 3) % 4}
 
                 while not done:
                     player  = self.env.current_player
                     flat_t  = torch.tensor(
-                        encode_obs_flat(obs, NORTH, hist),
+                        encode_obs_flat(obs, dealer, hist),
                         dtype=torch.float32).unsqueeze(0).to(self.device)
                     legal_t = torch.tensor(
                         obs['legal_actions'], dtype=torch.float32
@@ -1288,19 +1302,19 @@ class SubgameTrainer:
                     action, _, _ = actor.get_action(flat_t, legal_t, deterministic=True)
                     action_int = action.item()
 
-                    # 只在 EW 步骤计算诊断
-                    if player in (EAST, WEST):
+                    # 只在争叫方（EW）步骤计算诊断
+                    if player in overcaller_seats:
                         h_before = self._encode_history(hist)
                         hist_after = hist + [action_int]
                         h_after  = self._encode_history(hist_after)
 
-                        oh  = torch.tensor(hands[NORTH], dtype=torch.float32
+                        oh  = torch.tensor(hands[opener], dtype=torch.float32
                                            ).unsqueeze(0).to(self.device)
                         hb  = torch.tensor(h_before, dtype=torch.float32
                                            ).unsqueeze(0).to(self.device)
                         ha  = torch.tensor(h_after,  dtype=torch.float32
                                            ).unsqueeze(0).to(self.device)
-                        op  = torch.tensor([NORTH],  dtype=torch.long).to(self.device)
+                        op  = torch.tensor([opener], dtype=torch.long).to(self.device)
                         tp  = torch.tensor([player], dtype=torch.long).to(self.device)
                         tgt = torch.tensor(
                             hand_to_belief_target(hands[player]),
