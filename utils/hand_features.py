@@ -25,11 +25,13 @@ Hand Feature Extraction — 48-dim Belief Target
 - 每门花色内8档互斥，梯度信号干净，无跨维度干扰
 - 全部 48 维均为 0/1，BCEWithLogitsLoss 与 r_info 公式无需修改
 
-pos_weight
-----------
-统一设为 3.0。
-荣誉牌: P(持有) = 1/4 → 理论值恰好 = 3.0
-套长:   one-hot 互斥特性使类别不平衡影响较小，3.0 作为保守统一值
+pos_weight (P55 修正)
+---------------------
+荣誉牌 [0:16]:  P(持有) ≈ 1/4  →  pos_weight = 3.0  (neg/pos = 3)
+套长   [16:48]: P(正例) ≈ 1/8  →  pos_weight = 7.0  (neg/pos = 7)
+
+原来统一用 3.0 低估了套长正例的稀有程度，导致模型偏向预测全 0，
+length_acc 长期低于 0.40。分离 pos_weight 后梯度更平衡。
 """
 
 import numpy as np
@@ -42,12 +44,22 @@ LENGTH_DIM    = 32          # [16:48] one-hot套长 × 4门
 NUM_SUITS     = 4
 HONOR_RANKS   = [12, 11, 10, 9]    # A K Q J (rank index, 2=0, A=12)
 LENGTH_BINS   = 8                   # 0,1,2,3,4,5,6,7+
-POS_WEIGHT    = 3.0
+HONOR_POS_WEIGHT  = 3.0   # P(持有) ≈ 1/4 → neg/pos = 3
+LENGTH_POS_WEIGHT = 7.0   # P(正例) ≈ 1/8 → neg/pos = 7
+POS_WEIGHT    = HONOR_POS_WEIGHT   # backward-compat alias
 
 
 def build_pos_weight() -> torch.Tensor:
-    """构造 (48,) 统一 pos_weight tensor，传入 BCEWithLogitsLoss."""
-    return torch.full((BELIEF_DIM,), POS_WEIGHT)
+    """
+    构造 (48,) pos_weight tensor，传入 BCEWithLogitsLoss.
+
+    P55 修正: honor(前16维)=3.0，length(后32维)=7.0。
+    原来统一 3.0 低估了 length 正例稀有程度。
+    """
+    pw = torch.empty(BELIEF_DIM)
+    pw[:HONOR_DIM]  = HONOR_POS_WEIGHT
+    pw[HONOR_DIM:]  = LENGTH_POS_WEIGHT
+    return pw
 
 
 # ── 核心转换 ───────────────────────────────────────────────────────────────────
@@ -215,7 +227,8 @@ if __name__ == '__main__':
 
     pw = build_pos_weight()
     assert pw.shape == (BELIEF_DIM,)
-    assert (pw == POS_WEIGHT).all()
+    assert (pw[:HONOR_DIM] == HONOR_POS_WEIGHT).all()
+    assert (pw[HONOR_DIM:] == LENGTH_POS_WEIGHT).all()
 
-    print(f"pos_weight = {POS_WEIGHT} (uniform)")
+    print(f"pos_weight: honor={HONOR_POS_WEIGHT}, length={LENGTH_POS_WEIGHT}")
     print(f"All checks passed. BELIEF_DIM={BELIEF_DIM} ✓")

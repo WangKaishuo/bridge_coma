@@ -147,16 +147,19 @@ class DualInfoComputer:
         target_features: torch.Tensor,  # (batch, 48) 0/1
     ) -> torch.Tensor:
         """
-        信息增益 = CE(before, target) - CE(after, target)
-        用 mean(dim=-1) 归一化，消除维度数量对量纲的影响。
+        信息增益 = max(0, CE(before, target) - CE(after, target))
+
+        ReLU 截断保证非负：互信息 I(X;Y) ≥ 0。
+        Belief Net 未收敛时 CE 差值可能为负（随机噪声），
+        不截断会给 actor 加随机方向的噪声惩罚，破坏训练。
         """
         ce_before = F.binary_cross_entropy(
             belief_before, target_features, reduction='none'
-        ).mean(dim=-1)   # mean 而非 sum，归一化48维
+        ).mean(dim=-1)
         ce_after = F.binary_cross_entropy(
             belief_after, target_features, reduction='none'
         ).mean(dim=-1)
-        return ce_before - ce_after
+        return torch.relu(ce_before - ce_after)
 
     def compute_dual_info_bonus(
         self,

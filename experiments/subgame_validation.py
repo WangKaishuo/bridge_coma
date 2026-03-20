@@ -59,16 +59,16 @@ def run_competitive(args):
     print("\n[2] Building Agent A (MAPPO, β=0)...")
     cfg_a = SubgameConfig(
         num_rounds      = args.rounds,
-        steps_per_phase = 50 if args.quick else 200,
-        deals_per_step  = 32,
-        lr              = 1e-6,
+        steps_per_phase = 50 if args.quick else 100,   # P56: 200→100 (deals_per_step×4)
+        deals_per_step  = 32 if args.quick else 128,   # P56: 32→128, 4× larger batches
+        lr              = 3e-6,
         batch_size      = 256,
         use_info_bonus  = False,
         beta            = 0.0,
         fsp_pool_size   = 10,
         fsp_add_interval= 2,
-        kl_lambda_start = 0.5,
-        kl_lambda_end   = 0.1,
+        kl_lambda_start = 0.1,
+        kl_lambda_end   = 0.01,
         bc_warmup_samples= 1000 if args.quick else 5000,
         bc_warmup_epochs = 5   if args.quick else 20,
         device          = device,
@@ -80,16 +80,16 @@ def run_competitive(args):
     print(f"\n[3] Building Agent B (MAPPO + r_info, β={args.beta})...")
     cfg_b = SubgameConfig(
         num_rounds      = args.rounds,
-        steps_per_phase = 50 if args.quick else 200,
-        deals_per_step  = 32,
-        lr              = 1e-6,
+        steps_per_phase = 50 if args.quick else 100,   # P56: same as A
+        deals_per_step  = 32 if args.quick else 128,   # P56: same as A
+        lr              = 3e-6,
         batch_size      = 256,
         use_info_bonus  = True,
         beta            = args.beta,
         fsp_pool_size   = 10,
         fsp_add_interval= 2,
-        kl_lambda_start = 0.5,
-        kl_lambda_end   = 0.1,
+        kl_lambda_start = 0.1,
+        kl_lambda_end   = 0.01,
         bc_warmup_samples= 1000 if args.quick else 5000,
         bc_warmup_epochs = 5   if args.quick else 20,
         device          = device,
@@ -121,6 +121,21 @@ def run_competitive(args):
     trainer_b.set_bc_anchor(trainer_b.agent)
     print("  [KL Anchor] BC anchor set for both agents.")
 
+    # ── Stage 1.5: Belief Net 独立预训练（Agent B only）─────────────────────
+    belief_pretrain_rounds = getattr(args, 'belief_pretrain_rounds', 5)
+    if belief_pretrain_rounds > 0 and trainer_b.belief_net is not None:
+        # num_rounds × deals_per_round = 总数据量
+        # 训练到 early stopping，不再按轮数固定 epoch 数
+        deals = 200 if args.quick else 2000
+        print(f"\n[Stage 1.5] Belief Net Pretrain "
+              f"(total {belief_pretrain_rounds * deals} deals, early stopping)...")
+        trainer_b.pretrain_belief(
+            num_rounds=belief_pretrain_rounds,
+            deals_per_round=deals,
+            epochs_per_round=5,
+            max_epochs=getattr(args, 'belief_pretrain_max_epochs', 300),
+        )
+
     # ── Stage 2: RL 微调 ────────────────────────────────────────────────────
     print("\n[Stage 2] RL Fine-tuning...")
     print("  ── Agent A ──")
@@ -131,42 +146,80 @@ def run_competitive(args):
 
     # ── Stage 3: 评估 ───────────────────────────────────────────────────────
     print("\n[Stage 3] Evaluation...")
+    eval_deals = 200 if args.quick else 1000
 
     print("\n  → DDS Oracle Evaluation (Agent A):")
-    result_a = trainer_a.evaluate_oracle(num_deals=200 if args.quick else 1000)
+    result_a = trainer_a.evaluate_oracle(num_deals=eval_deals)
 
     print("\n  → DDS Oracle Evaluation (Agent B):")
-    result_b = trainer_b.evaluate_oracle(num_deals=200 if args.quick else 1000)
+    result_b = trainer_b.evaluate_oracle(num_deals=eval_deals)
 
-    # 打印对比
-    _print_comparison(result_a, result_b)
+    _print_oracle_comparison(result_a, result_b)
+
+    # ── Head-to-head: A vs B 直接对战 ──────────────────────────────────────
+    print("\n  → Head-to-Head: Agent A vs Agent B")
+    h2h_deals = 200 if args.quick else 500
+    h2h = trainer_a.evaluate_head_to_head(
+        trainer_b,
+        num_deals=h2h_deals,
+        label_self="A",
+        label_other="B",
+    )
 
     # Belief Net 评估（Agent B only）
     if cfg_b.use_info_bonus:
         print("\n  → Belief Network Evaluation (Agent B):")
-        trainer_b.evaluate_belief(num_deals=50 if args.quick else 100)
+        trainer_b.evaluate_belief(num_deals=50 if args.quick else 200)
 
     # ── 排雷诊断 ────────────────────────────────────────────────────────────
     print("\n[Diagnostics]")
     _print_diagnostics(log_a, log_b, cfg_b)
 
+    # ── 最终摘要 ────────────────────────────────────────────────────────────
+    print("\n" + "═" * 60)
+    print("  FINAL SUMMARY")
+    print("═" * 60)
+    print(f"  Oracle regret  A: {result_a['mean_regret']:+.3f} ± {result_a['std_regret']:.3f} IMP")
+    print(f"  Oracle regret  B: {result_b['mean_regret']:+.3f} ± {result_b['std_regret']:.3f} IMP")
+    print(f"  Δ oracle (B−A):   {result_b['mean_regret'] - result_a['mean_regret']:+.3f} IMP")
+    print(f"  Head-to-head A IMP: {h2h['mean_imp']:+.3f} ± {h2h['std_imp']:.3f}  "
+          f"win_rate={h2h['win_rate']:.1%}  p={h2h['p_value']:.3f} "
+          f"{'✅ sig' if h2h['significant'] else '(ns)'}")
+    conclusion = (
+        "✅ B significantly better than A"
+        if (h2h['mean_imp'] < 0 and h2h['significant'])
+        else "❌ No significant difference" if not h2h['significant']
+        else "⚠️  A outperforms B"
+    )
+    print(f"  Conclusion: {conclusion}")
+    print("═" * 60)
+
     # ── 保存 checkpoint ─────────────────────────────────────────────────────
     if args.save_dir:
+        import json
         os.makedirs(args.save_dir, exist_ok=True)
         trainer_a.agent.save(os.path.join(args.save_dir, f'agent_a_seed{args.seed}.pt'))
         trainer_b.agent.save(os.path.join(args.save_dir, f'agent_b_seed{args.seed}.pt'))
-        print(f"\n  Checkpoints saved → {args.save_dir}")
+        report = {
+            'seed': args.seed, 'beta': args.beta, 'rounds': args.rounds,
+            'oracle_a': result_a, 'oracle_b': result_b,
+            'head_to_head': h2h,
+        }
+        report_path = os.path.join(args.save_dir, f'report_seed{args.seed}.json')
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        print(f"\n  Checkpoints + report saved → {args.save_dir}")
 
 
-def _print_comparison(result_a: dict, result_b: dict):
-    print("\n  ── IMP Regret vs DDS Oracle ──")
+def _print_oracle_comparison(result_a: dict, result_b: dict):
+    print("\n  ── DDS Oracle Regret Comparison ──")
     print(f"  Agent A: {result_a['mean_regret']:+.3f} ± {result_a['std_regret']:.3f} IMP"
           f"  95% CI [{result_a['ci_lo']:+.3f}, {result_a['ci_hi']:+.3f}]")
     print(f"  Agent B: {result_b['mean_regret']:+.3f} ± {result_b['std_regret']:.3f} IMP"
           f"  95% CI [{result_b['ci_lo']:+.3f}, {result_b['ci_hi']:+.3f}]")
     delta = result_b['mean_regret'] - result_a['mean_regret']
-    verdict = "✅ B better" if delta > 0 else "❌ A better / tie"
-    print(f"  Δ (B − A): {delta:+.3f} IMP  → {verdict}")
+    verdict = "B closer to oracle" if delta > 0 else "A closer to oracle / tie"
+    print(f"  Δ oracle (B−A): {delta:+.3f} IMP  → {verdict}")
 
 
 def _print_diagnostics(log_a: list, log_b: list, cfg_b: SubgameConfig):
@@ -237,10 +290,14 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--beta', type=float, default=0.05,
                         help='Agent B r_info coefficient')
-    parser.add_argument('--rounds', type=int, default=10,
-                        help='Number of IBR rounds')
+    parser.add_argument('--rounds', type=int, default=30,
+                        help='Number of IBR rounds (default: 30)')
     parser.add_argument('--quick', action='store_true',
-                        help='Quick mode: fewer deals/deals for debugging')
+                        help='Quick mode: fewer deals for debugging')
+    parser.add_argument('--belief_pretrain_rounds', type=int, default=5,
+                        help='Rounds of data collection for Belief Net pretrain (default: 5, total_deals=rounds×2000)')
+    parser.add_argument('--belief_pretrain_max_epochs', type=int, default=300,
+                        help='Max training epochs for Belief Net pretrain (default: 300)')
     parser.add_argument('--sl_checkpoint', default='results/sl_base.pt',
                         help='SL pretrained checkpoint (4-actor format from sl_pretrain.py)')
     parser.add_argument('--save_dir', default='results/competitive',
