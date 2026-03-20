@@ -97,12 +97,26 @@ def run_competitive(args):
     reward_stats_b = RunningStats()
     trainer_b = SubgameTrainer(env, cfg_b, reward_stats=reward_stats_b)
 
-    # ── Stage 1: BC 预热（rule-based，~5k 局）────────────────────────────────
-    print("\n[Stage 1] BC Warmup (rule-based)...")
-    trainer_a.run_bc_warmup()
-    trainer_b.run_bc_warmup()
+    # ── Stage 1: 初始化（SL checkpoint 优先，否则 rule-based BC）──────────────
+    from env import NORTH as _N, EAST as _E, SOUTH as _S, WEST as _W
+    sl_path = getattr(args, 'sl_checkpoint', None)
+    if sl_path and os.path.exists(sl_path):
+        print(f"\n[Stage 1] Loading SL checkpoint: {sl_path}")
+        ckpt = torch.load(sl_path, map_location=device)
+        player_key_map = [(_N, 'actor_n'), (_E, 'actor_e'),
+                          (_S, 'actor_s'), (_W, 'actor_w')]
+        for trainer in (trainer_a, trainer_b):
+            for player, key in player_key_map:
+                if key in ckpt:
+                    trainer.agent.get_actor(player).load_state_dict(
+                        {k: v.to(device) for k, v in ckpt[key].items()})
+        print("  [SL Init] Weights loaded for N/E/S/W actors (both agents).")
+    else:
+        print("\n[Stage 1] BC Warmup (rule-based, SL checkpoint not found)...")
+        trainer_a.run_bc_warmup()
+        trainer_b.run_bc_warmup()
 
-    # BC 结束后，将当前 actor 设为 KL anchor
+    # Stage 1 结束：将当前 actor 设为 KL anchor
     trainer_a.set_bc_anchor(trainer_a.agent)
     trainer_b.set_bc_anchor(trainer_b.agent)
     print("  [KL Anchor] BC anchor set for both agents.")
@@ -227,6 +241,8 @@ def parse_args():
                         help='Number of IBR rounds')
     parser.add_argument('--quick', action='store_true',
                         help='Quick mode: fewer deals/deals for debugging')
+    parser.add_argument('--sl_checkpoint', default='results/sl_base.pt',
+                        help='SL pretrained checkpoint (4-actor format from sl_pretrain.py)')
     parser.add_argument('--save_dir', default='results/competitive',
                         help='Directory to save checkpoints')
     return parser.parse_args()
