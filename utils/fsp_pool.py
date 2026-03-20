@@ -56,15 +56,9 @@ class FSPPool:
         Args:
             agent: MAPPOAgent，需有 .model.actor_n / .model.actor_s 属性
         """
-        snapshot = {
-            'actor_n': copy.deepcopy(agent.model.actor_n.state_dict()),
-            'actor_s': copy.deepcopy(agent.model.actor_s.state_dict()),
-            # EW 阵营也需要（competitive 子博弈中 EW 是对手）
-            'actor_e': copy.deepcopy(
-                getattr(agent.model, 'actor_e', agent.model.actor_n).state_dict()),
-            'actor_w': copy.deepcopy(
-                getattr(agent.model, 'actor_w', agent.model.actor_s).state_dict()),
-        }
+        snapshot = {}
+        for role in ('actor_n', 'actor_s', 'actor_e', 'actor_w'):
+            snapshot[role] = copy.deepcopy(getattr(agent.model, role).state_dict())
         # 将所有 tensor 移到 CPU，避免 GPU 显存占用
         snapshot = {
             role: {k: v.cpu() for k, v in sd.items()}

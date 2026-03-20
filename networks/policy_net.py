@@ -34,8 +34,9 @@ from typing import Dict, Tuple, Optional
 from env import NUM_BIDS, NUM_PLAYERS
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
-NUM_REAL_BIDS = 35      # 1C–7NT (bid index 3–37)
-OBS_DIM       = 301     # 4 + 52 + 35×4 + 35×3
+NUM_REAL_BIDS  = 35      # 1C–7NT (bid index 3–37)
+OBS_DIM        = 301     # 4 + 52 + 35×4 + 35×3
+BASE_INPUT_DIM = OBS_DIM  # 向后兼容别名
 
 
 # ==============================================================================
@@ -116,7 +117,7 @@ def batch_encode_obs(obs_list, dealers, history_ints):
     ])
 
 
-def encode_history_flat(history: 'torch.Tensor') -> 'torch.Tensor':
+def encode_history_flat(history: torch.Tensor) -> torch.Tensor:
     """
     将叫牌历史序列压缩为固定维度向量，供 BeliefNetwork 使用.
 
@@ -128,9 +129,8 @@ def encode_history_flat(history: 'torch.Tensor') -> 'torch.Tensor':
 
     实现：对时间轴做 max-pool（判断每个 bid 是否出现过），
     然后 tile NUM_PLAYERS 次构成固定向量。
-    BeliefNetwork 的 input_dim = 52 + NUM_BIDS*NUM_PLAYERS + 32 + 32 = 268。
+    BeliefNetwork input_dim = 52 + NUM_BIDS*NUM_PLAYERS + 32 + 32 = 268。
     """
-    import torch
     bid_presence = history.max(dim=1).values   # (B, NUM_BIDS)
     return bid_presence.repeat(1, NUM_PLAYERS)  # (B, NUM_BIDS * NUM_PLAYERS)
 

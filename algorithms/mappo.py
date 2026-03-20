@@ -124,32 +124,24 @@ class MAPPORolloutBuffer(RolloutBuffer):
 
 class _HAPPOModel(nn.Module):
     """
-    HAPPO 模型容器.
+    HAPPO 模型容器: actor_n/s/e/w + critic_n/s/e/w 八个独立子网络.
 
-    包含 actor_n, actor_s, critic_n, critic_s 四个独立子网络.
-
-    新 API（对齐 MLPPolicyNetwork）:
-        actor.get_action(flat_obs, legal_actions, deterministic)
-        critic(flat_obs, all_hands)
-
-    向后兼容别名:
-        model.actor  → actor_s
-        model.critic → critic_s
+    NS 和 EW 各自独立，competitive 子博弈中叫牌语义完全不同。
+    向后兼容: model.actor → actor_s, model.critic → critic_s
     """
 
     def __init__(
         self,
-        actor_n:  MLPPolicyNetwork,
-        actor_s:  MLPPolicyNetwork,
-        critic_n: MLPValueNetwork,
-        critic_s: MLPValueNetwork,
+        actor_n:  MLPPolicyNetwork, actor_s:  MLPPolicyNetwork,
+        actor_e:  MLPPolicyNetwork, actor_w:  MLPPolicyNetwork,
+        critic_n: MLPValueNetwork,  critic_s: MLPValueNetwork,
+        critic_e: MLPValueNetwork,  critic_w: MLPValueNetwork,
     ):
         super().__init__()
-        self.actor_n  = actor_n
-        self.actor_s  = actor_s
-        self.critic_n = critic_n
-        self.critic_s = critic_s
-
+        self.actor_n  = actor_n;  self.actor_s  = actor_s
+        self.actor_e  = actor_e;  self.actor_w  = actor_w
+        self.critic_n = critic_n; self.critic_s = critic_s
+        self.critic_e = critic_e; self.critic_w = critic_w
         # 向后兼容别名
         self.actor  = actor_s
         self.critic = critic_s
@@ -162,12 +154,19 @@ class _HAPPOModel(nn.Module):
         deterministic: bool = False,
         player:        int  = SOUTH,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        actor  = self.actor_n  if player == NORTH else self.actor_s
-        critic = self.critic_n if player == NORTH else self.critic_s
-
+        actor  = self._actor_for(player)
+        critic = self._critic_for(player)
         action, log_prob, entropy = actor.get_action(flat_obs, legal_actions, deterministic)
         value = critic(flat_obs, all_hands)
         return action, log_prob, entropy, value
+
+    def _actor_for(self, player: int) -> MLPPolicyNetwork:
+        return {0: self.actor_n, 1: self.actor_e,
+                2: self.actor_s, 3: self.actor_w}[player]
+
+    def _critic_for(self, player: int) -> MLPValueNetwork:
+        return {0: self.critic_n, 1: self.critic_e,
+                2: self.critic_s, 3: self.critic_w}[player]
 
 
 # ==============================================================================
@@ -208,22 +207,21 @@ class MAPPOAgent:
             ).to(self.device)
 
         self.model = _HAPPOModel(
-            actor_n  = _make_actor(),
-            actor_s  = _make_actor(),
-            critic_n = _make_critic(),
-            critic_s = _make_critic(),
+            actor_n=_make_actor(), actor_s=_make_actor(),
+            actor_e=_make_actor(), actor_w=_make_actor(),
+            critic_n=_make_critic(), critic_s=_make_critic(),
+            critic_e=_make_critic(), critic_w=_make_critic(),
         )
 
-        critic_lr = config.lr * config.critic_lr_ratio
-
-        self.actor_n_optimizer  = torch.optim.Adam(
-            self.model.actor_n.parameters(),  lr=config.lr)
-        self.actor_s_optimizer  = torch.optim.Adam(
-            self.model.actor_s.parameters(),  lr=config.lr)
-        self.critic_n_optimizer = torch.optim.Adam(
-            self.model.critic_n.parameters(), lr=critic_lr)
-        self.critic_s_optimizer = torch.optim.Adam(
-            self.model.critic_s.parameters(), lr=critic_lr)
+        clr = config.lr * config.critic_lr_ratio
+        self.actor_n_optimizer  = torch.optim.Adam(self.model.actor_n.parameters(),  lr=config.lr)
+        self.actor_s_optimizer  = torch.optim.Adam(self.model.actor_s.parameters(),  lr=config.lr)
+        self.actor_e_optimizer  = torch.optim.Adam(self.model.actor_e.parameters(),  lr=config.lr)
+        self.actor_w_optimizer  = torch.optim.Adam(self.model.actor_w.parameters(),  lr=config.lr)
+        self.critic_n_optimizer = torch.optim.Adam(self.model.critic_n.parameters(), lr=clr)
+        self.critic_s_optimizer = torch.optim.Adam(self.model.critic_s.parameters(), lr=clr)
+        self.critic_e_optimizer = torch.optim.Adam(self.model.critic_e.parameters(), lr=clr)
+        self.critic_w_optimizer = torch.optim.Adam(self.model.critic_w.parameters(), lr=clr)
 
         # 向后兼容别名
         self.actor_optimizer  = self.actor_s_optimizer
@@ -238,37 +236,18 @@ class MAPPOAgent:
     # ------------------------------------------------------------------
 
     def get_actor(self, player: int) -> MLPPolicyNetwork:
-        """
-        返回对应 player 的 actor.
-
-        映射规则（适配 competitive 4方决策）:
-            NORTH (0) → actor_n
-            EAST  (1) → actor_n  (FSP 对手用 frozen snapshot，训练时同 N)
-            SOUTH (2) → actor_s
-            WEST  (3) → actor_s  (FSP 对手用 frozen snapshot，训练时同 S)
-        """
-        if player % 2 == 0:  # N / S 阵营
-            return self.model.actor_n if player == NORTH else self.model.actor_s
-        else:                 # E / W 阵营（映射到同侧 actor，FSP 会临时覆盖）
-            return self.model.actor_n if player == 1 else self.model.actor_s
+        return self.model._actor_for(player)
 
     def get_critic(self, player: int) -> MLPValueNetwork:
-        if player % 2 == 0:
-            return self.model.critic_n if player == NORTH else self.model.critic_s
-        else:
-            return self.model.critic_n if player == 1 else self.model.critic_s
+        return self.model._critic_for(player)
 
     def get_actor_optimizer(self, player: int):
-        if player % 2 == 0:
-            return self.actor_n_optimizer if player == NORTH else self.actor_s_optimizer
-        else:
-            return self.actor_n_optimizer if player == 1 else self.actor_s_optimizer
+        return {0: self.actor_n_optimizer, 1: self.actor_e_optimizer,
+                2: self.actor_s_optimizer, 3: self.actor_w_optimizer}[player]
 
     def get_critic_optimizer(self, player: int):
-        if player % 2 == 0:
-            return self.critic_n_optimizer if player == NORTH else self.critic_s_optimizer
-        else:
-            return self.critic_n_optimizer if player == 1 else self.critic_s_optimizer
+        return {0: self.critic_n_optimizer, 1: self.critic_e_optimizer,
+                2: self.critic_s_optimizer, 3: self.critic_w_optimizer}[player]
 
     # ------------------------------------------------------------------
     # Action sampling（新 API：接受 flat_obs + legal_actions）
@@ -416,79 +395,52 @@ class MAPPOAgent:
 
     def save(self, path: str):
         torch.save({
-            'actor_n':              self.model.actor_n.state_dict(),
-            'actor_s':              self.model.actor_s.state_dict(),
-            'critic_n':             self.model.critic_n.state_dict(),
-            'critic_s':             self.model.critic_s.state_dict(),
-            'actor_n_optimizer':    self.actor_n_optimizer.state_dict(),
-            'actor_s_optimizer':    self.actor_s_optimizer.state_dict(),
-            'critic_n_optimizer':   self.critic_n_optimizer.state_dict(),
-            'critic_s_optimizer':   self.critic_s_optimizer.state_dict(),
-            # 元数据，便于检查
+            'actor_n': self.model.actor_n.state_dict(),
+            'actor_s': self.model.actor_s.state_dict(),
+            'actor_e': self.model.actor_e.state_dict(),
+            'actor_w': self.model.actor_w.state_dict(),
+            'critic_n': self.model.critic_n.state_dict(),
+            'critic_s': self.model.critic_s.state_dict(),
+            'critic_e': self.model.critic_e.state_dict(),
+            'critic_w': self.model.critic_w.state_dict(),
+            'actor_n_optimizer':  self.actor_n_optimizer.state_dict(),
+            'actor_s_optimizer':  self.actor_s_optimizer.state_dict(),
+            'actor_e_optimizer':  self.actor_e_optimizer.state_dict(),
+            'actor_w_optimizer':  self.actor_w_optimizer.state_dict(),
+            'critic_n_optimizer': self.critic_n_optimizer.state_dict(),
+            'critic_s_optimizer': self.critic_s_optimizer.state_dict(),
+            'critic_e_optimizer': self.critic_e_optimizer.state_dict(),
+            'critic_w_optimizer': self.critic_w_optimizer.state_dict(),
             'obs_dim':    getattr(self.config, 'obs_dim', OBS_DIM),
             'hidden_dim': getattr(self.config, 'hidden_dim', 1024),
         }, path)
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-
-        if 'actor_n' in ckpt:
-            self.model.actor_n.load_state_dict(ckpt['actor_n'])
-            self.model.actor_s.load_state_dict(ckpt['actor_s'])
-            self.model.critic_n.load_state_dict(ckpt['critic_n'])
-            self.model.critic_s.load_state_dict(ckpt['critic_s'])
-            for key in ('actor_n_optimizer', 'actor_s_optimizer',
-                        'critic_n_optimizer', 'critic_s_optimizer'):
-                if key in ckpt:
-                    getattr(self, key).load_state_dict(ckpt[key])
-
-        elif 'model' in ckpt:
-            # 旧格式（共享 actor/critic → 复制到 N 和 S）
-            old = ckpt['model']
-            actor_state  = {k[len('actor.'):]:  v for k, v in old.items()
-                            if k.startswith('actor.')}
-            critic_state = {k[len('critic.'): ]: v for k, v in old.items()
-                            if k.startswith('critic.')}
-            self.model.actor_n.load_state_dict(actor_state)
-            self.model.actor_s.load_state_dict(actor_state)
-            self.model.critic_n.load_state_dict(critic_state)
-            self.model.critic_s.load_state_dict(critic_state)
-
-        else:
-            raise ValueError(
-                f"Unrecognized checkpoint format. Keys: {list(ckpt.keys())[:8]}")
+        for role in ('actor_n','actor_s','actor_e','actor_w',
+                     'critic_n','critic_s','critic_e','critic_w'):
+            if role in ckpt:
+                getattr(self.model, role).load_state_dict(ckpt[role])
+        for opt_key in ('actor_n_optimizer','actor_s_optimizer',
+                        'actor_e_optimizer','actor_w_optimizer',
+                        'critic_n_optimizer','critic_s_optimizer',
+                        'critic_e_optimizer','critic_w_optimizer'):
+            if opt_key in ckpt:
+                getattr(self, opt_key).load_state_dict(ckpt[opt_key])
 
     def state_dict(self) -> dict:
-        """合并 state dict: actor_n.* / actor_s.* / critic_n.* / critic_s.*"""
         d = {}
-        for prefix, net in [('actor_n',  self.model.actor_n),
-                             ('actor_s',  self.model.actor_s),
-                             ('critic_n', self.model.critic_n),
-                             ('critic_s', self.model.critic_s)]:
-            for k, v in net.state_dict().items():
-                d[f'{prefix}.{k}'] = v
+        for role in ('actor_n','actor_s','actor_e','actor_w',
+                     'critic_n','critic_s','critic_e','critic_w'):
+            for k, v in getattr(self.model, role).state_dict().items():
+                d[f'{role}.{k}'] = v
         return d
 
     def load_state_dict(self, state: dict):
-        """兼容新格式 (actor_n.*/critic_n.*) 和旧格式 (actor.*/critic.*)."""
-        if any(k.startswith('actor_n.') for k in state):
-            def _extract(prefix):
-                return {k[len(prefix)+1:]: v
-                        for k, v in state.items() if k.startswith(prefix+'.')}
-            self.model.actor_n.load_state_dict(_extract('actor_n'))
-            self.model.actor_s.load_state_dict(_extract('actor_s'))
-            self.model.critic_n.load_state_dict(_extract('critic_n'))
-            self.model.critic_s.load_state_dict(_extract('critic_s'))
-        elif any(k.startswith('actor.') for k in state):
-            # 旧格式：共享网络 → 复制到 N 和 S
-            actor_state  = {k[len('actor.'):]:  v for k, v in state.items()
-                            if k.startswith('actor.')}
-            critic_state = {k[len('critic.'): ]: v for k, v in state.items()
-                            if k.startswith('critic.')}
-            self.model.actor_n.load_state_dict(actor_state)
-            self.model.actor_s.load_state_dict(actor_state)
-            self.model.critic_n.load_state_dict(critic_state)
-            self.model.critic_s.load_state_dict(critic_state)
-        else:
-            raise ValueError(
-                f"Unrecognized state_dict format. Keys: {list(state.keys())[:5]}")
+        def _extract(prefix):
+            return {k[len(prefix)+1:]: v for k, v in state.items()
+                    if k.startswith(prefix+'.')}
+        for role in ('actor_n','actor_s','actor_e','actor_w',
+                     'critic_n','critic_s','critic_e','critic_w'):
+            if any(k.startswith(role+'.') for k in state):
+                getattr(self.model, role).load_state_dict(_extract(role))

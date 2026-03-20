@@ -57,14 +57,14 @@ class SubgameConfig:
     主要参数参考 README §4.2 / Kita et al. 2024.
     """
     # ── 训练规模 ────────────────────────────────────────────────────────────
-    num_rounds:       int   = 10          # IBR 轮数（外层循环）
+    num_rounds:       int   = 20          # IBR 轮数（外层循环）
     steps_per_phase:  int   = 500         # 每 phase 采集步数（每步 deals_per_step 局）
     deals_per_step:   int   = 32          # 每步并行 rollout 局数
     accumulate_steps: int   = 4           # 累积 N 步数据后做 1 次 PPO update
 
     # ── 学习率 ──────────────────────────────────────────────────────────────
     lr:              float  = 1e-6        # Actor lr（Kita et al. 2024）
-    critic_lr_ratio: float  = 3.0         # Critic lr = lr × critic_lr_ratio
+    critic_lr_ratio: float  = 5.0         # Critic lr = lr × critic_lr_ratio
     belief_lr:       float  = 1e-4        # Belief Net 微调 lr
 
     # ── PPO ─────────────────────────────────────────────────────────────────
@@ -104,7 +104,7 @@ class SubgameConfig:
 
     # ── BC Warmup（rule-based）──────────────────────────────────────────────
     bc_warmup_samples: int  = 5000        # rule-based BC 样本数
-    bc_warmup_epochs:  int  = 10          # BC 训练 epoch 数
+    bc_warmup_epochs:  int  = 20          # BC 训练 epoch 数
     bc_warmup_lr:      float = 1e-4
 
     # ── 网络 ────────────────────────────────────────────────────────────────
@@ -270,6 +270,10 @@ class SubgameTrainer:
         # ── KL anchor（BC checkpoint，由外部 set_bc_anchor 设置）──────────
         self.bc_actors: Optional[Dict[int, MLPPolicyNetwork]] = None
 
+        # ── FSP actor cache（避免每步 new 网络）──────────────────────────
+        self._fsp_actor_cache: dict = {}  # role -> MLPPolicyNetwork
+        self._fsp_cache_key: Optional[str] = None
+
         # ── 日志 ───────────────────────────────────────────────────────────
         self.log: List[dict] = []
         self._global_step = 0
@@ -308,7 +312,7 @@ class SubgameTrainer:
 
         print(f"[BC Warmup] Training {num_epochs} epochs on {len(data)} samples...")
 
-        for player in [NORTH, SOUTH]:  # 只训练 NS（训练方）
+        for player in [NORTH, SOUTH, EAST, WEST]:  # 四方各自独立 actor
             actor = self.agent.get_actor(player)
             opt   = torch.optim.Adam(actor.parameters(), lr=lr)
 
@@ -336,8 +340,8 @@ class SubgameTrainer:
 
                 avg_loss = loss_sum / max(1, n_batches)
 
-            print(f"  Player {'N' if player == NORTH else 'S'}: "
-                  f"epoch {num_epochs} loss={avg_loss:.4f}")
+            name = {NORTH:'N', SOUTH:'S', EAST:'E', WEST:'W'}[player]
+            print(f"  Player {name}: epoch {num_epochs} loss={avg_loss:.4f}")
 
         print("[BC Warmup] Done.")
 
@@ -347,27 +351,9 @@ class SubgameTrainer:
 
     def set_bc_anchor(self, agent_or_state_dict):
         """
-        设置 BC 锚点（Stage 1 BC 结束时的快照）.
-
-        Args:
-            agent_or_state_dict: MAPPOAgent 或 state_dict dict
+        设置 BC 锚点（BC 结束时四方 actor 的快照）.
+        必须在 BC warmup 结束后、RL 训练开始前调用。
         """
-        if isinstance(agent_or_state_dict, MAPPOAgent):
-            src_agent = agent_or_state_dict
-            n_state   = src_agent.model.actor_n.state_dict()
-            s_state   = src_agent.model.actor_s.state_dict()
-        else:
-            sd = agent_or_state_dict
-            def _extract(prefix):
-                return {k[len(prefix)+1:]: v for k, v in sd.items()
-                        if k.startswith(prefix + '.')}
-            if any(k.startswith('actor_n.') for k in sd):
-                n_state = _extract('actor_n')
-                s_state = _extract('actor_s')
-            else:
-                # 旧格式或直接 state dict
-                n_state = s_state = sd
-
         def _frozen_copy(state_dict):
             net = MLPPolicyNetwork(hidden_dim=self.config.hidden_dim).to(self.device)
             net.load_state_dict(state_dict)
@@ -376,11 +362,19 @@ class SubgameTrainer:
                 p.requires_grad_(False)
             return net
 
+        if isinstance(agent_or_state_dict, MAPPOAgent):
+            src = agent_or_state_dict.model
+        else:
+            # state_dict 格式：直接重建 agent 取不了，降级到当前 agent
+            src = self.agent.model
+
         self.bc_actors = {
-            NORTH: _frozen_copy(n_state),
-            SOUTH: _frozen_copy(s_state),
+            NORTH: _frozen_copy(src.actor_n.state_dict()),
+            SOUTH: _frozen_copy(src.actor_s.state_dict()),
+            EAST:  _frozen_copy(src.actor_e.state_dict()),
+            WEST:  _frozen_copy(src.actor_w.state_dict()),
         }
-        print("[KL Anchor] BC anchor set.")
+        print("[KL Anchor] BC anchor set for all 4 players.")
 
     def _get_kl_lambda(self, round_idx: int) -> float:
         cfg      = self.config
@@ -420,9 +414,12 @@ class SubgameTrainer:
         num_epochs = num_epochs or self.config.critic_prewarm_epochs
         conv_tol   = self.config.critic_prewarm_conv_tol
 
-        print(f"[Critic Warmup] Collecting {num_deals} deals...")
-        episodes = self._collect_episodes(num_deals, use_fsp_opponent=False)
-        self._store_episodes(episodes)
+        half = num_deals // 2
+        print(f"[Critic Warmup] Collecting {num_deals} deals (NS:{half} + EW:{half}, batch={self.config.deals_per_step})...")
+        ns_eps = self._collect_episodes_batch(half, train_side='NS', fsp_sd=None, batch_size=self.config.deals_per_step)
+        ew_eps = self._collect_episodes_batch(half, train_side='EW', fsp_sd=None, batch_size=self.config.deals_per_step)
+        self._store_episodes(ns_eps)
+        self._store_episodes(ew_eps)
 
         for player in self.active_players:
             buf = self.buffers[player]
@@ -488,40 +485,210 @@ class SubgameTrainer:
                     belief_data.append(step)
 
         if not belief_data:
-            return
+            return None
 
         self.belief_net.train()
         criterion = nn.BCEWithLogitsLoss(
             pos_weight=self.belief_net.pos_weight.to(self.device))
 
-        for epoch in range(self.config.jit_burnin_epochs):
-            np.random.shuffle(belief_data)
-            total_loss = 0.0
-            n = 0
-            for step in belief_data:
-                oh  = torch.tensor(step['observer_hand'], dtype=torch.float32
-                                   ).unsqueeze(0).to(self.device)
-                h   = torch.tensor(step['history'],       dtype=torch.float32
-                                   ).unsqueeze(0).to(self.device)
-                op  = torch.tensor([step['observer_pos']], dtype=torch.long).to(self.device)
-                tp  = torch.tensor([step['target_pos']],  dtype=torch.long).to(self.device)
-                tgt = torch.tensor(step['belief_target'], dtype=torch.float32
-                                   ).unsqueeze(0).to(self.device)
+        # 预先批量化，避免逐样本 forward
+        oh_all  = torch.tensor(np.stack([s['observer_hand'] for s in belief_data]), dtype=torch.float32)
+        h_all   = torch.tensor(np.stack([s['history']       for s in belief_data]), dtype=torch.float32)
+        op_all  = torch.tensor([s['observer_pos'] for s in belief_data], dtype=torch.long)
+        tp_all  = torch.tensor([s['target_pos']   for s in belief_data], dtype=torch.long)
+        tgt_all = torch.tensor(np.stack([s['belief_target'] for s in belief_data]), dtype=torch.float32)
+        N = len(belief_data); bs = min(256, N); final_loss = 0.0
 
-                logits = self.belief_net(oh, h, op, tp)
-                loss   = criterion(logits, tgt)
-                self.belief_optimizer.zero_grad()
-                loss.backward()
+        for epoch in range(self.config.jit_burnin_epochs):
+            perm = np.random.permutation(N)
+            tl = 0.0; nb = 0
+            for s in range(0, N, bs):
+                idx = perm[s:s+bs]
+                logits = self.belief_net(oh_all[idx].to(self.device), h_all[idx].to(self.device),
+                                         op_all[idx].to(self.device), tp_all[idx].to(self.device))
+                loss = criterion(logits, tgt_all[idx].to(self.device))
+                self.belief_optimizer.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(self.belief_net.parameters(), self.config.max_grad_norm)
                 self.belief_optimizer.step()
-                total_loss += loss.item()
-                n += 1
+                tl += loss.item(); nb += 1
+            final_loss = tl / max(1, nb)
 
-        print(f"  [JIT Burn-in] Done. loss={total_loss/max(1,n):.4f}")
+        print(f"  [JIT Burn-in] Done. loss={final_loss:.4f} samples={N}")
+        return final_loss
 
     # ======================================================================
     # Episode Collection
     # ======================================================================
+
+    def _collect_episodes_batch(
+        self,
+        num_deals:  int,
+        train_side: str,           # 'NS' 训练北南，'EW' 训练东西
+        fsp_sd:     Optional[dict] = None,
+        batch_size: int = 32,
+    ) -> List[List[dict]]:
+        """
+        批量 rollout：同时维护 batch_size 个 CompetitiveSubgameEnv 实例。
+        每个时间步按 actor 分组批量 forward，显著提升 GPU 利用率。
+
+        关键：每个 slot 使用独立的 CompetitiveSubgameEnv 实例，
+        保证 _compute_terminal_reward() 正确计算 DDS oracle reward。
+
+        train_side='NS': NS 用当前 agent，EW 用 frozen FSP
+        train_side='EW': EW 用当前 agent，NS 用 frozen FSP
+        """
+        from subgames.competitive_env import CompetitiveSubgameEnv
+
+        dealer = self.env.dealer  # NORTH
+
+        # ── 初始化 batch_size 个独立环境 ────────────────────────────────
+        envs = [CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
+                for _ in range(batch_size)]
+        for e in envs:
+            e.loader          = self.env.loader
+            e.env             = __import__('env', fromlist=['BridgeBiddingEnv']).BridgeBiddingEnv(60)
+            e.max_history_len = 60
+            e.dealer          = dealer
+            e._is_constrained_data = self.env._is_constrained_data
+            e._filtered_deals      = self.env._filtered_deals
+            e._current_hands = None; e._current_dd = None
+            e._vulnerability = (False, False); e.history_int = []
+
+        slot_obs  = [None] * batch_size
+        slot_hist = [None] * batch_size
+        slot_ep   = [[]   for _ in range(batch_size)]
+        slot_done = [True] * batch_size
+
+        all_episodes: List[List[dict]] = []
+        collected = 0
+
+        def _reset(i):
+            obs = envs[i].reset()
+            slot_hist[i] = list(envs[i].history_int)
+            slot_ep[i]   = []
+            slot_done[i] = False
+            return obs
+
+        slot_obs = [_reset(i) for i in range(batch_size)]
+
+        while collected < num_deals:
+            active = [i for i in range(batch_size) if not slot_done[i]]
+            if not active:
+                break
+
+            # 按 actor 分组
+            from collections import defaultdict
+            groups = defaultdict(list)  # role_key -> [slot_idx]
+            for i in active:
+                player = envs[i].current_player
+                is_train = ((train_side == 'NS' and player in (NORTH, SOUTH)) or
+                            (train_side == 'EW' and player in (EAST,  WEST)))
+                role = {NORTH:'actor_n', EAST:'actor_e',
+                        SOUTH:'actor_s', WEST:'actor_w'}[player]
+                key = f"train_{role}" if is_train else f"fsp_{role}"
+                groups[key].append(i)
+
+            actions_map = {}  # slot -> (action, log_prob, value, flat, legal, is_train)
+
+            for key, slots in groups.items():
+                is_train = key.startswith('train_')
+                role = key.split('_', 1)[1]  # actor_n/s/e/w
+
+                if is_train:
+                    actor  = getattr(self.agent.model, role)
+                    critic = getattr(self.agent.model,
+                                     role.replace('actor','critic'))
+                else:
+                    if fsp_sd and role in fsp_sd:
+                        ck = str(id(fsp_sd))
+                        if self._fsp_cache_key != ck or role not in self._fsp_actor_cache:
+                            net = MLPPolicyNetwork(
+                                hidden_dim=self.config.hidden_dim).to(self.device)
+                            net.load_state_dict(
+                                {k: v.to(self.device) for k, v in fsp_sd[role].items()})
+                            net.eval()
+                            self._fsp_actor_cache[role] = net
+                            self._fsp_cache_key = ck
+                        actor = self._fsp_actor_cache[role]
+                    else:
+                        actor = getattr(self.agent.model, role)
+                    critic = getattr(self.agent.model,
+                                     role.replace('actor','critic'))
+
+                flat_batch  = np.stack([
+                    encode_obs_flat(slot_obs[i], dealer, slot_hist[i])
+                    for i in slots])
+                legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
+                ah_batch    = np.stack([envs[i]._current_hands for i in slots])
+
+                flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
+                legal_t = torch.tensor(legal_batch, dtype=torch.float32).to(self.device)
+                ah_t    = torch.tensor(ah_batch,    dtype=torch.float32).to(self.device)
+
+                with torch.no_grad():
+                    actions, log_probs, _ = actor.get_action(flat_t, legal_t)
+                    values = critic(flat_t, ah_t)
+
+                for j, i in enumerate(slots):
+                    actions_map[i] = (actions[j].item(), log_probs[j].cpu(),
+                                      values[j].cpu(), flat_batch[j],
+                                      legal_batch[j], is_train)
+
+            # ── 执行动作 ────────────────────────────────────────────────
+            for i in active:
+                action, log_prob, value, flat_obs, legal_actions, is_train = actions_map[i]
+                player    = envs[i].current_player
+                all_hands = envs[i]._current_hands.copy()
+
+                step = {
+                    'flat_obs': flat_obs, 'legal_actions': legal_actions,
+                    'action': action, 'log_prob': log_prob, 'value': value,
+                    'reward': 0.0, 'done': False,
+                    'all_hands': all_hands, 'player': player,
+                    'is_training_side': is_train,
+                }
+
+                # Belief 数据记录
+                if self.belief_net is not None:
+                    if player in (NORTH, SOUTH):
+                        partner = (player + 2) % 4
+                        step.update({
+                            'observer_hand': all_hands[player],
+                            'history':       self._encode_history(slot_hist[i]),
+                            'observer_pos':  player, 'target_pos': partner,
+                            'belief_target': hand_to_belief_target(all_hands[partner]),
+                            'history_int_before': slot_hist[i][:],
+                        })
+                    else:
+                        step.update({
+                            'ew_diagnostic': True,
+                            'observer_hand': all_hands[NORTH],
+                            'history':       self._encode_history(slot_hist[i]),
+                            'observer_pos':  NORTH, 'target_pos': player,
+                            'belief_target': hand_to_belief_target(all_hands[player]),
+                            'history_int_before': slot_hist[i][:],
+                        })
+
+                slot_hist[i].append(action)
+                if self.belief_net is not None:
+                    if player in (NORTH, SOUTH) or step.get('ew_diagnostic'):
+                        step['history_int_after'] = slot_hist[i][:]
+
+                # CompetitiveSubgameEnv.step() 正确计算 DDS oracle reward
+                obs_next, reward, done, info = envs[i].step(action)
+                step['reward'] = reward
+                step['done']   = done
+                slot_ep[i].append(step)
+                slot_obs[i] = obs_next
+
+                if done:
+                    all_episodes.append(slot_ep[i])
+                    collected += 1
+                    slot_done[i] = True
+                    if collected < num_deals:
+                        slot_obs[i] = _reset(i)
+
+        return all_episodes[:num_deals]
 
     def _collect_episodes(
         self,
@@ -637,27 +804,19 @@ class SubgameTrainer:
         return episodes
 
     def _get_fsp_actor(self, player: int, fsp_sd: dict) -> MLPPolicyNetwork:
-        """
-        获取 FSP snapshot 对应的 actor（临时对象，不影响 self.agent）.
-
-        注: 简单实现：每次创建临时网络并加载权重。
-        性能影响可接受（FSP actor 只用于推断，不需要梯度）。
-        """
-        role  = 'actor_n' if player == NORTH else 'actor_s'
-        # EW 也映射到 actor_n / actor_s（EW 的 policy 从 pool 中来）
-        if player == EAST:
-            role = 'actor_n'
-        elif player == WEST:
-            role = 'actor_s'
-
+        """FSP snapshot actor，缓存避免每步 new 网络."""
+        role = {NORTH:'actor_n', EAST:'actor_e',
+                SOUTH:'actor_s', WEST:'actor_w'}[player]
         if role not in fsp_sd:
             return self.agent.get_actor(player)
-
-        net = MLPPolicyNetwork(hidden_dim=self.config.hidden_dim).to(self.device)
-        sd  = {k: v.to(self.device) for k, v in fsp_sd[role].items()}
-        net.load_state_dict(sd)
-        net.eval()
-        return net
+        cache_key = str(id(fsp_sd))
+        if self._fsp_cache_key != cache_key or role not in self._fsp_actor_cache:
+            net = MLPPolicyNetwork(hidden_dim=self.config.hidden_dim).to(self.device)
+            net.load_state_dict({k: v.to(self.device) for k, v in fsp_sd[role].items()})
+            net.eval()
+            self._fsp_actor_cache[role] = net
+            self._fsp_cache_key = cache_key
+        return self._fsp_actor_cache[role]
 
     def _store_episodes(self, episodes: List[List[dict]]):
         """将 episode list 存入各 player 的 buffer."""
@@ -708,7 +867,8 @@ class SubgameTrainer:
         for ep in episodes:
             bonuses = []
             for step in ep:
-                if 'belief_target' not in step or step['player'] not in (NORTH, SOUTH):
+                # NS 和 EW 都计算 r_info（partner/opponent 对称）
+                if 'belief_target' not in step:
                     bonuses.append(0.0)
                     continue
 
@@ -891,86 +1051,84 @@ class SubgameTrainer:
 
     def run(self, num_rounds: int = None) -> List[dict]:
         """
-        IBR 交替训练:
-
-        Round k:
-          S-phase:  训练 NS（S 先决策，N 后 rebid）
-          N-phase:  训练 NS（N-phase JIT Belief Burn-in → 更新 N + S）
-                    Agent B：在此阶段激活 r_info
-          每 fsp_add_interval 轮将 actor snapshot 存入 FSP pool
+        双桌 IBR 训练:
+          桌1 (NS训练): NS 用当前 agent，EW 用 frozen FSP
+          桌2 (EW训练): EW 用当前 agent，NS 用 frozen FSP
+        Agent B: 桌1后做 JIT Belief Burn-in，r_info 逐步分配。
         """
         num_rounds = num_rounds or self.config.num_rounds
+        n_deals    = self.config.steps_per_phase * self.config.deals_per_step
+        batch_sz   = self.config.deals_per_step
 
-        # 初始 Critic warmup
         print("\n[Trainer] Critic warmup...")
         self.critic_warmup()
 
         for rnd in range(num_rounds):
             print(f"\n══════ Round {rnd+1}/{num_rounds} ══════")
-
-            # FSP snapshot
             self._maybe_add_to_fsp(rnd)
             fsp_sd = self._apply_fsp_opponent()
+            _ir_vals: list = []; _bl_vals: list = []
+            ns_metrics: dict = {}; ew_metrics: dict = {}
 
-            # ── S-phase ────────────────────────────────────────────────────
-            print("  [S-phase] Collecting episodes...")
-            s_episodes = self._collect_episodes(
-                self.config.steps_per_phase * self.config.deals_per_step,
-                use_fsp_opponent=True, fsp_state_dict=fsp_sd)
+            # ── 桌1: 训练 NS ────────────────────────────────────────────
+            print(f"  [Table1/NS] Collecting {n_deals} deals (batch={batch_sz})...")
+            ns_eps = self._collect_episodes_batch(
+                n_deals, train_side='NS', fsp_sd=fsp_sd, batch_size=batch_sz)
 
             if self.config.use_info_bonus:
-                bonuses = self._compute_info_bonus(s_episodes)
-                for ep, bs in zip(s_episodes, bonuses):
+                bonuses = self._compute_info_bonus(ns_eps)
+                for ep, bs in zip(ns_eps, bonuses):
                     for step, b in zip(ep, bs):
-                        step['reward'] += b  # 逐步分配 r_info，beta 已在 compute_dual_info_bonus 内应用
+                        step['reward'] += b
+                        if b != 0.0: _ir_vals.append(b)
 
-            self._store_episodes(s_episodes)
-            s_metrics = {}
-            for p in self.active_players:
+            for ep in ns_eps:
+                for step in ep:
+                    if step['player'] in (NORTH, SOUTH):
+                        self.buffers[step['player']].add(
+                            flat_obs=step['flat_obs'], legal_actions=step['legal_actions'],
+                            action=step['action'], log_prob=step['log_prob'],
+                            reward=step['reward'], value=step['value'],
+                            done=step['done'], all_hands=step.get('all_hands'))
+            for p in (NORTH, SOUTH):
                 m = self._safe_update(p, rnd)
-                if m:
-                    s_metrics[p] = m
+                if m: ns_metrics[p] = m
 
-            # ── N-phase: JIT Belief Burn-in → 收集 → 更新 ─────────────────
+            # ── JIT Belief Burn-in（Agent B only）────────────────────────
             if self.belief_net is not None:
-                print("  [N-phase] JIT Belief Burn-in...")
-                self.jit_belief_burnin()
+                print("  [JIT Belief Burn-in]...")
+                bl = self.jit_belief_burnin()
+                if bl is not None: _bl_vals.append(bl)
 
-            print("  [N-phase] Collecting episodes...")
-            n_episodes = self._collect_episodes(
-                self.config.steps_per_phase * self.config.deals_per_step,
-                use_fsp_opponent=True, fsp_state_dict=fsp_sd)
+            # ── 桌2: 训练 EW ────────────────────────────────────────────
+            print(f"  [Table2/EW] Collecting {n_deals} deals (batch={batch_sz})...")
+            ew_eps = self._collect_episodes_batch(
+                n_deals, train_side='EW', fsp_sd=fsp_sd, batch_size=batch_sz)
 
-            if self.config.use_info_bonus:
-                bonuses = self._compute_info_bonus(n_episodes)
-                for ep, bs in zip(n_episodes, bonuses):
-                    for step, b in zip(ep, bs):
-                        step['reward'] += b  # 逐步分配 r_info，beta 已在 compute_dual_info_bonus 内应用
-
-            self._store_episodes(n_episodes)
-            n_metrics = {}
-            for p in self.active_players:
+            for ep in ew_eps:
+                for step in ep:
+                    if step['player'] in (EAST, WEST):
+                        self.buffers[step['player']].add(
+                            flat_obs=step['flat_obs'], legal_actions=step['legal_actions'],
+                            action=step['action'], log_prob=step['log_prob'],
+                            reward=step['reward'], value=step['value'],
+                            done=step['done'], all_hands=step.get('all_hands'))
+            for p in (EAST, WEST):
                 m = self._safe_update(p, rnd)
-                if m:
-                    n_metrics[p] = m
+                if m: ew_metrics[p] = m
 
-            # 日志
-            all_rewards = [
-                step['reward']
-                for ep in (s_episodes + n_episodes)
-                for step in ep
-                if step.get('done')
-            ]
-            mean_r = np.mean(all_rewards) if all_rewards else 0.0
-            std_r  = np.std(all_rewards)  if all_rewards else 0.0
+            # ── 日志 ────────────────────────────────────────────────────
+            all_rewards = [step['reward'] for ep in (ns_eps+ew_eps)
+                           for step in ep if step.get('done')]
+            mean_r = float(np.mean(all_rewards)) if all_rewards else 0.0
+            std_r  = float(np.std(all_rewards))  if all_rewards else 0.0
 
             log_entry = {
-                'round':       rnd + 1,
-                'mean_reward': mean_r,
-                'std_reward':  std_r,
-                's_metrics':   s_metrics,
-                'n_metrics':   n_metrics,
+                'round': rnd+1, 'mean_reward': mean_r, 'std_reward': std_r,
+                'ns_metrics': ns_metrics, 'ew_metrics': ew_metrics,
                 'fsp_pool_size': len(self.fsp_pool),
+                'mean_ir':   float(np.mean(_ir_vals)) if _ir_vals else None,
+                'belief_loss': float(np.mean(_bl_vals)) if _bl_vals else None,
             }
             self.log.append(log_entry)
             self._print_log(log_entry)
@@ -978,20 +1136,30 @@ class SubgameTrainer:
         return self.log
 
     def _print_log(self, entry: dict):
-        rnd  = entry['round']
-        mr   = entry['mean_reward']
-        sr   = entry['std_reward']
-        fsp  = entry['fsp_pool_size']
-        # 取 S 的 policy_loss / value_loss（典型 player）
-        s_m  = entry['s_metrics'].get(SOUTH, {})
-        pl   = s_m.get('policy_loss', 0)
-        vl   = s_m.get('value_loss',  0)
-        ent  = s_m.get('entropy',     0)
-        kl   = s_m.get('kl_loss',     0)
-        klam = s_m.get('kl_lambda',   0)
-        print(f"  [Round {rnd}] r={mr:+.3f}±{sr:.3f} "
-              f"pl={pl:.4f} vl={vl:.4f} ent={ent:.4f} "
-              f"kl={kl:.5f}(λ={klam:.3f}) fsp={fsp}")
+        rnd = entry['round']; fsp = entry['fsp_pool_size']
+        mr  = entry['mean_reward']; sr = entry['std_reward']
+        print(f"  [Round {rnd}] reward={mr:+.3f}±{sr:.3f}  fsp={fsp}")
+
+        ns = entry.get('ns_metrics', entry.get('s_metrics', {}))
+        ns_n = ns.get(NORTH,{}); ns_s = ns.get(SOUTH,{})
+        if ns_n or ns_s:
+            print(f"    Table1/NS │ "
+                  f"N: pl={ns_n.get('policy_loss',0):+.4f} vl={ns_n.get('value_loss',0):.3f} ent={ns_n.get('entropy',0):.3f} │ "
+                  f"S: pl={ns_s.get('policy_loss',0):+.4f} vl={ns_s.get('value_loss',0):.3f} ent={ns_s.get('entropy',0):.3f} "
+                  f"kl={ns_s.get('kl_loss',0):.5f}(λ={ns_s.get('kl_lambda',0):.3f})")
+
+        ew = entry.get('ew_metrics', entry.get('n_metrics', {}))
+        ew_e = ew.get(EAST,{}); ew_w = ew.get(WEST,{})
+        if ew_e or ew_w:
+            print(f"    Table2/EW │ "
+                  f"E: pl={ew_e.get('policy_loss',0):+.4f} vl={ew_e.get('value_loss',0):.3f} ent={ew_e.get('entropy',0):.3f} │ "
+                  f"W: pl={ew_w.get('policy_loss',0):+.4f} vl={ew_w.get('value_loss',0):.3f} ent={ew_w.get('entropy',0):.3f} "
+                  f"kl={ew_e.get('kl_loss',0):.5f}(λ={ew_e.get('kl_lambda',0):.3f})")
+
+        ir = entry.get('mean_ir'); bl = entry.get('belief_loss')
+        if ir is not None:
+            bl_str = f"{bl:.4f}" if bl is not None else "N/A"
+            print(f"    r_info    │ ir={ir:.4f}  belief_loss={bl_str}")
 
     # ======================================================================
     # 评估

@@ -23,6 +23,11 @@ Subgame Validation — Competitive Path (Phase 1 排雷)
 import argparse
 import os
 import random
+import sys
+from pathlib import Path
+
+# 将 bridge_coma 根目录加入 sys.path，确保包结构可被找到
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import torch
@@ -65,7 +70,7 @@ def run_competitive(args):
         kl_lambda_start = 0.5,
         kl_lambda_end   = 0.1,
         bc_warmup_samples= 1000 if args.quick else 5000,
-        bc_warmup_epochs = 5   if args.quick else 10,
+        bc_warmup_epochs = 5   if args.quick else 20,
         device          = device,
     )
     reward_stats_a = RunningStats()
@@ -86,7 +91,7 @@ def run_competitive(args):
         kl_lambda_start = 0.5,
         kl_lambda_end   = 0.1,
         bc_warmup_samples= 1000 if args.quick else 5000,
-        bc_warmup_epochs = 5   if args.quick else 10,
+        bc_warmup_epochs = 5   if args.quick else 20,
         device          = device,
     )
     reward_stats_b = RunningStats()
@@ -155,21 +160,28 @@ def _print_diagnostics(log_a: list, log_b: list, cfg_b: SubgameConfig):
 
     def _last_metric(log: list, player_key: int, metric: str) -> float:
         for entry in reversed(log):
-            m = entry.get('n_metrics', {}).get(player_key, {})
-            if metric in m:
-                return m[metric]
+            # 兼容新格式 ns_metrics/ew_metrics 和旧格式 s_metrics/n_metrics
+            for key in ('ns_metrics', 'ew_metrics', 's_metrics', 'n_metrics'):
+                m = entry.get(key, {}).get(player_key, {})
+                if metric in m:
+                    return m[metric]
         return float('nan')
 
-    from env import SOUTH
+    from env import SOUTH, EAST
     ent_a   = _last_metric(log_a, SOUTH, 'entropy')
     ent_b   = _last_metric(log_b, SOUTH, 'entropy')
     vl_a    = _last_metric(log_a, SOUTH, 'value_loss')
     vl_b    = _last_metric(log_b, SOUTH, 'value_loss')
     kl_b    = _last_metric(log_b, SOUTH, 'kl_loss')
     klam_b  = _last_metric(log_b, SOUTH, 'kl_lambda')
+    # EW 指标
+    ent_a_e = _last_metric(log_a, EAST, 'entropy')
+    vl_a_e  = _last_metric(log_a, EAST, 'value_loss')
+    ent_b_e = _last_metric(log_b, EAST, 'entropy')
+    vl_b_e  = _last_metric(log_b, EAST, 'value_loss')
 
-    print(f"  Agent A: entropy={ent_a:.3f}  vl={vl_a:.4f}")
-    print(f"  Agent B: entropy={ent_b:.3f}  vl={vl_b:.4f}  kl={kl_b:.5f}(λ={klam_b:.3f})")
+    print(f"  Agent A: NS entropy={ent_a:.3f} vl={vl_a:.4f} │ EW entropy={ent_a_e:.3f} vl={vl_a_e:.4f}")
+    print(f"  Agent B: NS entropy={ent_b:.3f} vl={vl_b:.4f} kl={kl_b:.5f}(λ={klam_b:.3f}) │ EW entropy={ent_b_e:.3f} vl={vl_b_e:.4f}")
 
     ok = True
     if ent_a < 0.5 or ent_b < 0.5:
@@ -206,7 +218,7 @@ def parse_args():
     parser.add_argument('--type', default='competitive',
                         choices=['competitive'],
                         help='Subgame type (competitive only for now)')
-    parser.add_argument('--data', default='data/1h1s_100k.npz',
+    parser.add_argument('--data', '--competitive_data', default='data/competitive_100k.npz',
                         help='Path to DDS data (npz)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--beta', type=float, default=0.05,
