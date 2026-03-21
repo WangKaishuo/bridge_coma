@@ -79,24 +79,26 @@ class SubgameConfig:
     max_grad_norm:    float = 0.5
 
     # ── KL Anchor ───────────────────────────────────────────────────────────
-    kl_lambda_start:  float = 1.5         # P73: 1.5（抑制早期entropy崩溃）
-    kl_lambda_end:    float = 1.5         # P73: 暂不退火（与start相同），等vl稳定后再开启
-    kl_anneal_frac:   float = 0.0         # P73: 0.0=固定不退火（1.0=全程退火）
+    kl_lambda_start:  float = 1.5         # P73
+    kl_lambda_end:    float = 1.5         # P73: 暂不退火
+    kl_anneal_frac:   float = 0.0         # P73: 0.0=固定不退火
 
     # ── KL Early Stopping ───────────────────────────────────────────────────
     kl_early_stop_threshold: float = 0.015
 
     # ── r_info ──────────────────────────────────────────────────────────────
-    use_info_bonus:   bool  = False
-    beta:             float = 0.05        # README: β=0.05 主配置
+    use_info_bonus:      bool  = False
+    beta:                float = 0.05        # 内部β: r_info = I(partner) - β·I(opponent)
+    info_reward_weight:  float = 0.02        # 外部权重: total_reward += w · r_info_scaled
 
     # ── FSP ─────────────────────────────────────────────────────────────────
     fsp_pool_size:    int   = 10          # Kita et al. 2024
     fsp_add_interval: int   = 2           # 每 N 轮将 actor 存入 pool
 
-    # ── JIT Belief Burn-in ──────────────────────────────────────────────────
-    jit_burnin_deals:  int  = 3000        # P56: 1000→3000，追赶 actor 策略变化速度
-    jit_burnin_epochs: int  = 3           # 快速微调 epoch 数
+    # ── JIT Belief Burn-in + Replay Buffer ───────────────────────────────
+    jit_burnin_deals:  int  = 3000        # 每轮新采集的belief数据量
+    jit_burnin_epochs: int  = 5           # P84: 3→5, replay buffer数据更多可多训几轮
+    belief_replay_capacity: int = 50000   # P84: FIFO replay buffer容量（样本数）
 
     # ── Critic Warmup ───────────────────────────────────────────────────────
     critic_prewarm_deals:  int   = 2048
@@ -115,9 +117,81 @@ class SubgameConfig:
     active_players:      Optional[List[int]] = None   # None = 全部四方
     eval_interval:       int   = 200
     log_interval:        int   = 50
-    oracle_snap_interval: int  = 1     # 每轮都做 oracle 快照（DDS 已预计算，几乎零开销）
-    oracle_snap_deals:   int   = 500   # 500 局，误差 ±0.3 IMP，趋势清晰
     device:              str   = 'cpu'
+    # ── 早停（基于 value_loss 平稳性）──────────────────────────────────────
+    early_stop_patience:   int   = 8
+    early_stop_vl_delta:   float = 0.15
+    early_stop_enabled:    bool  = True
+
+
+# ==============================================================================
+# Belief Replay Buffer (P84)
+# ==============================================================================
+
+class BeliefReplayBuffer:
+    """
+    FIFO replay buffer for Belief Network training data.
+
+    解决灾难性遗忘：JIT burn-in时从整个buffer采样训练，
+    而不是只用当前轮的3000局数据。Buffer保留最近几轮的数据，
+    自然淘汰过时样本。
+
+    存储格式：5个numpy array，按行对齐。
+    """
+
+    def __init__(self, capacity: int = 50000):
+        self.capacity = capacity
+        self.oh:  Optional[np.ndarray] = None   # observer_hand (N, 52)
+        self.h:   Optional[np.ndarray] = None   # history (N, max_len, NUM_BIDS)
+        self.op:  Optional[np.ndarray] = None   # observer_pos (N,)
+        self.tp:  Optional[np.ndarray] = None   # target_pos (N,)
+        self.tgt: Optional[np.ndarray] = None   # belief_target (N, BELIEF_DIM)
+        self.size = 0
+
+    def add_batch(self, belief_data: List[dict]):
+        """将一批belief数据加入buffer，超出容量则FIFO淘汰最老数据。"""
+        if not belief_data:
+            return
+
+        oh  = np.stack([s['observer_hand'] for s in belief_data])
+        h   = np.stack([s['history']       for s in belief_data])
+        op  = np.array([s['observer_pos']  for s in belief_data])
+        tp  = np.array([s['target_pos']    for s in belief_data])
+        tgt = np.stack([s['belief_target'] for s in belief_data])
+
+        if self.oh is None:
+            # 首次添加
+            self.oh, self.h, self.op, self.tp, self.tgt = oh, h, op, tp, tgt
+        else:
+            self.oh  = np.concatenate([self.oh,  oh],  axis=0)
+            self.h   = np.concatenate([self.h,   h],   axis=0)
+            self.op  = np.concatenate([self.op,  op],  axis=0)
+            self.tp  = np.concatenate([self.tp,  tp],  axis=0)
+            self.tgt = np.concatenate([self.tgt, tgt], axis=0)
+
+        # FIFO截断
+        if len(self.oh) > self.capacity:
+            excess = len(self.oh) - self.capacity
+            self.oh  = self.oh[excess:]
+            self.h   = self.h[excess:]
+            self.op  = self.op[excess:]
+            self.tp  = self.tp[excess:]
+            self.tgt = self.tgt[excess:]
+
+        self.size = len(self.oh)
+
+    def get_tensors(self):
+        """返回全量数据的torch tensor（CPU）。"""
+        return (
+            torch.tensor(self.oh,  dtype=torch.float32),
+            torch.tensor(self.h,   dtype=torch.float32),
+            torch.tensor(self.op,  dtype=torch.long),
+            torch.tensor(self.tp,  dtype=torch.long),
+            torch.tensor(self.tgt, dtype=torch.float32),
+        )
+
+    def __len__(self):
+        return self.size
 
 
 # ==============================================================================
@@ -265,6 +339,8 @@ class SubgameTrainer:
                 self.belief_net.parameters(), lr=config.belief_lr)
             self.partner_stats  = RunningStats()
             self.opponent_stats = RunningStats()
+            self.belief_replay  = BeliefReplayBuffer(
+                capacity=config.belief_replay_capacity)
 
         # ── reward 归一化（外部传入，跨 phase 持久）────────────────────────
         self.reward_stats: RunningStats = reward_stats or RunningStats()
@@ -282,6 +358,9 @@ class SubgameTrainer:
         # ── 日志 ───────────────────────────────────────────────────────────
         self.log: List[dict] = []
         self._global_step = 0
+        # ── 早停状态 ───────────────────────────────────────────────────────
+        self._vl_history: List[float] = []
+        self._fsp_seeded: bool = False
 
     # ======================================================================
     # BC 预热（rule-based）
@@ -804,60 +883,76 @@ class SubgameTrainer:
         self.belief_net.train()
         print(f"[Belief Pretrain] Done. best_val_loss={best_val:.4f}")
 
+        # P84: 将pretrain数据填入replay buffer作为初始先验
+        if hasattr(self, 'belief_replay'):
+            self.belief_replay.add_batch(belief_data)
+            print(f"  [Replay Buffer] Seeded with {len(belief_data)} pretrain samples "
+                  f"(buffer size: {len(self.belief_replay)})")
+
     # ======================================================================
     # JIT Belief Burn-in
     # ======================================================================
 
     def jit_belief_burnin(self):
         """
-        每次 N-phase 开始前对 Belief Net 做快速微调.
+        P84: Replay Buffer版JIT Belief Burn-in.
 
-        采集 jit_burnin_deals 局 rollout，训练 jit_burnin_epochs epoch。
-        防止 N 策略更新后 Belief Net OOD。
+        1. 采集 jit_burnin_deals 局新数据
+        2. 将新数据加入 belief_replay（FIFO，自动淘汰最老数据）
+        3. 从整个 replay buffer 采样训练 jit_burnin_epochs 个epoch
+
+        解决灾难性遗忘：训练数据包含历史先验，不会被当前轮的小数据集洗掉。
         """
         if self.belief_net is None or self.belief_optimizer is None:
             return
 
         print(f"  [JIT Burn-in] Collecting {self.config.jit_burnin_deals} deals...")
-        episodes = self._collect_episodes(self.config.jit_burnin_deals,
-                                          use_fsp_opponent=False)
+        episodes = self._collect_episodes_batch(
+            self.config.jit_burnin_deals, train_side='NS',
+            fsp_sd=None, batch_size=self.config.deals_per_step,
+            skip_dual_table=True)
 
-        belief_data = []
+        # 提取belief数据
+        new_belief_data = []
         for ep in episodes:
             for step in ep:
-                if 'belief_target' in step:
-                    belief_data.append(step)
+                if 'belief_target' in step and not step.get('ew_diagnostic'):
+                    new_belief_data.append(step)
 
-        if not belief_data:
+        if not new_belief_data:
             return None
+
+        # 加入replay buffer
+        self.belief_replay.add_batch(new_belief_data)
+
+        # 从整个buffer采样训练
+        oh_t, h_t, op_t, tp_t, tgt_t = self.belief_replay.get_tensors()
+        N = len(self.belief_replay)
 
         self.belief_net.train()
         criterion = nn.BCEWithLogitsLoss(
             pos_weight=self.belief_net.pos_weight.to(self.device))
-
-        # 预先批量化，避免逐样本 forward
-        oh_all  = torch.tensor(np.stack([s['observer_hand'] for s in belief_data]), dtype=torch.float32)
-        h_all   = torch.tensor(np.stack([s['history']       for s in belief_data]), dtype=torch.float32)
-        op_all  = torch.tensor([s['observer_pos'] for s in belief_data], dtype=torch.long)
-        tp_all  = torch.tensor([s['target_pos']   for s in belief_data], dtype=torch.long)
-        tgt_all = torch.tensor(np.stack([s['belief_target'] for s in belief_data]), dtype=torch.float32)
-        N = len(belief_data); bs = min(256, N); final_loss = 0.0
+        bs = min(512, N)
+        final_loss = 0.0
 
         for epoch in range(self.config.jit_burnin_epochs):
             perm = np.random.permutation(N)
             tl = 0.0; nb = 0
             for s in range(0, N, bs):
                 idx = perm[s:s+bs]
-                logits = self.belief_net(oh_all[idx].to(self.device), h_all[idx].to(self.device),
-                                         op_all[idx].to(self.device), tp_all[idx].to(self.device))
-                loss = criterion(logits, tgt_all[idx].to(self.device))
+                logits = self.belief_net(
+                    oh_t[idx].to(self.device), h_t[idx].to(self.device),
+                    op_t[idx].to(self.device), tp_t[idx].to(self.device))
+                loss = criterion(logits, tgt_t[idx].to(self.device))
                 self.belief_optimizer.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(self.belief_net.parameters(), self.config.max_grad_norm)
+                nn.utils.clip_grad_norm_(
+                    self.belief_net.parameters(), self.config.max_grad_norm)
                 self.belief_optimizer.step()
                 tl += loss.item(); nb += 1
             final_loss = tl / max(1, nb)
 
-        print(f"  [JIT Burn-in] Done. loss={final_loss:.4f} samples={N}")
+        print(f"  [JIT Burn-in] Done. loss={final_loss:.4f} "
+              f"new={len(new_belief_data)} buffer={N}")
         return final_loss
 
     # ======================================================================
@@ -905,7 +1000,7 @@ class SubgameTrainer:
         slot_done   = [True] * batch_size
 
         all_episodes: List[List[dict]] = []
-        _pending_swaps: List[Tuple]   = []   # P56: batch swap queue
+        _pending_rewards: List[Tuple]   = []   # P76: single-table DDS IMP reward queue
         collected = 0
 
         def _reset(i):
@@ -987,12 +1082,14 @@ class SubgameTrainer:
                 player    = envs[i].current_player
                 all_hands = envs[i]._current_hands.copy()
 
+                opener_seats_i = {slot_dealer[i], (slot_dealer[i] + 2) % 4}
                 step = {
                     'flat_obs': flat_obs, 'legal_actions': legal_actions,
                     'action': action, 'log_prob': log_prob, 'value': value,
                     'reward': 0.0, 'done': False,
                     'all_hands': all_hands, 'player': player,
                     'is_training_side': is_train,
+                    'is_opener': player in opener_seats_i,
                 }
 
                 # Belief 数据记录
@@ -1033,11 +1130,10 @@ class SubgameTrainer:
 
                 if done:
                     all_episodes.append(slot_ep[i])
-                    # stash deal info for batch swap rollout
+                    # P76: 单桌DDS IMP reward，不再做换桌rollout
                     if not skip_dual_table:
-                        _pending_swaps.append((
-                            len(all_episodes) - 1,      # ep index
-                            envs[i]._current_hands.copy(),
+                        _pending_rewards.append((
+                            len(all_episodes) - 1,
                             envs[i]._current_dd.copy(),
                             slot_dealer[i],
                             envs[i]._vulnerability,
@@ -1048,22 +1144,29 @@ class SubgameTrainer:
                     if collected < num_deals:
                         slot_obs[i] = _reset(i)
 
-        # ── P56: 批量换桌 rollout，一次性计算所有双桌 IMP ─────────────────
-        if not skip_dual_table and _pending_swaps:
-            deals_for_swap = [
-                (hands, dd, dealer, vul)
-                for _, hands, dd, dealer, vul, _ in _pending_swaps
-            ]
-            scores_sw = self._play_swapped_table_batch(deals_for_swap, fsp_sd)
-
-            for (ep_idx, hands, dd, dealer, vul, contract), score2_sw in \
-                    zip(_pending_swaps, scores_sw):
-                score1    = self.env._compute_score_ns(contract, dd, vul)
-                imp_ns    = float(score_to_imp(score1 - (-score2_sw)))
+        # ── P82: 每个player的最后一步都标记done=True并赋对应reward ────────
+        # 旧逻辑只给env.step()返回done=True的那个step（最后行动者）赋reward，
+        # 导致同一局中其他player的所有step reward=0且done=False，
+        # GAE无法正确切分episode边界，且大部分player学不到任何信号。
+        # 修复：遍历episode找到每个player最后出现的step，标记done+赋reward。
+        if not skip_dual_table and _pending_rewards:
+            for (ep_idx, dd, dealer, vul, contract) in _pending_rewards:
+                score_ns    = self.env._compute_score_ns(contract, dd, vul)
+                score_opt   = self.env._compute_dds_optimal_score_ns(dd, vul)
+                imp_ns      = float(score_to_imp(score_ns  - score_opt))
+                imp_ew      = float(score_to_imp(score_opt - score_ns))
                 opener_seats = {dealer, (dealer + 2) % 4}
-                for s in all_episodes[ep_idx]:
-                    if s['done']:
-                        s['reward'] = imp_ns if s['player'] in opener_seats else -imp_ns
+
+                # 找每个player最后出现的step index
+                last_step_idx: Dict[int, int] = {}
+                for s_idx, s in enumerate(all_episodes[ep_idx]):
+                    last_step_idx[s['player']] = s_idx
+
+                # 给每个player的最后一步标记done=True并赋reward
+                for player, s_idx in last_step_idx.items():
+                    s = all_episodes[ep_idx][s_idx]
+                    s['done']   = True
+                    s['reward'] = imp_ns if player in opener_seats else imp_ew
 
         return all_episodes[:num_deals]
 
@@ -1246,84 +1349,69 @@ class SubgameTrainer:
         if self.dual_info is None:
             return [[0.0] * len(ep) for ep in episodes]
 
-        raw_ep_bonuses: List[List[float]] = []
+        # P75 Fix A: 全批量化——从O(N×4次单样本forward)降到O(4次批量forward)
+        valid_steps: List[dict] = []
+        ep_step_idx: List[tuple] = []
+        for ep_idx, ep in enumerate(episodes):
+            for s_idx, step in enumerate(ep):
+                if 'belief_target' in step and not step.get('ew_diagnostic'):
+                    valid_steps.append(step)
+                    ep_step_idx.append((ep_idx, s_idx))
 
-        for ep in episodes:
-            bonuses = []
-            for step in ep:
-                if 'belief_target' not in step or step.get('ew_diagnostic'):
-                    bonuses.append(0.0)
-                    continue
+        raw_ep_bonuses: List[List[float]] = [[0.0] * len(ep) for ep in episodes]
+        if not valid_steps:
+            return raw_ep_bonuses
 
-                player  = step['player']
-                partner = (player + 2) % 4
-                opp     = (player + 1) % 4
+        n = len(valid_steps)
+        oh_arr   = np.stack([s['observer_hand'] for s in valid_steps])
+        hb_arr   = np.stack([self._encode_history(s.get('history_int_before', [])) for s in valid_steps])
+        ha_arr   = np.stack([self._encode_history(s.get('history_int_after',  [])) for s in valid_steps])
+        tgt_arr  = np.stack([s['belief_target']  for s in valid_steps])
+        op_arr   = np.array([s['player']          for s in valid_steps])
+        pp_arr   = np.array([(s['player']+2)%4    for s in valid_steps])
+        oo_arr   = np.array([(s['player']+1)%4    for s in valid_steps])
+        opp_tgt_arr = np.stack([hand_to_belief_target(s['all_hands'][(s['player']+1)%4]) for s in valid_steps])
 
-                h_before_enc = self._encode_history(step.get('history_int_before', []))
-                h_after_enc  = self._encode_history(step.get('history_int_after',  []))
+        oh_t      = torch.tensor(oh_arr,      dtype=torch.float32).to(self.device)
+        hb_t      = torch.tensor(hb_arr,      dtype=torch.float32).to(self.device)
+        ha_t      = torch.tensor(ha_arr,      dtype=torch.float32).to(self.device)
+        tgt_t     = torch.tensor(tgt_arr,     dtype=torch.float32).to(self.device)
+        op_t      = torch.tensor(op_arr,      dtype=torch.long).to(self.device)
+        pp_t      = torch.tensor(pp_arr,      dtype=torch.long).to(self.device)
+        oo_t      = torch.tensor(oo_arr,      dtype=torch.long).to(self.device)
+        opp_tgt_t = torch.tensor(opp_tgt_arr, dtype=torch.float32).to(self.device)
 
-                oh  = torch.tensor(step['observer_hand'], dtype=torch.float32
-                                   ).unsqueeze(0).to(self.device)
-                hb  = torch.tensor(h_before_enc, dtype=torch.float32
-                                   ).unsqueeze(0).to(self.device)
-                ha  = torch.tensor(h_after_enc,  dtype=torch.float32
-                                   ).unsqueeze(0).to(self.device)
-                tgt = torch.tensor(step['belief_target'], dtype=torch.float32
-                                   ).unsqueeze(0).to(self.device)
+        CHUNK = 2048
+        bonuses_flat = np.zeros(n, dtype=np.float32)
+        with torch.no_grad():
+            for start in range(0, n, CHUNK):
+                sl = slice(start, start + CHUNK)
+                b_before_p   = self.belief_net.get_probs(oh_t[sl], hb_t[sl], op_t[sl], pp_t[sl])
+                b_after_p    = self.belief_net.get_probs(oh_t[sl], ha_t[sl], op_t[sl], pp_t[sl])
+                partner_gain = self.dual_info.compute_info_gain(b_before_p, b_after_p, tgt_t[sl])
+                b_before_o   = self.belief_net.get_probs(oh_t[sl], hb_t[sl], op_t[sl], oo_t[sl])
+                b_after_o    = self.belief_net.get_probs(oh_t[sl], ha_t[sl], op_t[sl], oo_t[sl])
+                opp_leak     = self.dual_info.compute_info_gain(b_before_o, b_after_o, opp_tgt_t[sl])
+                bonus, _     = self.dual_info.compute_dual_info_bonus(partner_gain, opp_leak)
+                bonuses_flat[start:start + CHUNK] = bonus.cpu().numpy()
 
-                op_t = torch.tensor([player],  dtype=torch.long).to(self.device)
-                pp_t = torch.tensor([partner], dtype=torch.long).to(self.device)
-                oo_t = torch.tensor([opp],     dtype=torch.long).to(self.device)
+        for i, (ep_idx, s_idx) in enumerate(ep_step_idx):
+            raw_ep_bonuses[ep_idx][s_idx] = float(bonuses_flat[i])
 
-                with torch.no_grad():
-                    b_before_p = self.belief_net.get_probs(oh, hb, op_t, pp_t)
-                    b_after_p  = self.belief_net.get_probs(oh, ha, op_t, pp_t)
-                    partner_gain = self.dual_info.compute_info_gain(
-                        b_before_p, b_after_p, tgt)
-
-                    b_before_o = self.belief_net.get_probs(oh, hb, op_t, oo_t)
-                    b_after_o  = self.belief_net.get_probs(oh, ha, op_t, oo_t)
-                    opp_tgt = torch.tensor(
-                        hand_to_belief_target(step['all_hands'][opp]),
-                        dtype=torch.float32).unsqueeze(0).to(self.device)
-                    opponent_leak = self.dual_info.compute_info_gain(
-                        b_before_o, b_after_o, opp_tgt)
-
-                    bonus, _ = self.dual_info.compute_dual_info_bonus(
-                        partner_gain, opponent_leak)
-
-                bonuses.append(float(bonus.item()))
-            raw_ep_bonuses.append(bonuses)
-
-        # ── 量纲归一化 (P73) ────────────────────────────────────────────────
-        # P73 修复：集中到最后一步（与IMP时序对齐），只做Scale不做Shift。
-        #
-        # 旧方案（P55）问题：
-        #   - r_info 均摊到每步 → Dense reward；IMP 只在终步 → Sparse reward。
-        #   - GAE 累加 dense r_info 导致中间步 return 膨胀4-8倍，Critic无法拟合。
-        #
-        # 新方案：
-        #   - per-episode r_info 之和集中赋给 done=True 的那一步。
-        #   - 只做 scale（std对齐IMP），不减mean（保留信息增益的非负性质）。
-        #   - scale_factor 上限1000，防止早期 rinfo_std≈0 时除以极小数爆炸。
-
+        # ── 量纲归一化 (P73) + 外部权重 (P83) ───────────────────────────────
+        # P73: 集中到最后一步（与IMP时序对齐），只做Scale不做Shift。
+        # P83: 乘以 info_reward_weight 控制 r_info 在总 reward 中的占比。
         ep_totals = [sum(b for b in bs) for bs in raw_ep_bonuses]
-
-        # 更新运行统计（只用于计算scale，不做shift）
         for v in ep_totals:
             self.partner_stats.update(v)
-
         imp_std   = max(self.reward_stats.std, 1.0)
         rinfo_std = max(self.partner_stats.std, 1e-6)
-        scale_factor = min(imp_std / rinfo_std, 1000.0)   # 上限防爆炸
-
-        # 集中到最后一步（done=True的位置），其余步归零
+        scale_factor = min(imp_std / rinfo_std, 1000.0) * self.config.info_reward_weight
         scaled_episodes = []
         for ep_bonuses, ep_total in zip(raw_ep_bonuses, ep_totals):
             scaled = [0.0] * len(ep_bonuses)
-            scaled[-1] = ep_total * scale_factor   # 最后一步接收全部bonus
+            scaled[-1] = ep_total * scale_factor
             scaled_episodes.append(scaled)
-
         return scaled_episodes
 
     # ======================================================================
@@ -1465,17 +1553,28 @@ class SubgameTrainer:
 
     def run(self, num_rounds: int = None) -> List[dict]:
         """
-        双桌 IBR 训练 (P55):
-          每局 done 时跑换桌 rollout，reward = 双桌 IMP（非 oracle regret）
-          开叫方阵营 +IMP，争叫方阵营 -IMP
-          Agent B: r_info 归一化到 IMP 量纲后叠加
+        双桌对称训练 (P82):
+          每轮对同一批牌做两次 rollout:
+            桌1: agent=NS, FSP=EW → NS actors 学习
+            桌2: agent=EW, FSP=NS → EW actors 学习
+          Reward: 每桌独立 DDS regret = score_to_imp(score - dds_optimal)，可正可负。
+          四方 actor 每轮都更新。
         """
         num_rounds = num_rounds or self.config.num_rounds
         n_deals    = self.config.steps_per_phase * self.config.deals_per_step
         batch_sz   = self.config.deals_per_step
+        cfg = self.config
+        print(f"[Config] kl_lambda_start={cfg.kl_lambda_start}  kl_lambda_end={cfg.kl_lambda_end}  kl_anneal_frac={cfg.kl_anneal_frac}")
+        print(f"[Config] num_rounds={num_rounds}  deals_per_step={cfg.deals_per_step}  n_deals_per_phase={n_deals}  use_info_bonus={cfg.use_info_bonus}  beta={cfg.beta}")
 
         print("\n[Trainer] Critic warmup...")
         self.critic_warmup()
+
+        # P74: FSP Pool用BC checkpoint作为pool[0]
+        if not self._fsp_seeded and self.config.fsp_pool_size > 0:
+            self.fsp_pool.add(self.agent)
+            self._fsp_seeded = True
+            print(f"  [FSP] Seeded pool with BC checkpoint (pool size: {len(self.fsp_pool)})")
 
         for rnd in range(num_rounds):
             print(f"\n══════ Round {rnd+1}/{num_rounds} ══════")
@@ -1484,21 +1583,22 @@ class SubgameTrainer:
             _ir_vals: list = []; _bl_vals: list = []
             ns_metrics: dict = {}; ew_metrics: dict = {}
 
-            # ── 桌1: 训练 NS ────────────────────────────────────────────
+            # ── 桌1: agent=NS, FSP=EW ──────────────────────────────────
             print(f"  [Table1/NS] Collecting {n_deals} deals (batch={batch_sz})...")
             ns_eps = self._collect_episodes_batch(
                 n_deals, train_side='NS', fsp_sd=fsp_sd, batch_size=batch_sz)
 
-            # 更新 IMP reward 运行统计（供 r_info 归一化用）
-            # 必须在 r_info 叠加之前采集，保证 reward_stats 是纯 IMP 分布
-            raw_imp_vals = []
+            # 收集NS方的DDS regret用于reward_stats和日志（每局一个值）
+            raw_ns_vals = []
             for ep in ns_eps:
                 for step in ep:
                     if step.get('done') and step['player'] in (NORTH, SOUTH):
                         v = float(step['reward'])
                         self.reward_stats.update(v)
-                        raw_imp_vals.append(v)
+                        raw_ns_vals.append(v)
+                        break  # 同一局NS方reward相同，只取一次
 
+            # r_info bonus（Agent B only, NS桌）
             if self.config.use_info_bonus:
                 bonuses = self._compute_info_bonus(ns_eps)
                 for ep, bs in zip(ns_eps, bonuses):
@@ -1506,6 +1606,7 @@ class SubgameTrainer:
                         step['reward'] += b
                         if b != 0.0: _ir_vals.append(b)
 
+            # 存NS actors的数据并update
             for ep in ns_eps:
                 for step in ep:
                     if step['player'] in (NORTH, SOUTH):
@@ -1524,18 +1625,22 @@ class SubgameTrainer:
                 bl = self.jit_belief_burnin()
                 if bl is not None: _bl_vals.append(bl)
 
-            # ── 桌2: 训练 EW ────────────────────────────────────────────
+            # ── 桌2: agent=EW, FSP=NS ──────────────────────────────────
             print(f"  [Table2/EW] Collecting {n_deals} deals (batch={batch_sz})...")
             ew_eps = self._collect_episodes_batch(
                 n_deals, train_side='EW', fsp_sd=fsp_sd, batch_size=batch_sz)
 
-            # P73 Fix 2: EW 的 IMP stats 更新（reward_stats 供 r_info scale 用）
+            # 收集EW方的DDS regret（每局一个值）
+            raw_ew_vals = []
             for ep in ew_eps:
                 for step in ep:
                     if step.get('done') and step['player'] in (EAST, WEST):
-                        self.reward_stats.update(float(step['reward']))
+                        v = float(step['reward'])
+                        self.reward_stats.update(v)
+                        raw_ew_vals.append(v)
+                        break  # 同一局EW方reward相同，只取一次
 
-            # P73 Fix 2: EW 也叠加 r_info（之前只有 NS 有，导致对称性破坏）
+            # r_info bonus（Agent B only, EW桌）
             if self.config.use_info_bonus:
                 ew_bonuses = self._compute_info_bonus(ew_eps)
                 for ep, bs in zip(ew_eps, ew_bonuses):
@@ -1543,6 +1648,7 @@ class SubgameTrainer:
                         step['reward'] += b
                         if b != 0.0: _ir_vals.append(b)
 
+            # 存EW actors的数据并update
             for ep in ew_eps:
                 for step in ep:
                     if step['player'] in (EAST, WEST):
@@ -1555,27 +1661,40 @@ class SubgameTrainer:
                 m = self._safe_update(p, rnd)
                 if m: ew_metrics[p] = m
 
-            # ── Oracle 快照（每 oracle_snap_interval 轮，仅观察）────────────
-            oracle_snap = None
-            snap_iv = self.config.oracle_snap_interval
-            if snap_iv > 0 and (rnd + 1) % snap_iv == 0:
-                oracle_snap = self._oracle_snapshot(self.config.oracle_snap_deals)
-
             # ── 日志 ────────────────────────────────────────────────────
-            mean_r = float(np.mean(raw_imp_vals)) if raw_imp_vals else 0.0
-            std_r  = float(np.std(raw_imp_vals))  if raw_imp_vals else 0.0
+            all_vals = raw_ns_vals + raw_ew_vals
+            mean_r = float(np.mean(all_vals)) if all_vals else 0.0
+            std_r  = float(np.std(all_vals))  if all_vals else 0.0
+            mean_ns = float(np.mean(raw_ns_vals)) if raw_ns_vals else 0.0
+            mean_ew = float(np.mean(raw_ew_vals)) if raw_ew_vals else 0.0
 
             log_entry = {
                 'round': rnd+1, 'mean_reward': mean_r, 'std_reward': std_r,
+                'mean_ns_regret': mean_ns, 'mean_ew_regret': mean_ew,
                 'ns_metrics': ns_metrics, 'ew_metrics': ew_metrics,
                 'fsp_pool_size': len(self.fsp_pool),
                 'mean_ir':    float(np.mean(_ir_vals)) if _ir_vals else None,
                 'belief_loss': float(np.mean(_bl_vals)) if _bl_vals else None,
                 'imp_std_running': float(self.reward_stats.std),
-                'oracle_regret_snap': oracle_snap,
             }
             self.log.append(log_entry)
             self._print_log(log_entry)
+
+            # P74: 早停——基于value_loss平稳性
+            if self.config.early_stop_enabled:
+                all_vl = []
+                for m in list(ns_metrics.values()) + list(ew_metrics.values()):
+                    if 'value_loss' in m:
+                        all_vl.append(m['value_loss'])
+                if all_vl:
+                    self._vl_history.append(float(np.mean(all_vl)))
+                pat = self.config.early_stop_patience
+                if len(self._vl_history) >= pat:
+                    window = self._vl_history[-pat:]
+                    vl_range = max(window) - min(window)
+                    if vl_range < self.config.early_stop_vl_delta:
+                        print(f"\n  [Early Stop] vl plateau (range={vl_range:.3f} < {self.config.early_stop_vl_delta} over {pat} rounds). Stopping at round {rnd+1}.")
+                        break
 
         return self.log
 
@@ -1584,13 +1703,12 @@ class SubgameTrainer:
         fsp = entry['fsp_pool_size']
         mr  = entry['mean_reward']
         sr  = entry['std_reward']
+        ns_r = entry.get('mean_ns_regret', 0.0)
+        ew_r = entry.get('mean_ew_regret', 0.0)
 
-        # oracle regret snapshot（仅观察，每 oracle_snap_interval 轮计算一次）
-        snap = entry.get('oracle_regret_snap')
-        snap_str = f"  oracle≈{snap:+.2f}" if snap is not None else ""
-        print(f"  [Round {rnd}] imp={mr:+.3f}±{sr:.3f}{snap_str}  fsp={fsp}")
+        print(f"  [Round {rnd}] regret={mr:+.3f}±{sr:.3f}  (NS={ns_r:+.3f} EW={ew_r:+.3f})  fsp={fsp}")
 
-        ns = entry.get('ns_metrics', entry.get('s_metrics', {}))
+        ns = entry.get('ns_metrics', {})
         ns_n = ns.get(NORTH, {}); ns_s = ns.get(SOUTH, {})
         if ns_n or ns_s:
             print(f"    NS │ N: pl={ns_n.get('policy_loss',0):+.4f} "
@@ -1601,7 +1719,7 @@ class SubgameTrainer:
                   f"ent={ns_s.get('entropy',0):.3f} "
                   f"kl={ns_s.get('kl_loss',0):.5f}(λ={ns_s.get('kl_lambda',0):.3f})")
 
-        ew = entry.get('ew_metrics', entry.get('n_metrics', {}))
+        ew = entry.get('ew_metrics', {})
         ew_e = ew.get(EAST, {}); ew_w = ew.get(WEST, {})
         if ew_e or ew_w:
             print(f"    EW │ E: pl={ew_e.get('policy_loss',0):+.4f} "
@@ -1616,14 +1734,60 @@ class SubgameTrainer:
         bl = entry.get('belief_loss')
         if ir is not None:
             bl_str = f"{bl:.4f}" if bl is not None else "N/A"
-            # ep_equiv: episode-level r_info 等效 IMP（≈ step-level × ~8 steps/ep）
-            ep_equiv = abs(ir) * 8
-            print(f"    r_info │ step_ir={ir:.4f}  ep_equiv≈{ep_equiv:.3f} IMP  "
-                  f"belief_loss={bl_str}")
+            print(f"    r_info │ step_ir={ir:.4f}  belief_loss={bl_str}")
 
     # ======================================================================
     # 评估
     # ======================================================================
+
+    def _mini_h2h_snapshot(self, num_deals: int = 100) -> float:
+        """
+        Mini head-to-head: 当前agent vs FSP pool最新checkpoint，双桌IMP。
+
+        正值=当前agent比上一个版本自己强，是训练收敛的直接信号。
+        负值=训练后退化。
+        FSP pool为空时（训练初期）返回None。
+        """
+        from subgames.competitive_env import cross_evaluate
+
+        if self.fsp_pool.is_empty():
+            return None
+
+        fsp_sd = self.fsp_pool.latest()   # 最新的FSP checkpoint作为基准对手
+        env    = self.env
+        device = self.device
+
+        def _current_policy(obs, player, history_int):
+            flat   = encode_obs_flat(obs, env.dealer, history_int)
+            flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
+            legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(device)
+            actor  = self.agent.get_actor(player)
+            with torch.no_grad():
+                action, _, _ = actor.get_action(flat_t, legal, deterministic=True)
+            return action.item()
+
+        def _fsp_policy(obs, player, history_int):
+            flat   = encode_obs_flat(obs, env.dealer, history_int)
+            flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
+            legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(device)
+            role   = {0:'actor_n', 1:'actor_e', 2:'actor_s', 3:'actor_w'}[player]
+            if role not in fsp_sd:
+                actor = self.agent.get_actor(player)
+            else:
+                actor = self._get_fsp_actor(player, fsp_sd)
+            with torch.no_grad():
+                action, _, _ = actor.get_action(flat_t, legal, deterministic=True)
+            return action.item()
+
+        result = cross_evaluate(
+            env,
+            agent_a_ns_policy=_current_policy,
+            agent_a_ew_policy=_current_policy,
+            agent_b_ns_policy=_fsp_policy,
+            agent_b_ew_policy=_fsp_policy,
+            num_deals=num_deals,
+        )
+        return float(result.mean_imp)
 
     def _oracle_snapshot(self, num_deals: int = 100) -> float:
         """

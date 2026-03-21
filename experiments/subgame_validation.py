@@ -58,41 +58,45 @@ def run_competitive(args):
     # ── Agent A（控制组：纯 MAPPO，beta=0）──────────────────────────────────
     print("\n[2] Building Agent A (MAPPO, β=0)...")
     cfg_a = SubgameConfig(
-        num_rounds      = args.rounds,
-        steps_per_phase = 50 if args.quick else 100,   # P56: 200→100 (deals_per_step×4)
-        deals_per_step  = 32 if args.quick else 128,   # P56: 32→128, 4× larger batches
-        lr              = 3e-6,
-        batch_size      = 256,
-        use_info_bonus  = False,
-        beta            = 0.0,
-        fsp_pool_size   = 10,
-        fsp_add_interval= 2,
-        kl_lambda_start = 0.1,
-        kl_lambda_end   = 0.01,
+        num_rounds       = args.rounds,
+        steps_per_phase  = 10  if args.quick else 64,
+        deals_per_step   = 32  if args.quick else 512,
+        lr               = 3e-6,
+        batch_size       = 256,
+        use_info_bonus   = False,
+        beta             = 0.0,
+        fsp_pool_size    = 10,
+        fsp_add_interval = 2,
+        kl_lambda_start  = 1.5,
+        kl_lambda_end    = 1.5,
+        kl_anneal_frac   = 0.0,
         bc_warmup_samples= 1000 if args.quick else 5000,
-        bc_warmup_epochs = 5   if args.quick else 20,
-        device          = device,
+        bc_warmup_epochs = 5    if args.quick else 20,
+        device           = device,
     )
     reward_stats_a = RunningStats()
     trainer_a = SubgameTrainer(env, cfg_a, reward_stats=reward_stats_a)
 
     # ── Agent B（实验组：MAPPO + r_info，beta=args.beta）────────────────────
-    print(f"\n[3] Building Agent B (MAPPO + r_info, β={args.beta})...")
+    print(f"\n[3] Building Agent B (MAPPO + r_info, β={args.beta}, w={args.info_weight})...")
     cfg_b = SubgameConfig(
-        num_rounds      = args.rounds,
-        steps_per_phase = 50 if args.quick else 100,   # P56: same as A
-        deals_per_step  = 32 if args.quick else 128,   # P56: same as A
-        lr              = 3e-6,
-        batch_size      = 256,
-        use_info_bonus  = True,
-        beta            = args.beta,
-        fsp_pool_size   = 10,
-        fsp_add_interval= 2,
-        kl_lambda_start = 0.1,
-        kl_lambda_end   = 0.01,
+        # 与A完全对称，唯一区别是use_info_bonus、beta、info_reward_weight
+        num_rounds       = args.rounds,
+        steps_per_phase  = 10  if args.quick else 64,
+        deals_per_step   = 32  if args.quick else 512,
+        lr               = 3e-6,
+        batch_size       = 256,
+        use_info_bonus   = True,
+        beta             = args.beta,
+        info_reward_weight = args.info_weight,
+        fsp_pool_size    = 10,
+        fsp_add_interval = 2,
+        kl_lambda_start  = 1.5,
+        kl_lambda_end    = 1.5,
+        kl_anneal_frac   = 0.0,
         bc_warmup_samples= 1000 if args.quick else 5000,
-        bc_warmup_epochs = 5   if args.quick else 20,
-        device          = device,
+        bc_warmup_epochs = 5    if args.quick else 20,
+        device           = device,
     )
     reward_stats_b = RunningStats()
     trainer_b = SubgameTrainer(env, cfg_b, reward_stats=reward_stats_b)
@@ -100,26 +104,32 @@ def run_competitive(args):
     # ── Stage 1: 初始化（SL checkpoint 优先，否则 rule-based BC）──────────────
     from env import NORTH as _N, EAST as _E, SOUTH as _S, WEST as _W
     sl_path = getattr(args, 'sl_checkpoint', None)
+
+    # 确定哪些trainer需要SL初始化
+    trainers_to_init = [trainer_b] if args.load_agent_a else [trainer_a, trainer_b]
+
     if sl_path and os.path.exists(sl_path):
         print(f"\n[Stage 1] Loading SL checkpoint: {sl_path}")
         ckpt = torch.load(sl_path, map_location=device)
         player_key_map = [(_N, 'actor_n'), (_E, 'actor_e'),
                           (_S, 'actor_s'), (_W, 'actor_w')]
-        for trainer in (trainer_a, trainer_b):
+        for trainer in trainers_to_init:
             for player, key in player_key_map:
                 if key in ckpt:
                     trainer.agent.get_actor(player).load_state_dict(
                         {k: v.to(device) for k, v in ckpt[key].items()})
-        print("  [SL Init] Weights loaded for N/E/S/W actors (both agents).")
+        init_names = "B only" if args.load_agent_a else "both agents"
+        print(f"  [SL Init] Weights loaded for N/E/S/W actors ({init_names}).")
     else:
         print("\n[Stage 1] BC Warmup (rule-based, SL checkpoint not found)...")
-        trainer_a.run_bc_warmup()
-        trainer_b.run_bc_warmup()
+        for trainer in trainers_to_init:
+            trainer.run_bc_warmup()
 
     # Stage 1 结束：将当前 actor 设为 KL anchor
-    trainer_a.set_bc_anchor(trainer_a.agent)
-    trainer_b.set_bc_anchor(trainer_b.agent)
-    print("  [KL Anchor] BC anchor set for both agents.")
+    for trainer in trainers_to_init:
+        trainer.set_bc_anchor(trainer.agent)
+    anchor_names = "Agent B" if args.load_agent_a else "both agents"
+    print(f"  [KL Anchor] BC anchor set for {anchor_names}.")
 
     # ── Stage 1.5: Belief Net 独立预训练（Agent B only）─────────────────────
     belief_pretrain_rounds = getattr(args, 'belief_pretrain_rounds', 5)
@@ -138,27 +148,26 @@ def run_competitive(args):
 
     # ── Stage 2: RL 微调 ────────────────────────────────────────────────────
     print("\n[Stage 2] RL Fine-tuning...")
-    print("  ── Agent A ──")
-    log_a = trainer_a.run(num_rounds=args.rounds)
+
+    if args.load_agent_a:
+        # 直接加载预训练好的Agent A checkpoint，跳过训练
+        print(f"  ── Agent A (loading from {args.load_agent_a}) ──")
+        trainer_a.agent.load(args.load_agent_a)
+        log_a = []
+        print(f"  [Agent A] Loaded from checkpoint. Training skipped.")
+    else:
+        print("  ── Agent A ──")
+        log_a = trainer_a.run(num_rounds=args.rounds)
 
     print("\n  ── Agent B ──")
     log_b = trainer_b.run(num_rounds=args.rounds)
 
-    # ── Stage 3: 评估 ───────────────────────────────────────────────────────
+    # ── Stage 3: 评估（A vs B 直接对战）──────────────────────────────────────
     print("\n[Stage 3] Evaluation...")
-    eval_deals = 200 if args.quick else 1000
-
-    print("\n  → DDS Oracle Evaluation (Agent A):")
-    result_a = trainer_a.evaluate_oracle(num_deals=eval_deals)
-
-    print("\n  → DDS Oracle Evaluation (Agent B):")
-    result_b = trainer_b.evaluate_oracle(num_deals=eval_deals)
-
-    _print_oracle_comparison(result_a, result_b)
 
     # ── Head-to-head: A vs B 直接对战 ──────────────────────────────────────
     print("\n  → Head-to-Head: Agent A vs Agent B")
-    h2h_deals = 200 if args.quick else 500
+    h2h_deals = 200 if args.quick else 1000
     h2h = trainer_a.evaluate_head_to_head(
         trainer_b,
         num_deals=h2h_deals,
@@ -179,9 +188,6 @@ def run_competitive(args):
     print("\n" + "═" * 60)
     print("  FINAL SUMMARY")
     print("═" * 60)
-    print(f"  Oracle regret  A: {result_a['mean_regret']:+.3f} ± {result_a['std_regret']:.3f} IMP")
-    print(f"  Oracle regret  B: {result_b['mean_regret']:+.3f} ± {result_b['std_regret']:.3f} IMP")
-    print(f"  Δ oracle (B−A):   {result_b['mean_regret'] - result_a['mean_regret']:+.3f} IMP")
     print(f"  Head-to-head A IMP: {h2h['mean_imp']:+.3f} ± {h2h['std_imp']:.3f}  "
           f"win_rate={h2h['win_rate']:.1%}  p={h2h['p_value']:.3f} "
           f"{'✅ sig' if h2h['significant'] else '(ns)'}")
@@ -202,7 +208,6 @@ def run_competitive(args):
         trainer_b.agent.save(os.path.join(args.save_dir, f'agent_b_seed{args.seed}.pt'))
         report = {
             'seed': args.seed, 'beta': args.beta, 'rounds': args.rounds,
-            'oracle_a': result_a, 'oracle_b': result_b,
             'head_to_head': h2h,
         }
         report_path = os.path.join(args.save_dir, f'report_seed{args.seed}.json')
@@ -211,23 +216,11 @@ def run_competitive(args):
         print(f"\n  Checkpoints + report saved → {args.save_dir}")
 
 
-def _print_oracle_comparison(result_a: dict, result_b: dict):
-    print("\n  ── DDS Oracle Regret Comparison ──")
-    print(f"  Agent A: {result_a['mean_regret']:+.3f} ± {result_a['std_regret']:.3f} IMP"
-          f"  95% CI [{result_a['ci_lo']:+.3f}, {result_a['ci_hi']:+.3f}]")
-    print(f"  Agent B: {result_b['mean_regret']:+.3f} ± {result_b['std_regret']:.3f} IMP"
-          f"  95% CI [{result_b['ci_lo']:+.3f}, {result_b['ci_hi']:+.3f}]")
-    delta = result_b['mean_regret'] - result_a['mean_regret']
-    verdict = "B closer to oracle" if delta > 0 else "A closer to oracle / tie"
-    print(f"  Δ oracle (B−A): {delta:+.3f} IMP  → {verdict}")
-
-
 def _print_diagnostics(log_a: list, log_b: list, cfg_b: SubgameConfig):
     """排雷判断：检查训练健康性指标."""
 
     def _last_metric(log: list, player_key: int, metric: str) -> float:
         for entry in reversed(log):
-            # 兼容新格式 ns_metrics/ew_metrics 和旧格式 s_metrics/n_metrics
             for key in ('ns_metrics', 'ew_metrics', 's_metrics', 'n_metrics'):
                 m = entry.get(key, {}).get(player_key, {})
                 if metric in m:
@@ -235,26 +228,30 @@ def _print_diagnostics(log_a: list, log_b: list, cfg_b: SubgameConfig):
         return float('nan')
 
     from env import SOUTH, EAST
-    ent_a   = _last_metric(log_a, SOUTH, 'entropy')
+
+    # Agent A（可能从checkpoint加载，无训练日志）
+    if log_a:
+        ent_a   = _last_metric(log_a, SOUTH, 'entropy')
+        vl_a    = _last_metric(log_a, SOUTH, 'value_loss')
+        ent_a_e = _last_metric(log_a, EAST, 'entropy')
+        vl_a_e  = _last_metric(log_a, EAST, 'value_loss')
+        print(f"  Agent A: NS entropy={ent_a:.3f} vl={vl_a:.4f} │ EW entropy={ent_a_e:.3f} vl={vl_a_e:.4f}")
+    else:
+        print(f"  Agent A: (loaded from checkpoint, no training log)")
+
     ent_b   = _last_metric(log_b, SOUTH, 'entropy')
-    vl_a    = _last_metric(log_a, SOUTH, 'value_loss')
     vl_b    = _last_metric(log_b, SOUTH, 'value_loss')
     kl_b    = _last_metric(log_b, SOUTH, 'kl_loss')
     klam_b  = _last_metric(log_b, SOUTH, 'kl_lambda')
-    # EW 指标
-    ent_a_e = _last_metric(log_a, EAST, 'entropy')
-    vl_a_e  = _last_metric(log_a, EAST, 'value_loss')
     ent_b_e = _last_metric(log_b, EAST, 'entropy')
     vl_b_e  = _last_metric(log_b, EAST, 'value_loss')
-
-    print(f"  Agent A: NS entropy={ent_a:.3f} vl={vl_a:.4f} │ EW entropy={ent_a_e:.3f} vl={vl_a_e:.4f}")
     print(f"  Agent B: NS entropy={ent_b:.3f} vl={vl_b:.4f} kl={kl_b:.5f}(λ={klam_b:.3f}) │ EW entropy={ent_b_e:.3f} vl={vl_b_e:.4f}")
 
     ok = True
-    if ent_a < 0.5 or ent_b < 0.5:
+    if ent_b < 0.5:
         print("  ⚠️  Entropy collapse detected! Consider higher entropy_coef.")
         ok = False
-    if vl_a > 10 or vl_b > 10:
+    if vl_b > 10:
         print("  ⚠️  Value loss too high! Consider more critic warmup.")
         ok = False
     if kl_b > 0.3:
@@ -289,9 +286,11 @@ def parse_args():
                         help='Path to DDS data (npz)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--beta', type=float, default=0.05,
-                        help='Agent B r_info coefficient')
-    parser.add_argument('--rounds', type=int, default=30,
-                        help='Number of IBR rounds (default: 30)')
+                        help='Internal β: r_info = I(partner) - β·I(opponent)')
+    parser.add_argument('--info_weight', type=float, default=0.02,
+                        help='External weight: reward += w × r_info_scaled (default: 0.02)')
+    parser.add_argument('--rounds', type=int, default=20,
+                        help='Number of IBR rounds (default: 20)')
     parser.add_argument('--quick', action='store_true',
                         help='Quick mode: fewer deals for debugging')
     parser.add_argument('--belief_pretrain_rounds', type=int, default=5,
@@ -302,6 +301,9 @@ def parse_args():
                         help='SL pretrained checkpoint (4-actor format from sl_pretrain.py)')
     parser.add_argument('--save_dir', default='results/competitive',
                         help='Directory to save checkpoints')
+    parser.add_argument('--load_agent_a', default=None,
+                        help='Path to pre-trained Agent A checkpoint (.pt). '
+                        'If set, skip A training and load directly.')
     return parser.parse_args()
 
 

@@ -428,54 +428,66 @@ class CompetitiveSubgameEnv:
         vulnerability: Tuple[bool, bool],
     ) -> int:
         """
-        DDS oracle: NS 视角的最优得分.
+        DDS oracle: NS 视角的双明手博弈均衡得分（P77修复）.
 
-        遍历所有可能的庄家 × 花色 × 级数，取 NS 视角最优。
-            - NS 作庄 → 得分为正（取 NS 方最好的定约）
-            - EW 作庄 → 得分为负（取 EW 方最差的定约，即 NS 防守最佳）
+        正确语义：双明手均衡是双方都知道所有手牌时的博弈平衡点——
+        任何一方再叫牌都只会得到更差的结果，因此停叫。
+        1H-1S之后流局不可能发生。
 
-        最优定约 = 令 NS 得分最大的那个。
-        流局 = 0 分（始终可以选择）。
+        正确算法：对每个花色，只考虑能叫成的定约：
+            - NS在该花色能叫成的最高级数 → NS视角正分
+            - EW在该花色能叫成的最高级数 → NS视角负分
+            - 两者取对NS更好的结果
+        跨所有花色取全局最大值。
 
-        注: doubled=0（未加倍）作为保守估计，DDS 不包含叫牌过程。
+        错误的旧逻辑：
+            - best_score=0预设流局可选（竞争叫牌中不成立）
+            - EW作庄分支全pass
+            - 误把EW宕牌的负分（NS视角正数）当作可选结果
+              （EW永远不会自愿叫宕牌的定约）
         """
         from utils.scoring import Contract as C_
 
         ns_vul, ew_vul = vulnerability
-        best_score = 0   # 流局下限
+        best_score = None
 
-        # NS 作庄场景 (declarer ∈ {NORTH, SOUTH})
         for suit in range(5):
-            for level in range(1, 8):
+            # NS 在该花色能叫成的最高级数（叫成才有正分）
+            ns_best = None
+            for level in range(7, 0, -1):
                 for declarer in (NORTH, SOUTH):
                     tricks = int(dd_table[suit, declarer])
-                    contract = C_(level=level, suit=suit, declarer=declarer, doubled=0)
-                    score = calculate_score(contract, tricks, ns_vul)
-                    if score > best_score:
-                        best_score = score
+                    score  = calculate_score(
+                        C_(level=level, suit=suit, declarer=declarer, doubled=0),
+                        tricks, ns_vul)
+                    if score > 0:
+                        if ns_best is None or score > ns_best:
+                            ns_best = score
 
-        # EW 作庄场景 (declarer ∈ {EAST, WEST}) — NS 得负分
-        # 取 EW 能成的最高合理定约（对 NS 最不利），NS 视角即 -score
-        # 注: NS 可选择流局(0)，所以 EW 作庄对 NS 的净效果最多令 best_score 保持 0
-        #     如果 NS 无好定约，流局 0 仍优于让 EW 下成。
-        #     此处我们仅在 EW 成局时才考虑（否则 NS 宁可流局）。
-        for suit in range(5):
-            for level in range(1, 8):
+            # EW 在该花色能叫成的最高级数（NS视角取负）
+            # EW会选对自己最有利的定约（叫最高能成的级数），
+            # 对NS而言这是最坏情况（NS视角取min）
+            ew_best_ns_view = None
+            for level in range(7, 0, -1):
                 for declarer in (EAST, WEST):
-                    tricks = int(dd_table[suit, declarer])
-                    contract = C_(level=level, suit=suit, declarer=declarer, doubled=0)
-                    ew_score = calculate_score(contract, tricks, ew_vul)
-                    if ew_score <= 0:
-                        continue   # EW 宕牌，NS 无需防
-                    # EW 下成：NS 视角为 -ew_score
-                    ns_score_if_ew_plays = -ew_score
-                    # DDS oracle 假设 NS 会选择防止 EW 下成的叫牌
-                    # 但若 NS 无可叫定约，最优结果就是 max(best_ns_score, 0)
-                    # 即流局比让 EW 下成要好
-                    # → best_score 已经包含流局 0，无需再比较负值
-                    pass   # EW 作庄场景的贡献：NS 的目标是 ≥ 0（流局），不低于 EW 下成
+                    tricks   = int(dd_table[suit, declarer])
+                    ew_score = calculate_score(
+                        C_(level=level, suit=suit, declarer=declarer, doubled=0),
+                        tricks, ew_vul)
+                    if ew_score > 0:
+                        ns_view = -ew_score
+                        # EW叫最高能成的级数对NS最不利：取NS视角最小值
+                        if ew_best_ns_view is None or ns_view < ew_best_ns_view:
+                            ew_best_ns_view = ns_view
 
-        return best_score
+            # 该花色对NS最好的结果（NS打 vs 让EW打，取较优者）
+            candidates = [x for x in (ns_best, ew_best_ns_view) if x is not None]
+            if candidates:
+                suit_best = max(candidates)
+                if best_score is None or suit_best > best_score:
+                    best_score = suit_best
+
+        return best_score if best_score is not None else 0
 
     def _compute_score_ns(
         self,
