@@ -36,6 +36,8 @@ length_acc 长期低于 0.40。分离 pos_weight 后梯度更平衡。
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+import math
 
 # ── 常量 ───────────────────────────────────────────────────────────────────────
 BELIEF_DIM    = 48
@@ -44,22 +46,30 @@ LENGTH_DIM    = 32          # [16:48] one-hot套长 × 4门
 NUM_SUITS     = 4
 HONOR_RANKS   = [12, 11, 10, 9]    # A K Q J (rank index, 2=0, A=12)
 LENGTH_BINS   = 8                   # 0,1,2,3,4,5,6,7+
-HONOR_POS_WEIGHT  = 3.0   # P(持有) ≈ 1/4 → neg/pos = 3
-LENGTH_POS_WEIGHT = 7.0   # P(正例) ≈ 1/8 → neg/pos = 7
-POS_WEIGHT    = HONOR_POS_WEIGHT   # backward-compat alias
+
+# ── Prior 常量（P86: 用于 bias 初始化和 baseline 对比）──────────────────────
+HONOR_PRIOR   = 13.0 / 52.0        # ≈ 0.25, 单张大牌在特定player手里的概率
+HONOR_BIAS_INIT = math.log(HONOR_PRIOR / (1.0 - HONOR_PRIOR))  # ≈ -1.098
+
+# 套长先验分布（从大量随机发牌的经验统计，每门花色）
+# 这是无约束的一般先验；竞叫子博弈中♥♠有约束，但作为初始化足够
+LENGTH_PRIOR  = [0.01, 0.08, 0.24, 0.29, 0.21, 0.12, 0.04, 0.01]
+LENGTH_BIAS_INIT = [math.log(p + 1e-8) for p in LENGTH_PRIOR]
+
+# ── 向后兼容（旧代码可能引用这些，不再实际使用）────────────────────────────
+HONOR_POS_WEIGHT  = 1.0   # P86: 移除 pos_weight，设为1.0（=无权重）
+LENGTH_POS_WEIGHT = 1.0
+POS_WEIGHT        = 1.0
 
 
 def build_pos_weight() -> torch.Tensor:
     """
-    构造 (48,) pos_weight tensor，传入 BCEWithLogitsLoss.
+    P86: 返回全1 tensor（无权重）。保留函数签名向后兼容。
 
-    P55 修正: honor(前16维)=3.0，length(后32维)=7.0。
-    原来统一 3.0 低估了 length 正例稀有程度。
+    旧版: honor=3.0, length=7.0。
+    P86修正: pos_weight扭曲概率校准，对r_info计算有害。移除。
     """
-    pw = torch.empty(BELIEF_DIM)
-    pw[:HONOR_DIM]  = HONOR_POS_WEIGHT
-    pw[HONOR_DIM:]  = LENGTH_POS_WEIGHT
-    return pw
+    return torch.ones(BELIEF_DIM)
 
 
 # ── 核心转换 ───────────────────────────────────────────────────────────────────
@@ -121,39 +131,59 @@ def batch_hand_to_belief_target(hands: np.ndarray) -> np.ndarray:
 
 def belief_accuracy(probs: torch.Tensor, targets: torch.Tensor) -> dict:
     """
-    评估 Belief Network 预测质量，替代旧版 top13_hit_rate。
+    评估 Belief Network 预测质量。
+
+    P86: 增加 Brier Score 和 NLL（概率校准的正确指标）。
+    保留 honor_acc / length_acc 向后兼容，但这些不应作为主要评估指标。
 
     Args:
-        probs:   (B, 48) sigmoid 概率
+        probs:   (B, 48) 概率值（honor部分=sigmoid, length部分=softmax over 8 bins）
         targets: (B, 48) 0/1 ground truth
 
     Returns dict:
-        honor_acc  : 荣誉牌 (前16维) 准确率，threshold=0.5
-                     随机基线 ≈ 0.625（P=0.25时预测0，neg acc主导）
-        length_acc : 套长 one-hot (后32维) 准确率
-                     等价于: 每门花色预测的最高概率档位是否正确
-                     随机基线 = 1/8 = 0.125（8档均匀）
-        overall_acc: 全部48维准确率
+        honor_acc   : 荣誉牌 threshold=0.5 准确率（参考用）
+        length_acc  : 套长 argmax 准确率（参考用）
+        overall_acc : 全48维 threshold 准确率（参考用）
+        honor_brier : 荣誉牌 Brier Score = mean((prob - target)²)，越低越好
+        length_nll  : 套长 NLL = -mean(log P(true class))，越低越好
+        honor_nll   : 荣誉牌 NLL = mean BCE(prob, target)，越低越好
     """
-    # 荣誉牌：threshold=0.5
+    # ── 荣誉牌：threshold=0.5 ──────────────────────────────────────────
     honor_preds   = (probs[:, :HONOR_DIM] > 0.5).float()
     honor_acc     = float((honor_preds == targets[:, :HONOR_DIM]).float().mean())
 
-    # 套长：每门花色取argmax，等价于one-hot分类准确率
+    # Honor Brier Score
+    honor_brier   = float(((probs[:, :HONOR_DIM] - targets[:, :HONOR_DIM]) ** 2).mean())
+
+    # Honor NLL (BCE)
+    honor_nll     = float(F.binary_cross_entropy(
+        probs[:, :HONOR_DIM].clamp(1e-7, 1-1e-7),
+        targets[:, :HONOR_DIM], reduction='mean'))
+
+    # ── 套长：每门花色取argmax ─────────────────────────────────────────
     length_probs  = probs[:, HONOR_DIM:].view(-1, NUM_SUITS, LENGTH_BINS)   # (B,4,8)
     length_target = targets[:, HONOR_DIM:].view(-1, NUM_SUITS, LENGTH_BINS) # (B,4,8)
     pred_bins     = length_probs.argmax(dim=-1)    # (B, 4)
     true_bins     = length_target.argmax(dim=-1)   # (B, 4)
     length_acc    = float((pred_bins == true_bins).float().mean())
 
-    # 全维度 threshold acc（参考用）
+    # Length NLL: -log P(true class)
+    length_nll    = float(F.cross_entropy(
+        length_probs.reshape(-1, LENGTH_BINS),
+        true_bins.reshape(-1),
+        reduction='mean'))
+
+    # ── 全维度 threshold acc（参考用）──────────────────────────────────
     overall_preds = (probs > 0.5).float()
     overall_acc   = float((overall_preds == targets).float().mean())
 
     return {
-        'honor_acc':  honor_acc,
-        'length_acc': length_acc,
+        'honor_acc':   honor_acc,
+        'length_acc':  length_acc,
         'overall_acc': overall_acc,
+        'honor_brier': honor_brier,
+        'honor_nll':   honor_nll,
+        'length_nll':  length_nll,
     }
 
 

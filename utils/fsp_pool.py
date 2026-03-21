@@ -34,13 +34,22 @@ class FSPPool:
     """
     固定大小的 checkpoint pool，先进先出（FIFO）.
 
+    P90: 支持 permanent member（如 SL baseline），不被 FIFO 淘汰。
+    pool = [permanent_0, ..., permanent_k, fifo_0, ..., fifo_m]
+    max_size 包含 permanent members。
+
     Args:
         max_size : pool 容量，建议 10（Kita et al. 2024）
     """
 
     def __init__(self, max_size: int = 10):
         self.max_size = max_size
-        self._pool: list[dict] = []   # 存 state_dict（CPU tensor）
+        self._permanent: list[dict] = []  # 永不淘汰的 members (e.g. SL)
+        self._pool: list[dict] = []       # FIFO 部分
+
+    @property
+    def _fifo_capacity(self) -> int:
+        return self.max_size - len(self._permanent)
 
     # ------------------------------------------------------------------
     # 写入
@@ -56,17 +65,23 @@ class FSPPool:
         Args:
             agent: MAPPOAgent，需有 .model.actor_n / .model.actor_s 属性
         """
-        snapshot = {}
-        for role in ('actor_n', 'actor_s', 'actor_e', 'actor_w'):
-            snapshot[role] = copy.deepcopy(getattr(agent.model, role).state_dict())
+        snapshot = {
+            'actor_n': copy.deepcopy(agent.model.actor_n.state_dict()),
+            'actor_s': copy.deepcopy(agent.model.actor_s.state_dict()),
+            # EW 阵营也需要（competitive 子博弈中 EW 是对手）
+            'actor_e': copy.deepcopy(
+                getattr(agent.model, 'actor_e', agent.model.actor_n).state_dict()),
+            'actor_w': copy.deepcopy(
+                getattr(agent.model, 'actor_w', agent.model.actor_s).state_dict()),
+        }
         # 将所有 tensor 移到 CPU，避免 GPU 显存占用
         snapshot = {
             role: {k: v.cpu() for k, v in sd.items()}
             for role, sd in snapshot.items()
         }
 
-        if len(self._pool) >= self.max_size:
-            self._pool.pop(0)   # 移除最旧
+        if len(self._pool) >= self._fifo_capacity:
+            self._pool.pop(0)   # 移除 FIFO 中最旧的（permanent 不受影响）
         self._pool.append(snapshot)
 
     def add_state_dict(self, state_dict: dict) -> None:
@@ -79,9 +94,27 @@ class FSPPool:
             role: {k: v.cpu() for k, v in sd.items()}
             for role, sd in state_dict.items()
         }
-        if len(self._pool) >= self.max_size:
+        if len(self._pool) >= self._fifo_capacity:
             self._pool.pop(0)
         self._pool.append(sd_cpu)
+
+    def add_permanent(self, agent) -> None:
+        """
+        P90: 将 agent 存为 permanent member（SL baseline 等），永不被 FIFO 淘汰。
+        """
+        snapshot = {
+            'actor_n': copy.deepcopy(agent.model.actor_n.state_dict()),
+            'actor_s': copy.deepcopy(agent.model.actor_s.state_dict()),
+            'actor_e': copy.deepcopy(
+                getattr(agent.model, 'actor_e', agent.model.actor_n).state_dict()),
+            'actor_w': copy.deepcopy(
+                getattr(agent.model, 'actor_w', agent.model.actor_s).state_dict()),
+        }
+        snapshot = {
+            role: {k: v.cpu() for k, v in sd.items()}
+            for role, sd in snapshot.items()
+        }
+        self._permanent.append(snapshot)
 
     # ------------------------------------------------------------------
     # 读取
@@ -89,26 +122,24 @@ class FSPPool:
 
     def sample(self) -> Optional[dict]:
         """
-        随机返回一个 state_dict.
-
-        Returns:
-            state_dict 或 None（pool 为空时）
+        随机返回一个 state_dict（从 permanent + FIFO 合并池中均匀采样）。
         """
-        if not self._pool:
+        all_members = self._permanent + self._pool
+        if not all_members:
             return None
-        return random.choice(self._pool)
+        return random.choice(all_members)
 
     def latest(self) -> Optional[dict]:
-        """返回最新存入的 state_dict."""
+        """返回最新存入的 FIFO state_dict."""
         if not self._pool:
             return None
         return self._pool[-1]
 
     def __len__(self) -> int:
-        return len(self._pool)
+        return len(self._permanent) + len(self._pool)
 
     def is_empty(self) -> bool:
-        return len(self._pool) == 0
+        return len(self._permanent) + len(self._pool) == 0
 
     # ------------------------------------------------------------------
     # 应用到 agent

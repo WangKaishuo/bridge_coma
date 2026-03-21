@@ -49,7 +49,7 @@ def run_competitive(args):
     set_seed(args.seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"\n[Competitive Subgame] seed={args.seed}  device={device}")
-    print(f"  beta={args.beta}  rounds={args.rounds}  quick={args.quick}")
+    print(f"  beta={args.beta}  info_weight={args.info_weight}  rounds={args.rounds}  quick={args.quick}")
 
     # ── 环境 ────────────────────────────────────────────────────────────────
     print("\n[1] Initializing environment...")
@@ -65,11 +65,11 @@ def run_competitive(args):
         batch_size       = 256,
         use_info_bonus   = False,
         beta             = 0.0,
-        fsp_pool_size    = 10,
-        fsp_add_interval = 2,
-        kl_lambda_start  = 1.5,
-        kl_lambda_end    = 1.5,
-        kl_anneal_frac   = 0.0,
+        fsp_pool_size    = 10,   # P90: restored (P89's 3 was too homogeneous)
+        fsp_add_interval = 2,    # P90: restored
+        kl_lambda_start  = 0.5,   # P88
+        kl_lambda_end    = 0.1,   # P90: floor 0.1 (was 0.0, caused entropy collapse)
+        kl_anneal_frac   = 0.3,   # P90: fast anneal in first 30%, then hold at 0.1
         bc_warmup_samples= 1000 if args.quick else 5000,
         bc_warmup_epochs = 5    if args.quick else 20,
         device           = device,
@@ -89,11 +89,11 @@ def run_competitive(args):
         use_info_bonus   = True,
         beta             = args.beta,
         info_reward_weight = args.info_weight,
-        fsp_pool_size    = 10,
-        fsp_add_interval = 2,
-        kl_lambda_start  = 1.5,
-        kl_lambda_end    = 1.5,
-        kl_anneal_frac   = 0.0,
+        fsp_pool_size    = 10,   # P90: restored
+        fsp_add_interval = 2,    # P90: restored
+        kl_lambda_start  = 0.5,   # P88
+        kl_lambda_end    = 0.1,   # P90: floor 0.1
+        kl_anneal_frac   = 0.3,   # P90: fast anneal in first 30%
         bc_warmup_samples= 1000 if args.quick else 5000,
         bc_warmup_epochs = 5    if args.quick else 20,
         device           = device,
@@ -162,18 +162,38 @@ def run_competitive(args):
     print("\n  ── Agent B ──")
     log_b = trainer_b.run(num_rounds=args.rounds)
 
-    # ── Stage 3: 评估（A vs B 直接对战）──────────────────────────────────────
+    # ── Stage 3: 评估 ───────────────────────────────────────────────────────
     print("\n[Stage 3] Evaluation...")
-
-    # ── Head-to-head: A vs B 直接对战 ──────────────────────────────────────
-    print("\n  → Head-to-Head: Agent A vs Agent B")
     h2h_deals = 200 if args.quick else 1000
+
+    # ── Build SL baseline agent for evaluation ─────────────────────────────
+    from algorithms.mappo import MAPPOAgent, MAPPOConfig
+    sl_agent_eval = MAPPOAgent(MAPPOConfig(device=device))
+    if sl_path and os.path.exists(sl_path):
+        ckpt_sl = torch.load(sl_path, map_location=device)
+        for player, key in [(_N, 'actor_n'), (_E, 'actor_e'),
+                            (_S, 'actor_s'), (_W, 'actor_w')]:
+            if key in ckpt_sl:
+                sl_agent_eval.get_actor(player).load_state_dict(
+                    {k: v.to(device) for k, v in ckpt_sl[key].items()})
+    # Wrap SL agent in a temporary trainer for H2H API
+    sl_trainer = SubgameTrainer(env, cfg_a, reward_stats=RunningStats())
+    sl_trainer.agent = sl_agent_eval
+
+    # ── A vs SL ────────────────────────────────────────────────────────────
+    print("\n  → Agent A vs SL baseline")
+    h2h_a_sl = trainer_a.evaluate_head_to_head(
+        sl_trainer, num_deals=h2h_deals, label_self="A", label_other="SL")
+
+    # ── B vs SL ────────────────────────────────────────────────────────────
+    print("\n  → Agent B vs SL baseline")
+    h2h_b_sl = trainer_b.evaluate_head_to_head(
+        sl_trainer, num_deals=h2h_deals, label_self="B", label_other="SL")
+
+    # ── A vs B ─────────────────────────────────────────────────────────────
+    print("\n  → Agent A vs Agent B")
     h2h = trainer_a.evaluate_head_to_head(
-        trainer_b,
-        num_deals=h2h_deals,
-        label_self="A",
-        label_other="B",
-    )
+        trainer_b, num_deals=h2h_deals, label_self="A", label_other="B")
 
     # Belief Net 评估（Agent B only）
     if cfg_b.use_info_bonus:
@@ -188,15 +208,19 @@ def run_competitive(args):
     print("\n" + "═" * 60)
     print("  FINAL SUMMARY")
     print("═" * 60)
-    print(f"  Head-to-head A IMP: {h2h['mean_imp']:+.3f} ± {h2h['std_imp']:.3f}  "
-          f"win_rate={h2h['win_rate']:.1%}  p={h2h['p_value']:.3f} "
-          f"{'✅ sig' if h2h['significant'] else '(ns)'}")
-    conclusion = (
-        "✅ B significantly better than A"
-        if (h2h['mean_imp'] < 0 and h2h['significant'])
-        else "❌ No significant difference" if not h2h['significant']
-        else "⚠️  A outperforms B"
-    )
+    print(f"  A vs SL:  {h2h_a_sl['mean_imp']:+.3f} ± {h2h_a_sl['std_imp']:.3f} IMP  "
+          f"p={h2h_a_sl['p_value']:.3f} {'✅' if h2h_a_sl['significant'] else '(ns)'}")
+    print(f"  B vs SL:  {h2h_b_sl['mean_imp']:+.3f} ± {h2h_b_sl['std_imp']:.3f} IMP  "
+          f"p={h2h_b_sl['p_value']:.3f} {'✅' if h2h_b_sl['significant'] else '(ns)'}")
+    print(f"  A vs B:   {h2h['mean_imp']:+.3f} ± {h2h['std_imp']:.3f} IMP  "
+          f"p={h2h['p_value']:.3f} {'✅' if h2h['significant'] else '(ns)'}")
+    # Conclusion
+    if h2h['mean_imp'] < 0 and h2h['significant']:
+        conclusion = "✅ B significantly better than A"
+    elif h2h['mean_imp'] > 0 and h2h['significant']:
+        conclusion = "⚠️  A outperforms B"
+    else:
+        conclusion = "❌ No significant difference"
     print(f"  Conclusion: {conclusion}")
     print("═" * 60)
 
@@ -208,7 +232,9 @@ def run_competitive(args):
         trainer_b.agent.save(os.path.join(args.save_dir, f'agent_b_seed{args.seed}.pt'))
         report = {
             'seed': args.seed, 'beta': args.beta, 'rounds': args.rounds,
-            'head_to_head': h2h,
+            'a_vs_sl': h2h_a_sl,
+            'b_vs_sl': h2h_b_sl,
+            'a_vs_b': h2h,
         }
         report_path = os.path.join(args.save_dir, f'report_seed{args.seed}.json')
         with open(report_path, 'w') as f:
@@ -287,10 +313,10 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--beta', type=float, default=0.05,
                         help='Internal β: r_info = I(partner) - β·I(opponent)')
-    parser.add_argument('--info_weight', type=float, default=0.02,
-                        help='External weight: reward += w × r_info_scaled (default: 0.02)')
-    parser.add_argument('--rounds', type=int, default=20,
-                        help='Number of IBR rounds (default: 20)')
+    parser.add_argument('--info_weight', type=float, default=0.2,
+                        help='r_info as fraction of IMP variance (P87b: 0.02→0.2, step_ir≈1.4)')
+    parser.add_argument('--rounds', type=int, default=30,
+                        help='Number of IBR rounds (P90: 20→30)')
     parser.add_argument('--quick', action='store_true',
                         help='Quick mode: fewer deals for debugging')
     parser.add_argument('--belief_pretrain_rounds', type=int, default=5,

@@ -25,7 +25,7 @@ Usage:
 
     # 单独生成
     python -m utils.generate_subgame_data --type stayman --num_samples 50000
-    python -m utils.generate_subgame_data --type competitive --num_samples 100000
+    python -m utils.generate_subgame_data --type competitive --num_workers 8 --num_samples 500000 data/competitive_500k.npz
 
     # 自定义输出
     python -m utils.generate_subgame_data --type stayman --num_samples 50000 --output data/stayman_50k.npz
@@ -317,27 +317,45 @@ def generate_subgame_data(
         num_workers: 并行 worker 数
         seed: 随机种子
     """
+    from tqdm import tqdm
+
     print(f"Generating {num_samples} {deal_type} deals with {num_workers} workers...")
     t0 = time.time()
 
-    # Split work
-    per_worker = num_samples // num_workers
-    remainder = num_samples % num_workers
+    # 拆成小chunk（每chunk 500局），方便进度条更新
+    chunk_size = 500
+    n_chunks = (num_samples + chunk_size - 1) // chunk_size
     tasks = []
-    for i in range(num_workers):
-        n = per_worker + (1 if i < remainder else 0)
-        tasks.append((n, seed + i * 10000, deal_type))
+    remaining = num_samples
+    for i in range(n_chunks):
+        n = min(chunk_size, remaining)
+        tasks.append((n, seed + i * 137, deal_type))
+        remaining -= n
 
-    # Run
+    # Run with progress bar
+    all_decks_list = []
+    all_tricks_list = []
+
     if num_workers > 1:
         with mp.Pool(num_workers) as pool:
-            results = pool.map(_generate_worker, tasks)
+            for decks, tricks in tqdm(
+                pool.imap_unordered(_generate_worker, tasks),
+                total=n_chunks,
+                desc=f"{deal_type}",
+                unit="chunk",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+            ):
+                all_decks_list.append(decks)
+                all_tricks_list.append(tricks)
     else:
-        results = [_generate_worker(t) for t in tasks]
+        for task in tqdm(tasks, desc=f"{deal_type}", unit="chunk"):
+            decks, tricks = _generate_worker(task)
+            all_decks_list.append(decks)
+            all_tricks_list.append(tricks)
 
     # Merge
-    all_decks = np.concatenate([r[0] for r in results], axis=0)
-    all_tricks = np.concatenate([r[1] for r in results], axis=0)
+    all_decks = np.concatenate(all_decks_list, axis=0)[:num_samples]
+    all_tricks = np.concatenate(all_tricks_list, axis=0)[:num_samples]
 
     # Save
     output_path = Path(output_path)
@@ -400,7 +418,7 @@ def main():
                         help='Output .npz path (only for single type)')
     parser.add_argument('--output_dir', default='data/',
                         help='Output directory (used when --output not set)')
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 

@@ -89,7 +89,7 @@ class SubgameConfig:
     # ── r_info ──────────────────────────────────────────────────────────────
     use_info_bonus:      bool  = False
     beta:                float = 0.05        # 内部β: r_info = I(partner) - β·I(opponent)
-    info_reward_weight:  float = 0.02        # 外部权重: total_reward += w · r_info_scaled
+    info_reward_weight:  float = 0.2         # P87b: 占 IMP 方差的比例 (0.02→0.2)
 
     # ── FSP ─────────────────────────────────────────────────────────────────
     fsp_pool_size:    int   = 10          # Kita et al. 2024
@@ -338,7 +338,6 @@ class SubgameTrainer:
             self.belief_optimizer = torch.optim.Adam(
                 self.belief_net.parameters(), lr=config.belief_lr)
             self.partner_stats  = RunningStats()
-            self.opponent_stats = RunningStats()
             self.belief_replay  = BeliefReplayBuffer(
                 capacity=config.belief_replay_capacity)
 
@@ -461,8 +460,13 @@ class SubgameTrainer:
         print("[KL Anchor] BC anchor set for all 4 players.")
 
     def _get_kl_lambda(self, round_idx: int) -> float:
-        cfg      = self.config
-        progress = min(1.0, round_idx / max(1, cfg.num_rounds - 1))
+        cfg = self.config
+        if cfg.kl_anneal_frac <= 0:
+            # No annealing — fixed at start value
+            return cfg.kl_lambda_start
+        # Anneal over first kl_anneal_frac of rounds, then hold at end value
+        anneal_rounds = max(1, int(cfg.num_rounds * cfg.kl_anneal_frac))
+        progress = min(1.0, round_idx / anneal_rounds)
         return cfg.kl_lambda_start + (cfg.kl_lambda_end - cfg.kl_lambda_start) * progress
 
     # ======================================================================
@@ -820,8 +824,7 @@ class SubgameTrainer:
         tr_idx   = perm_all[:split]
         va_idx   = perm_all[split:]
 
-        criterion = nn.BCEWithLogitsLoss(
-            pos_weight=self.belief_net.pos_weight.to(self.device))
+        criterion = None  # P86: 不再需要独立criterion，用belief_net.compute_loss
         optimizer = torch.optim.Adam(
             self.belief_net.parameters(), lr=self.config.belief_lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -840,10 +843,10 @@ class SubgameTrainer:
             tr_loss  = 0.0; nb = 0
             for s in range(0, split, bs):
                 idx    = tr_idx[perm[s:s+bs]]
-                logits = self.belief_net(
+                loss   = self.belief_net.compute_loss(
                     oh_all[idx].to(self.device), h_all[idx].to(self.device),
-                    op_all[idx].to(self.device), tp_all[idx].to(self.device))
-                loss   = criterion(logits, tgt_all[idx].to(self.device))
+                    op_all[idx].to(self.device), tp_all[idx].to(self.device),
+                    tgt_all[idx].to(self.device))
                 optimizer.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(
                     self.belief_net.parameters(), self.config.max_grad_norm)
@@ -854,11 +857,13 @@ class SubgameTrainer:
             # Validate
             self.belief_net.eval()
             with torch.no_grad():
-                vlogits = self.belief_net(
+                val_loss = self.belief_net.compute_loss(
+                    oh_all[va_idx].to(self.device), h_all[va_idx].to(self.device),
+                    op_all[va_idx].to(self.device), tp_all[va_idx].to(self.device),
+                    tgt_all[va_idx].to(self.device)).item()
+                probs    = self.belief_net.get_probs(
                     oh_all[va_idx].to(self.device), h_all[va_idx].to(self.device),
                     op_all[va_idx].to(self.device), tp_all[va_idx].to(self.device))
-                val_loss = criterion(vlogits, tgt_all[va_idx].to(self.device)).item()
-                probs    = torch.sigmoid(vlogits)
                 acc      = belief_accuracy(probs, tgt_all[va_idx].to(self.device))
             self.belief_net.train()
 
@@ -930,8 +935,6 @@ class SubgameTrainer:
         N = len(self.belief_replay)
 
         self.belief_net.train()
-        criterion = nn.BCEWithLogitsLoss(
-            pos_weight=self.belief_net.pos_weight.to(self.device))
         bs = min(512, N)
         final_loss = 0.0
 
@@ -940,10 +943,10 @@ class SubgameTrainer:
             tl = 0.0; nb = 0
             for s in range(0, N, bs):
                 idx = perm[s:s+bs]
-                logits = self.belief_net(
+                loss = self.belief_net.compute_loss(
                     oh_t[idx].to(self.device), h_t[idx].to(self.device),
-                    op_t[idx].to(self.device), tp_t[idx].to(self.device))
-                loss = criterion(logits, tgt_t[idx].to(self.device))
+                    op_t[idx].to(self.device), tp_t[idx].to(self.device),
+                    tgt_t[idx].to(self.device))
                 self.belief_optimizer.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(
                     self.belief_net.parameters(), self.config.max_grad_norm)
@@ -1338,13 +1341,9 @@ class SubgameTrainer:
         r_info_raw = I(bid; hand | partner) - β × I(bid; hand | opponent)
                    ≈ CE_reduction(belief_before, target) - CE_reduction(belief_after, target)
 
-        量纲问题 (P55):
-            raw per-step gain ≈ 0.001, IMP per-episode ≈ 6 std
-            → 先把 per-episode 的 r_info_raw 之和用 RunningStats 归一化，
-              得到 r_info_norm ~ N(0,1)，
-              再乘以 imp_scale（IMP reward 的运行标准差），
-              最后均摊回每个 step。
-              这样 β 的物理意义是：r_info 占 IMP 奖励的比例。
+        P87b: 保留动态归一化（imp_std/rinfo_std 自动对齐量纲），
+        w 的语义 = r_info 占 IMP 方差的比例。
+        从 w=0.02（step_ir≈0.09，PPO 无法利用）提升到 w=0.2（step_ir≈1.4）。
         """
         if self.dual_info is None:
             return [[0.0] * len(ep) for ep in episodes]
@@ -1398,9 +1397,10 @@ class SubgameTrainer:
         for i, (ep_idx, s_idx) in enumerate(ep_step_idx):
             raw_ep_bonuses[ep_idx][s_idx] = float(bonuses_flat[i])
 
-        # ── 量纲归一化 (P73) + 外部权重 (P83) ───────────────────────────────
-        # P73: 集中到最后一步（与IMP时序对齐），只做Scale不做Shift。
-        # P83: 乘以 info_reward_weight 控制 r_info 在总 reward 中的占比。
+        # ── 量纲归一化 (P73) + 外部权重 (P87b) ─────────────────────────────
+        # 集中到最后一步（与IMP时序对齐），只做Scale不做Shift。
+        # P87b: 恢复动态归一化（w 的语义 = r_info 占 IMP 方差的比例），
+        # 仅将 w 从 0.02 提升到 0.2 使 step_ir 达到 ~1.5 IMP。
         ep_totals = [sum(b for b in bs) for bs in raw_ep_bonuses]
         for v in ep_totals:
             self.partner_stats.update(v)
@@ -1565,16 +1565,16 @@ class SubgameTrainer:
         batch_sz   = self.config.deals_per_step
         cfg = self.config
         print(f"[Config] kl_lambda_start={cfg.kl_lambda_start}  kl_lambda_end={cfg.kl_lambda_end}  kl_anneal_frac={cfg.kl_anneal_frac}")
-        print(f"[Config] num_rounds={num_rounds}  deals_per_step={cfg.deals_per_step}  n_deals_per_phase={n_deals}  use_info_bonus={cfg.use_info_bonus}  beta={cfg.beta}")
+        print(f"[Config] num_rounds={num_rounds}  deals_per_step={cfg.deals_per_step}  n_deals_per_phase={n_deals}  use_info_bonus={cfg.use_info_bonus}  beta={cfg.beta}  info_weight={cfg.info_reward_weight}")
 
         print("\n[Trainer] Critic warmup...")
         self.critic_warmup()
 
         # P74: FSP Pool用BC checkpoint作为pool[0]
         if not self._fsp_seeded and self.config.fsp_pool_size > 0:
-            self.fsp_pool.add(self.agent)
+            self.fsp_pool.add_permanent(self.agent)  # P90: SL baseline永不淘汰
             self._fsp_seeded = True
-            print(f"  [FSP] Seeded pool with BC checkpoint (pool size: {len(self.fsp_pool)})")
+            print(f"  [FSP] Seeded pool with BC checkpoint as permanent (pool size: {len(self.fsp_pool)})")
 
         for rnd in range(num_rounds):
             print(f"\n══════ Round {rnd+1}/{num_rounds} ══════")
@@ -1582,6 +1582,13 @@ class SubgameTrainer:
             fsp_sd = self._apply_fsp_opponent()
             _ir_vals: list = []; _bl_vals: list = []
             ns_metrics: dict = {}; ew_metrics: dict = {}
+
+            # ── JIT Belief Burn-in（Agent B only，轮首更新）─────────────
+            # P85b: 移到轮首，确保两桌的r_info计算基于同一个Belief Net
+            if self.belief_net is not None:
+                print("  [JIT Belief Burn-in]...")
+                bl = self.jit_belief_burnin()
+                if bl is not None: _bl_vals.append(bl)
 
             # ── 桌1: agent=NS, FSP=EW ──────────────────────────────────
             print(f"  [Table1/NS] Collecting {n_deals} deals (batch={batch_sz})...")
@@ -1618,12 +1625,6 @@ class SubgameTrainer:
             for p in (NORTH, SOUTH):
                 m = self._safe_update(p, rnd)
                 if m: ns_metrics[p] = m
-
-            # ── JIT Belief Burn-in（Agent B only）────────────────────────
-            if self.belief_net is not None:
-                print("  [JIT Belief Burn-in]...")
-                bl = self.jit_belief_burnin()
-                if bl is not None: _bl_vals.append(bl)
 
             # ── 桌2: agent=EW, FSP=NS ──────────────────────────────────
             print(f"  [Table2/EW] Collecting {n_deals} deals (batch={batch_sz})...")

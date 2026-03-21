@@ -1,21 +1,23 @@
 """
-Belief Network
-==============
+Belief Network (P86 重构)
+=========================
 
-推断他人手牌的网络，用于计算 Dual-Info Bonus。
+核心修正:
+1. Honor (16维): BCE **无 pos_weight** + sigmoid → 校准概率
+2. Length (32维): CrossEntropyLoss + softmax → 互斥分类的正确建模
+3. Bias 初始化: honor bias = log(0.25/0.75) ≈ -1.098
+               length bias = log(prior_dist) 使初始输出 = 先验分布
+4. get_probs(): honor→sigmoid, length→softmax (per suit)
+5. compute_info_gain(): honor用BCE, length用CE, 加权合并
 
-v2: 预测目标从 52 维 one-hot 改为 48 维二值语义特征
-    详见 hand_features.py
+为什么 pos_weight 有害:
+    pos_weight 放大正例 loss → 网络输出概率系统性偏高 (0.41 vs 真实 0.25)
+    → r_info = log P(after) - log P(before) 被偏移污染
+    → 即使没有信息的叫牌 (Pass) 也产生非零 r_info → 噪声奖励
 
-    [0 :16]  荣誉牌归属 (AKQJ × 4门)  — 16维独立 binary
-    [16:48]  套长 one-hot (0~7+ × 4门) — 32维，每门花色互斥 8档
-
-    优势:
-    - AKQJ 覆盖全部大牌点来源，T以下对叫牌决策贡献极小
-    - one-hot 套长避免阶梯式编码的单调性冗余：
-      "5张黑桃"只激活1个bit，r_info 不会重复计算
-    - pos_weight 统一=3.0，简洁无额外超参数
-    - r_info / BCEWithLogitsLoss 公式完全不变
+为什么 Length 必须用 CrossEntropy:
+    花色长度是互斥分类 (8选1)，BCE 把 8 个 bin 当独立预测，
+    允许概率和 > 1.0 → 概率论上不合法 → 互信息计算错误
 """
 
 import torch
@@ -25,44 +27,68 @@ from typing import Tuple
 
 from env import NUM_BIDS, NUM_PLAYERS
 from utils.hand_features import (
-    BELIEF_DIM, HONOR_DIM, build_pos_weight, belief_accuracy
+    BELIEF_DIM, HONOR_DIM, LENGTH_DIM, LENGTH_BINS, NUM_SUITS,
+    HONOR_BIAS_INIT, LENGTH_BIAS_INIT,
+    belief_accuracy,
 )
 
 
 class BeliefNetwork(nn.Module):
     """
-    Belief Network (P52): 预测目标玩家的 48 维二值语义特征。
-
-    P52 变更: 删除 LSTM history encoder, 改用 MLP + who-made-it 展平编码.
-    与 PolicyNetwork 保持一致的 history 表示.
+    Belief Network (P86): 双头架构，honor + length 分别预测。
 
     输入:
         observer_hand (52) + history_flat (NUM_BIDS×NUM_PLAYERS=152)
         + observer_pos_embed (32) + target_pos_embed (32)
         = 268 dims
-    输出: (batch, 48) logits，未经 Sigmoid
+
+    输出:
+        honor_logits: (batch, 16) — 用 sigmoid 得到概率
+        length_logits: (batch, 4, 8) — 用 softmax(dim=-1) 得到概率
     """
 
     def __init__(self, hand_dim: int = 256, history_dim: int = 256, hidden_dim: int = 512):
         super().__init__()
-        # hand_dim / history_dim 参数保留向后兼容，实际不再使用
         from networks.policy_net import encode_history_flat, NUM_BIDS, NUM_PLAYERS
         self._encode_history_flat = encode_history_flat
 
         self.position_embed = nn.Embedding(4, 32)
 
-        # 输入: hand(52) + history_flat(NUM_BIDS*NUM_PLAYERS) + pos×2(64)
+        # 共享 trunk
         input_dim = 52 + NUM_BIDS * NUM_PLAYERS + 32 + 32
-        self.fc = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, BELIEF_DIM),
-            # 不加 Sigmoid; forward 返回 logits
         )
 
+        # Honor head: 16 独立 binary logits
+        self.honor_head = nn.Linear(hidden_dim, HONOR_DIM)
+        # Length head: 4 suits × 8 bins = 32 logits
+        self.length_head = nn.Linear(hidden_dim, LENGTH_DIM)
+
+        # ── Bias 初始化（P86 核心）──────────────────────────────────────
+        self._init_bias()
+
+        # 保留 pos_weight buffer 向后兼容（实际不再使用）
+        from utils.hand_features import build_pos_weight
         self.register_buffer('pos_weight', build_pos_weight())
+
+    def _init_bias(self):
+        """
+        先验 bias 初始化:
+        - Honor: bias = log(0.25/0.75) ≈ -1.098 → sigmoid 输出 ≈ 0.25
+        - Length: bias = log(prior_dist) → softmax 输出 ≈ 先验分布
+        网络从先验开始学习，无信息时自然回退到先验 → r_info ≈ 0
+        """
+        with torch.no_grad():
+            self.honor_head.bias.fill_(HONOR_BIAS_INIT)
+            self.honor_head.weight.mul_(0.01)
+
+            length_bias = torch.tensor(LENGTH_BIAS_INIT * NUM_SUITS, dtype=torch.float32)
+            self.length_head.bias.copy_(length_bias)
+            self.length_head.weight.mul_(0.01)
 
     def forward(
         self,
@@ -72,16 +98,18 @@ class BeliefNetwork(nn.Module):
         target_pos: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Args:
-            history: (batch, max_len, NUM_BIDS) one-hot 序列
-        Returns:
-            logits: (batch, 48)
+        Returns: (batch, 48) raw logits.
+        [0:16] = honor logits (for BCE / sigmoid)
+        [16:48] = length logits (for CE / softmax per suit)
         """
-        hist_flat = self._encode_history_flat(history)   # (B, NUM_BIDS*NUM_PLAYERS)
+        hist_flat = self._encode_history_flat(history)
         obs_embed = self.position_embed(observer_pos)
         tgt_embed = self.position_embed(target_pos)
         x = torch.cat([observer_hand, hist_flat, obs_embed, tgt_embed], dim=-1)
-        return self.fc(x)
+        h = self.trunk(x)
+        honor_logits = self.honor_head(h)
+        length_logits = self.length_head(h)
+        return torch.cat([honor_logits, length_logits], dim=-1)
 
     def get_probs(
         self,
@@ -90,8 +118,20 @@ class BeliefNetwork(nn.Module):
         observer_pos: torch.Tensor,
         target_pos: torch.Tensor,
     ) -> torch.Tensor:
-        """返回 sigmoid 概率 (batch, 48)，供 r_info 计算使用。"""
-        return torch.sigmoid(self.forward(observer_hand, history, observer_pos, target_pos))
+        """
+        返回校准概率 (batch, 48):
+        [0:16]  = sigmoid(honor_logits)  — 独立二值概率
+        [16:48] = softmax(length_logits per suit) — 互斥分类概率
+        """
+        logits = self.forward(observer_hand, history, observer_pos, target_pos)
+        return self._logits_to_probs(logits)
+
+    def _logits_to_probs(self, logits: torch.Tensor) -> torch.Tensor:
+        """logits (B, 48) → calibrated probs (B, 48)."""
+        honor_probs = torch.sigmoid(logits[:, :HONOR_DIM])
+        length_logits = logits[:, HONOR_DIM:].view(-1, NUM_SUITS, LENGTH_BINS)
+        length_probs = F.softmax(length_logits, dim=-1).view(-1, LENGTH_DIM)
+        return torch.cat([honor_probs, length_probs], dim=-1)
 
     def compute_loss(
         self,
@@ -99,41 +139,45 @@ class BeliefNetwork(nn.Module):
         history: torch.Tensor,
         observer_pos: torch.Tensor,
         target_pos: torch.Tensor,
-        target_features: torch.Tensor,   # (batch, 48)
+        target_features: torch.Tensor,
     ) -> torch.Tensor:
         """
-        BCEWithLogitsLoss with uniform pos_weight=3.0.
-
-        Args:
-            target_features: (batch, 48) 由 hand_to_belief_target() 生成
+        P86 混合 loss:
+        - Honor [0:16]: BCEWithLogitsLoss（无 pos_weight）
+        - Length [16:48]: CrossEntropyLoss（4门花色各自 8 分类）
         """
         logits = self.forward(observer_hand, history, observer_pos, target_pos)
-        return F.binary_cross_entropy_with_logits(
-            logits, target_features, pos_weight=self.pos_weight
+
+        honor_loss = F.binary_cross_entropy_with_logits(
+            logits[:, :HONOR_DIM],
+            target_features[:, :HONOR_DIM],
+            reduction='mean',
         )
+
+        length_logits = logits[:, HONOR_DIM:].view(-1, NUM_SUITS, LENGTH_BINS)
+        length_target = target_features[:, HONOR_DIM:].view(-1, NUM_SUITS, LENGTH_BINS)
+        length_labels = length_target.argmax(dim=-1)
+
+        length_loss = F.cross_entropy(
+            length_logits.reshape(-1, LENGTH_BINS),
+            length_labels.reshape(-1),
+            reduction='mean',
+        )
+
+        return honor_loss + length_loss
 
     @staticmethod
     def evaluate_accuracy(probs: torch.Tensor, targets: torch.Tensor) -> dict:
-        """
-        评估指标，替代旧版 top13_hit_rate。
-
-        Returns:
-            honor_acc  / length_acc / overall_acc
-        """
         return belief_accuracy(probs, targets)
 
 
 class DualInfoComputer:
     """
-    计算 Dual-Info Bonus
+    计算 Dual-Info Bonus (P86 适配)
 
     r_info = I(bid; hand | partner) - β * I(bid; hand | opponent)
 
-    近似:
-    I(bid; hand) ≈ CE(belief_before, target) - CE(belief_after, target)
-
-    注: target 现为 48 维特征，CE 计算方式与原 52 维完全相同。
-    reduction='mean' 归一化维度数量，避免量纲随特征维度变化漂移。
+    P86: honor 和 length 分别计算信息增益，加权合并。
     """
 
     def __init__(self, belief_net: BeliefNetwork, beta: float = 0.5):
@@ -142,23 +186,41 @@ class DualInfoComputer:
 
     def compute_info_gain(
         self,
-        belief_before: torch.Tensor,    # (batch, 48) sigmoid probs
-        belief_after: torch.Tensor,     # (batch, 48) sigmoid probs
-        target_features: torch.Tensor,  # (batch, 48) 0/1
+        belief_before: torch.Tensor,
+        belief_after: torch.Tensor,
+        target_features: torch.Tensor,
     ) -> torch.Tensor:
         """
         信息增益 = max(0, CE(before, target) - CE(after, target))
-
-        ReLU 截断保证非负：互信息 I(X;Y) ≥ 0。
-        Belief Net 未收敛时 CE 差值可能为负（随机噪声），
-        不截断会给 actor 加随机方向的噪声惩罚，破坏训练。
+        Honor: BCE, Length: CE (per suit), 等权平均。
         """
-        ce_before = F.binary_cross_entropy(
-            belief_before, target_features, reduction='none'
+        # ── Honor ──────────────────────────────────────────────────────
+        h_before = belief_before[:, :HONOR_DIM].clamp(1e-7, 1-1e-7)
+        h_after  = belief_after[:, :HONOR_DIM].clamp(1e-7, 1-1e-7)
+        h_target = target_features[:, :HONOR_DIM]
+
+        honor_ce_before = F.binary_cross_entropy(
+            h_before, h_target, reduction='none').mean(dim=-1)
+        honor_ce_after = F.binary_cross_entropy(
+            h_after, h_target, reduction='none').mean(dim=-1)
+
+        # ── Length ─────────────────────────────────────────────────────
+        l_before = belief_before[:, HONOR_DIM:].view(-1, NUM_SUITS, LENGTH_BINS)
+        l_after  = belief_after[:, HONOR_DIM:].view(-1, NUM_SUITS, LENGTH_BINS)
+        l_target = target_features[:, HONOR_DIM:].view(-1, NUM_SUITS, LENGTH_BINS)
+        l_labels = l_target.argmax(dim=-1)
+
+        l_ce_before = -torch.log(
+            l_before.clamp(1e-7, 1.0).gather(2, l_labels.unsqueeze(-1)).squeeze(-1)
         ).mean(dim=-1)
-        ce_after = F.binary_cross_entropy(
-            belief_after, target_features, reduction='none'
+        l_ce_after = -torch.log(
+            l_after.clamp(1e-7, 1.0).gather(2, l_labels.unsqueeze(-1)).squeeze(-1)
         ).mean(dim=-1)
+
+        # ── 合并 ──────────────────────────────────────────────────────
+        ce_before = (honor_ce_before + l_ce_before) / 2.0
+        ce_after  = (honor_ce_after  + l_ce_after)  / 2.0
+
         return torch.relu(ce_before - ce_after)
 
     def compute_dual_info_bonus(
@@ -166,13 +228,6 @@ class DualInfoComputer:
         partner_gain: torch.Tensor,
         opponent_leak: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
-        """
-        Dual-Info Bonus = partner_gain - β * opponent_leak
-
-        Returns:
-            bonus:   (batch,) tensor
-            metrics: 详细指标 dict
-        """
         bonus = partner_gain - self.beta * opponent_leak
         metrics = {
             'partner_gain':    partner_gain.mean().item(),
