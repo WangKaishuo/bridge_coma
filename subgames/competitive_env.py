@@ -539,6 +539,7 @@ class CompetitiveSubgameEnv:
         NS/EW 语义保持: 开叫方阵营 = NS policy, 争叫方阵营 = EW policy.
         """
         dealer = dealer if dealer is not None else self.dealer
+        self.dealer = dealer  # P93 fix: policy closures read env.dealer for encode_obs_flat
         opener_seats = {dealer, (dealer + 2) % NUM_PLAYERS}
 
         inner = BridgeBiddingEnv(self.max_history_len)
@@ -664,6 +665,7 @@ def dds_oracle_evaluate(
     for _ in range(num_deals):
         hands, dd_table = env.generate_deal()
         dealer = env._sampled_dealer
+        env.dealer = dealer  # P93 fix: policy closures read env.dealer for encode_obs_flat
         vul = (False, False)
 
         obs  = inner.reset(hands, dealer=dealer, vulnerability=vul)

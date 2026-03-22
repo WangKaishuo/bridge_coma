@@ -1,11 +1,19 @@
 # Bridge-COMA
 
 **Dual-Information Credit Assignment for Cooperative-Competitive Multi-Agent Coordination**
+MSc Research Project — Kaishuo Wang, 2026
 
-MSc Research Project — Addressing relative overgeneralization and miscoordination in bridge bidding
-via information-theoretic reward shaping with prior asymmetry.
+$$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdot I(\text{bid};\,\text{hand} \mid \text{opponent})$$
 
-Core innovation: `r_info = I(bid;hand|partner) − β·I(bid;hand|opponent)` on top of MAPPO/HAPPO.
+---
+
+## ⚠️ CRITICAL WORKFLOW NOTES (read at start of every session)
+
+1. **Claude has NO cross-session memory.** Paste this README at the start of each new conversation.
+2. **NEVER use `/mnt/project/` as base for edits.** That directory is the version last manually uploaded by Titus and may be several patches behind. Always base edits on the most recent file in `/home/claude/` or `/mnt/user-data/outputs/`.
+3. **Config lives in `subgame_validation.py`, not `subgame_trainer.py`.** SubgameConfig kwargs in `subgame_validation.py` override all defaults. Always edit `subgame_validation.py` for hyperparameter changes.
+4. **Five files to keep in sync:** `subgame_trainer.py`, `subgame_validation.py`, `competitive_env.py`, `belief_net.py`, `fsp_pool.py`.
+5. **belief_net.py and hand_features.py were rewritten in P86.** Do NOT reference old versions with pos_weight=3.0/7.0 or unified BCE loss.
 
 ---
 
@@ -13,294 +21,232 @@ Core innovation: `r_info = I(bid;hand|partner) − β·I(bid;hand|opponent)` on 
 
 ### Phase 1: Environment & Infrastructure ✅ Complete
 
-| Item | Status |
-|------|--------|
-| Package structure + `setup_project.py` assembly | ✅ |
-| Single-table bidding env (`BridgeBiddingEnv`) | ✅ |
-| Dual-table IMP env (`DualTableEnv`) | ✅ |
-| Scoring SSOT (`scoring.py`) | ✅ |
-| IMP conversion (`imp.py`) | ✅ |
-| DDS data generation & loading (1M deals) | ✅ |
-| IPPO / MAPPO algorithms | ✅ |
-| Training script (dual-table IMP + dealer rotation + vulnerability) | ✅ |
-| Test suite (35 tests across all modules) | ✅ |
-
 ### Phase 2: Subgame Validation 🔄 In Progress
 
-#### Stayman Subgame 🔄 P53 rewrite complete, clean run pending
+#### Stayman ⏸ Deferred — null result structurally expected
+
+#### Competitive Subgame 🔄 Active
 
 | Item | Status |
 |------|--------|
-| Constrained dealing + DDS data generation (50k deals) | ✅ |
-| Stayman subgame env (`stayman_env.py`) | ✅ |
-| Action mask → generalized to `env._get_legal_actions()` | ✅ |
-| Subgame trainer (`subgame_trainer.py`) | ✅ |
-| N/S rule policies | ✅ |
-| BC data generation — N+S joint + Round3 N response | ✅ |
-| HAPPO dual-actor (actor_n + actor_s fully independent) | ✅ |
-| Dual independent critic (critic_n + critic_s) | ✅ |
-| Entropy revival (temperature=2.0 before Stage 2) | ✅ |
-| KL early stopping (epoch-level) | ✅ |
-| BC global hard ceiling (bc_kl_max) | ✅ |
-| Post-BC diagnostics: north_rule=True | ✅ |
-| **P52: MLP + flat input (no LSTM) — Kita et al. 2024 style** | ✅ |
-| **P52: Fictitious Self-Play (FSP) checkpoint pool** | ✅ |
-| **P52: lr 3e-5 → 3e-6; steps 200 → 800** | ✅ |
-| **P53: PopArt value normalization** | ✅ |
-| **Clean run post-P53** | ⏳ Next |
-| Multi-seed validation (5 seeds) | ⏳ After clean run |
-
-#### Competitive Subgame
-
-| Item | Status |
-|------|--------|
-| Constrained dealing + DDS data (100k deals) | ✅ |
-| Competitive subgame env (`competitive_env.py`) | ✅ |
-| BC warmup (`behavioral_cloning.py`) | ✅ |
-| Full experiment | ⏳ After Stayman confirmed |
-
-### Phase 3–4: Not started
+| Env + DDS data (500k deals) | ✅ |
+| P54–P86: Core infrastructure + Belief Net rewrite | ✅ |
+| P87b: r_info weight 0.02→0.2 | ✅ |
+| P88: KL anneal 0.5→0.0, first B>A result | ✅ |
+| **P93: Dealer eval bug fix** | ✅ |
+| **P93: Belief Net on-policy update (replaces replay buffer)** | ✅ |
+| **P93: Corrected eval (eval_paired.py)** | ✅ |
+| P93 experiment run (P88 config + on-policy belief) | 🔄 In progress |
+| Multi-seed validation (3 seeds) | ⏳ After P93 confirmed |
 
 ---
 
-## Current Experimental State
+## ⚠️ P93 CRITICAL BUG FIX: Dealer Encoding in Eval
 
-### P52/P53 Architecture Rewrite (In Progress)
+### The Bug
+`play_mixed()` and `dds_oracle_evaluate()` in `competitive_env.py` never updated `env.dealer` (i.e. `self.dealer`). Policy closures read `env.dealer` for `encode_obs_flat()`, which uses `dealer` to compute `caller = (dealer + step_idx) % 4` — determining which player made each bid in the `who_called` matrix.
 
-A full architectural overhaul motivated by reviewing prior literature:
+**Training was NOT affected** — `_collect_episodes_batch` uses independent `envs[i]` with correct per-slot `slot_dealer[i]`.
 
-**Key references:**
-- Kita et al. (2024) "A Simple, Solid, and Reproducible Baseline for Bridge Bidding AI" (IEEE CoG 2024) — MLP+flat input, SL→PPO+FSP recipe, lr=1e-6
-- Yu et al. (2022) "The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games" (NeurIPS 2022) — MAPPO, **PopArt as Suggestion #1**, training epoch count guidance
+**All eval H2H numbers from P82–P92 were wrong** — `cross_evaluate()`, `evaluate_head_to_head()`, and `dds_oracle_evaluate()` all had incorrect dealer encoding, systematically underestimating agent strength.
 
-**Changes in P52:**
-
-1. **MLP + global input (no LSTM)** — Following Kita et al. 2024:
-   - Deleted `HandEncoder` (52→256 MLP) and `HistoryEncoder` (2-layer LSTM 256)
-   - New `encode_history_flat()`: converts `(B, T, 38)` history sequence to `(B, 152)` who-made-it binary vector. For each bid `b`, records which player called it (4-bit one-hot). Lossless for bridge (bids are strictly monotone, each real bid appears at most once).
-   - Actor input: `hand(52) + history_flat(152) + position(4) + vuln(2) = 210 dims` [+ `belief_dim` if enabled]
-   - Network: 4-layer MLP × 1024 units, ReLU — same as Kita et al.
-   - Rationale: Stayman sequences are ≤12 tokens, no long-range dependency; LSTM's 74% parameter share brought no benefit but caused training instability
-
-2. **Fictitious Self-Play (FSP)** — Following Kita et al. 2024 (who followed Brown et al.):
-   - `FSPPool` in `mappo.py`: maintains a rolling pool of the last 10 actor snapshots (N and S separately)
-   - Non-active player during rollout samples uniformly from pool instead of always using the latest policy
-   - Prevents **policy cycling**: the alternating IBR (Improved Best Response) scheme in cooperative games is not guaranteed to converge to optimal Nash; FSP approximates the average policy and stabilizes training
-   - Pool empty at start → falls back to latest policy (backward compatible)
-   - `agent.fsp_push()` called after each N-phase completes
-
-3. **Learning rate and step count** — Following Kita et al. 2024:
-   - `stage2_lr`: 3e-5 → **3e-6** (Kita uses 1e-6; relaxed slightly for subgame scale)
-   - `stage2_alt_steps`: 200 → **800** (lower lr requires more steps to accumulate same gradient magnitude)
-   - Rationale: previous vl=2-7 explosions in S-phase were caused by large lr destroying BC-learned weights within a few PPO updates
-
-4. **Removed player weighting ×3 from BC** — was a workaround for shared LSTM (N/S shared `HistoryEncoder`, N's gradient "told LSTM history is unimportant"). With independent MLP actors, this coupling no longer exists.
-
-**Changes in P53:**
-
-5. **PopArt value normalization** — Following Yu et al. (2022) MAPPO, Suggestion #1: *"Always use PopArt value normalization."*
-   - `PopArtLayer` replaces `nn.Linear(hidden, 1)` in `ValueNetwork`
-   - Maintains running `μ` and `σ` of returns via EMA (β=3e-4)
-   - **Art step**: when μ/σ update, output layer weights are adjusted to preserve denormalized output continuity — `w ← w·(σ_old/σ_new)`, `b ← (b·σ_old + μ_old - μ_new) / σ_new`
-   - `forward()` → denormalized value (for GAE bootstrap)
-   - `normalized_forward()` → normalized value (for loss computation)
-   - `normalize_target(returns)` → `(returns - μ) / σ` (training target)
-   - In `critic_warmup_step` and `safe_update`: call `update_stats(b_ret)` before each batch, compute loss in normalized space
-   - **Effect**: vl stays in [0, 0.3] regardless of phase switches; eliminates the vl=0.07→2.8 jump that previously required asymmetric S-phase prewarm (6 rounds ×1024 deals). Prewarm now unified at 2 rounds ×512 deals for both N and S.
-
-### Previous Latest Full Run (P51, seed=42, 6 rounds) — Pre-rewrite baseline
-
-**Stage 2 Final:**
-
-| Agent | IMP | Δ vs BC |
-|-------|-----|---------|
-| BC-only | −4.07 | — |
-| A_control (MAPPO) | −4.11 | −0.04 ← RL slightly degrades |
-| B_partner_only (MAPPO+r_info) | pending | — |
-
-**Root causes identified (led to P52/P53 rewrite):**
-- `stage2_lr=3e-5` too high → vl=2-7 in S-phase → noisy advantage → wrong gradient direction
-- No FSP → policy cycling under alternating IBR → S overfits to latest N rather than learning robust strategy
-- LSTM overhead with no benefit in short-sequence subgame
-
----
-
-## Architecture (P52/P53)
-
-### Actor: `PolicyNetwork`
-
-```
-Input (210 dims):
-  hand           : (B, 52)   — one-hot cards
-  history_flat   : (B, 152)  — who-made-it encoding: 38 bids × 4 players
-  position       : (B, 4)    — player one-hot
-  vulnerability  : (B, 2)
-  [belief]       : (B, K)    — optional BeliefNet output, stop-gradient
-
-Network: Linear(210, 1024) → ReLU → ×3 → Linear(1024, 38)
-Output: (B, 38) logits
-```
-
-### Critic: `ValueNetwork` (CTDE + PopArt)
-
-```
-Input (418 dims):
-  hand           : (B, 52)
-  history_flat   : (B, 152)
-  position       : (B, 4)
-  vulnerability  : (B, 2)
-  all_hands      : (B, 208)  — 4×52 centralized info
-
-Trunk: Linear(418, 1024) → ReLU → ×3 → (B, 1024)
-Head:  PopArtLayer(1024)  → scalar (denormalized)
-```
-
-**PopArtLayer internals:**
-```
-μ, σ: running stats (EMA, β=3e-4)
-forward(x)          → Linear(x)·σ + μ      (denorm, for GAE)
-normalized_forward(x) → Linear(x)           (norm, for loss)
-normalize_target(y) → (y - μ) / σ
-update_stats(y)     → update μ,σ + Art weight adjustment
-```
-
-### BeliefNetwork (P52, no LSTM)
-
-```
-Input: hand(52) + history_flat(152) + pos_embed(32) + target_pos_embed(32) = 268 dims
-Network: Linear(268, 512) → ReLU → Linear(512, 512) → ReLU → Linear(512, 48)
-Output: (B, 48) logits — 16 honor bits (AKQJ per suit) + 32 length bits (one-hot per suit)
-Loss: BCEWithLogitsLoss(pos_weight=3.0)
-```
-
-### FSP Pool (`mappo.py`)
-
+### The Fix (competitive_env.py)
 ```python
-FSPPool(pool_size=10)
-  .push(actor_n_state, actor_s_state)      # call after N-phase ends
-  .sample_actor_state(player)              # uniform sample from pool
-  .get_fsp_actor(player) → PolicyNetwork   # returns loaded historical actor
+# play_mixed(): line 542
+self.dealer = dealer  # P93 fix: policy closures read env.dealer
+
+# dds_oracle_evaluate(): line 667
+env.dealer = dealer   # P93 fix
 ```
 
-Non-active player calls `agent.get_action_for_player_fsp()` during rollout.
-Pool empty → falls back to latest policy (first few rounds).
+### Impact
+- vs SL IMP jumped from ~+1 to ~+7–8 (agents were always stronger than we thought)
+- A vs B **direction may have been wrong** in some experiments
+- All historical eval numbers must be re-verified with `eval_paired.py`
 
 ---
 
-## Key Hyperparameters (P53 current)
+## Experimental Results History (Corrected)
 
-```python
-# Stage 1
-stage1_steps                 = 0       # pure BC + critic warmup, no RL
-critic_warmup_rounds         = 3
-critic_warmup_deals          = 512
+### P88 — Re-evaluated with dealer fix (eval_paired.py, 5000 deals)
 
-# Stage 2
-stage2_alt_rounds            = 6
-stage2_alt_steps             = 800     # P52: was 200
-stage2_lr                    = 3e-6    # P52: was 3e-5 (Kita 2024: 1e-6)
-stage2_entropy_start         = 0.05    # P52: was 0.10
-stage2_entropy_end           = 0.01    # P52: was 0.05
-stage2_fsp_pool_size         = 10      # P52: FSP pool
+**Config**: 20 rounds, λ: 0.5→0.0 over 50%, pool=10, interval=2
 
-# Critic prewarm (P53 PopArt: unified, no S-phase special case)
-stage2_critic_prewarm_max_rounds = 2
-stage2_critic_prewarm_deals  = 512
-stage2_critic_prewarm_epochs = 3
-stage2_critic_prewarm_conv_tol = 0.05
+| Matchup | IMP | p-value | |
+|---------|-----|---------|--|
+| A vs SL | **+6.176** | 0.000 ✅ | |
+| B vs SL | **+8.065** | 0.000 ✅ | |
+| A vs B  | **-3.181** | 0.000 ✅ | **B wins** |
+| Paired (A_SL - B_SL) | **-1.889** | 0.000 ✅ | **B stronger vs SL** |
 
-# KL guards
-stage2_kl_early_stop_threshold = 0.015
-stage2_bc_kl_max             = 0.5
+**This is the strongest positive result.** r_info produces both internal superiority (B>>A) and external generalization (B vs SL > A vs SL by 1.9 IMP).
 
-# PopArt (P53)
-popart_beta                  = 3e-4    # EMA update rate for μ/σ
+### P92 (self-play, λ=0 全程) — Re-evaluated with dealer fix
 
-# Agent B info bonus
-beta                         = 0.05
+**Config**: 30 rounds, λ=0.0 throughout, no FSP (self-play only)
 
-# Multi-seed
-seeds                        = [42, 123, 456, 789, 2024]
-```
+| Matchup | IMP | p-value | |
+|---------|-----|---------|--|
+| A vs SL | +7.071 | 0.000 ✅ | |
+| B vs SL | +7.388 | 0.000 ✅ | |
+| A vs B  | +0.075 | 0.173 (ns) | No difference |
+| Paired (A_SL - B_SL) | -0.317 | 0.010 | Marginal |
+
+**r_info had no meaningful effect.** Cause identified: Belief Net degraded catastrophically during training — length accuracy fell from 0.488 (pretrain) to 0.230 (final), making r_info essentially random noise.
+
+### Key Comparison: Why P88 > P92
+
+| Factor | P88 (B>A ✅) | P92 (B≈A ❌) |
+|--------|-------------|-------------|
+| KL schedule | 0.5→0.0 over 50% | 0.0 throughout |
+| Opponent | FSP pool (10 checkpoints) | Self-play only |
+| Rounds | 20 | 30 |
+| Final NS entropy | ~0.52 | ~0.37 |
+| Belief Net health | Maintained (slow drift) | Collapsed (length 0.23) |
+| Diagnosis | KL stabilizes early training → belief net learns good foundation → r_info effective in later rounds | No KL → immediate drift → belief net can't track → r_info = noise |
+
+### Pre-P93 eval numbers (INVALID — dealer bug)
+
+All H2H numbers in previous README versions (P88: A vs SL = +2.4, etc.) were **systematically wrong** due to the dealer encoding bug. Only the corrected numbers above should be used.
 
 ---
 
-## Quick Start
+## P93: Belief Net On-Policy Update
 
-### 1. Install
-```bash
-pip install torch numpy tqdm endplay pyyaml scipy
+### Problem
+Belief Net was trained via JIT burn-in using a 50k FIFO replay buffer. As policy drifted (especially with low/no KL), buffer contained stale data from earlier strategies. This poisoned belief estimates — analogous to training a Critic on off-policy returns.
+
+### Solution
+Treat Belief Net like a Critic: train on current round's on-policy rollout data only, continual learning on previous weights.
+
+- **After** both tables' PPO updates, extract belief data from `ns_eps + ew_eps`
+- Train 8 epochs with early stopping (patience=2), 90/10 train/val split
+- LR = 5e-5 (lower than pretrain's 1e-4 for smooth continual learning)
+- No replay buffer — data from current round only, discarded after use
+- Network weights carry forward (not reset) — low-frequency knowledge preserved in weights
+
+### Why Not Other Approaches
+- **Replay buffer (old method)**: Stale data poisons belief when policy drifts
+- **Joint training (Rong et al.)**: Gradient interference between belief loss and PPO loss
+- **SL anchor buffer**: Only safe when KL keeps policy near SL; contradictory when λ→0
+- **On-policy (chosen)**: Matches Critic training paradigm; no distribution shift by construction
+
+---
+
+## Architecture
+
+### Actor: `MLPPolicyNetwork` (301 dims → 4×1024 MLP → 38 logits)
+```
+hand(52) + history_flat(152, who-made-it) + position(4) + vulnerability(2) + dealer(1) = 301
+```
+Note: `encode_obs_flat(obs, dealer, history_int)` uses `dealer` to compute
+`caller = (dealer + step_idx) % 4` for the `who_called` matrix. **Getting dealer wrong
+causes catastrophic input corruption** (P93 bug).
+
+### Critic: `MLPValueNetwork` (CTDE, 509 dims)
+```
+flat_obs(301) + all_hands(4×52=208) = 509
 ```
 
-### 2. Assemble project (every new session)
-```bash
-python setup_project.py
-# Then manually overwrite:
-#   networks/__init__.py  ← remove HandEncoder/HistoryEncoder/ActorCritic exports
+### Belief Network (P86, 268 dims → shared 2×512 trunk → dual head)
+```
+Input: observer_hand(52) + history_flat(152) + pos_embed×2(64) = 268
+
+Honor head: trunk → Linear(512, 16) → sigmoid → calibrated P(honor)
+  Loss: BCEWithLogitsLoss (NO pos_weight)
+
+Length head: trunk → Linear(512, 32) → softmax(per suit, 8 bins) → P(length)
+  Loss: CrossEntropyLoss (8-class per suit)
 ```
 
-### 3. Run Phase 2 Stayman experiment
+### HAPPO: 8 independent networks — `actor_n/s/e/w` + `critic_n/s/e/w`
+
+---
+
+## Training Pipeline (P93, current)
+
+### Stage 1: SL Initialization
+Load `results/sl_base.pt` (9.9M SAYC deals, 4 actors with identical weights).
+
+### Stage 1.5: Belief Net Pretrain (Agent B only)
+10k deals → train to convergence (~300 epochs). No replay buffer seeding (P93: removed).
+
+### Stage 2: RL Fine-tuning (20 rounds)
+
+Each round:
+1. FSP pool: sample checkpoint as opponent (SL is permanent member)
+2. **Table 1 (NS)**: collect 32768 deals, agent=NS, FSP=EW → r_info bonus → PPO update N+S
+3. **Table 2 (EW)**: collect 32768 deals, agent=EW, FSP=NS → r_info bonus → PPO update E+W
+4. **On-policy Belief Update (P93)**: train belief net on this round's rollout data (ns_eps + ew_eps), 8 epochs, early stopping
+5. **Mini eval**: vs SL H2H (1000 deals)
+
+**Reward**: `score_to_imp(score - dds_optimal)`, terminal only.
+
+**r_info (P87b)**: Dynamic normalization. With w=0.2, step_ir ≈ 0.9–1.4 IMP.
+
+**KL schedule**: λ linearly 0.5→0.0 over first 50% of rounds (P88 config).
+
+### Stage 3: Evaluation
+- A vs SL, B vs SL, A vs B (1000 deals each, Wilcoxon)
+- **Paired eval** (`eval_paired.py`): same 5000 deals for all 3 matchups, paired Wilcoxon on (A_SL - B_SL)
+- Belief Net quality (honor/length accuracy)
+
+### Hyperparameters (P93, set in `subgame_validation.py`)
+
+| Param | Value | Note |
+|-------|-------|------|
+| lr | 3e-6 | Kita et al. |
+| kl_lambda_start / end | 0.5 / 0.0 | P93: restore P88 anneal |
+| kl_anneal_frac | 0.5 | Over first 50% of rounds |
+| deals_per_step | 512 | |
+| steps_per_phase | 64 | → 32768 deals/table/round |
+| num_rounds | 20 | P93: restore P88 |
+| beta (internal) | 0.05 | I(partner) - β·I(opponent) |
+| info_reward_weight | 0.2 | P87b |
+| fsp_pool_size | 10 | 1 permanent SL + 9 FIFO |
+| fsp_add_interval | 2 | |
+| belief_update_epochs | 8 | P93: on-policy, early stop patience=2 |
+| belief_update_lr | 5e-5 | P93: lower than pretrain 1e-4 |
+
+---
+
+## Running the Experiment
+
 ```bash
-# Single run (default seed=42)
+# P93: Train Agent B only (load pre-trained Agent A)
 python experiments/subgame_validation.py \
-    --stayman_data data/stayman_50k.npz \
-    --seed 42 \
-    --device cuda
+    --data data/competitive_500k.npz \
+    --sl_checkpoint results/sl_base.pt \
+    --load_agent_a results/competitive/agent_a_seed42.pt \
+    --seed 42
 
-# With belief actor for S
-python experiments/subgame_validation.py \
-    --stayman_data data/stayman_50k.npz \
-    --belief_actor_south \
-    --device cuda
-
-# Quick smoke test
-python experiments/subgame_validation.py --quick \
-    --stayman_data data/stayman_50k.npz
+# Paired eval (corrected, same deals for all matchups)
+python eval_paired.py \
+    --data data/competitive_500k.npz \
+    --sl_checkpoint results/sl_base.pt \
+    --agent_a results/competitive/agent_a_seed42.pt \
+    --agent_b results/competitive/agent_b_seed42.pt \
+    --num_deals 5000
 ```
 
-### 4. Key log indicators
-
+### Key log indicators
 ```
-[Critic Prewarm] 2 rounds × 512 deals: vl X → Y
-  → With PopArt, vl should stay < 0.3 even after phase switches
-  → If vl > 1.0, PopArt may not be updating (check update_stats calls)
+[Round N] regret=+3.80±6.65  (NS=+3.99 EW=+3.65)  fsp=10
+  regret: mean DDS IMP regret vs FSP pool (relative, not absolute)
 
-[FSP] pool size N
-  → Non-active player sampling from N historical checkpoints
+NS │ N: pl=-0.015 vl=6.8 ent=0.66 │ S: ... kl=0.97(λ=0.250)
+  ent: healthy range 0.5–0.8 for competitive bidding
+  kl: with λ annealing, expected to rise as λ decreases
 
-⚡KL-stop
-  → epoch-level KL > 0.015; actor update truncated
+r_info │ step_ir=0.93  belief_loss=1.79
+  step_ir: ~0.9 IMP is the target range
 
-🚫actor-skip(bc_kl=X.XXX)
-  → global BC ceiling triggered; should be rare (<10% of updates)
+[Belief Update] 45000 samples, 5 epochs, val_loss=1.8200
+  P93: on-policy update. Watch val_loss — should track, not diverge.
+
+[Head-to-Head] agent vs SL  n=1000  p=0.003
+  PRIMARY convergence metric (now with correct dealer encoding)
 ```
-
-### 5. Outputs
-```
-results/
-├── phase2_report.json
-├── s_base.pt
-├── A_control.pt
-└── B_partner_only.pt
-```
-
----
-
-## Stayman: Scientific Assessment
-
-**The Stayman subgame is a necessary but limited test.** Key evidence:
-
-1. **N's bidding is 100% deterministic** — BC taught the 3-bit Stayman protocol (2♦/2♥/2♠) to near-theoretical optimality.
-2. **Belief overall_acc = 0.756** — well above 0.40 target; S can already infer N's hand type perfectly from N's single bid.
-3. **ir ≈ 1.0** — information channel saturated; r_info cannot improve what BC maximized.
-4. **EW always pass** — β·opponent_leak term is structurally inactive in Stayman.
-5. **Null result is expected** — Stayman validates infrastructure stability, not r_info.
-
-**The real r_info test is the competitive subgame**, where:
-- N has a richer signaling space (no single "correct" protocol)
-- Active EW interference creates genuine partner/opponent information tension
-- BC cannot reach a theoretical ceiling
-- Full dual-info formula `I(bid;hand|partner) - β·I(bid;hand|opponent)` is exercised
 
 ---
 
@@ -309,64 +255,48 @@ results/
 ### Phase 1 (P0–P6)
 P0 package · P1 termination · P2 reward · P3 eval · P4 scoring · P5 vulnerability · P6 dealer
 
-### Phase 2 (P7–P53)
+### Phase 2 (P7–P93)
 
 | # | Problem | Fix |
 |---|---------|-----|
-| P7 | NaN crash | `safe_update` robust normalization |
-| P8 | All Pass | Stayman action mask |
-| P9 | All-negative reward | Piecewise linear shifted IMP |
-| P10 | N↔S coupling | N+S joint BC |
-| P11 | cudnn LSTM error | `model.train()` |
-| P12 | Competitive reward explosion | Dual-table IMP |
-| P13 | Low filter rate | `generate_subgame_data.py` |
-| P14 | Unfair DDS | `max_level=4` |
-| P15 | Entropy collapse | `entropy_end=0.02`, anneal=0.8 |
-| P16 | N weights random | N+S joint training |
-| P17 | RL destroys BC | Stage 1 pure BC + low lr |
-| P18–P20 | Logging / checkpoint / imports | Fixed |
-| P21 | Value loss explosion | `single_step=True`: batch-mean baseline |
-| P22 | Entropy collapse | `entropy_end=0.02`, anneal=0.8 |
-| P23 | Credit assignment blur | Alternating S-N-S-N training |
-| P24 | N-phase reward=0 | Fixed `reward` capture in non-active player path |
-| P25 | LSTM deaf | `pack_padded_sequence` |
-| P26 | S ignores N's bids | S weight ×3 + minority weight ×2 |
-| P27 | KL=-inf NaN | Clamped logits before KL |
-| P28 | NaN in `evaluate_actions` | Separate actor/critic optimizers |
-| P29 | Critic warmup Adam re-created each call | Reuse `agent.critic_optimizer` |
-| P30 | `single_step=True` blocked Critic | `single_step=False` in Stage 2 |
-| P31 | Belief Net stuck at 0.75 | BCEWithLogitsLoss(pos_weight=3) + Top-13 hit rate |
-| P32 | KL anchor gradient = 0 | Manual KL; `curr_logits` outside `no_grad` |
-| P33 | Belief Net catastrophic forgetting | `belief_lr: 1e-3 → 1e-4` |
-| P34 | BC missing N Round3 responses | Extended BC collection |
-| P35 | 4H/4S acceptance too rare in BC | `stayman_bc_samples: 10000 → 20000` |
-| P36 | r_info never wired to reward; β=0.0 | Wire ir to terminal reward; `beta=0.05`; ReLU clamp; JIT burn-in |
-| P37 | `NameError: BID_PASS` | Add imports |
-| P38 | BC mask mismatch | `env._get_legal_actions()`, deleted 327 lines |
-| P39 | N vl explosion Round 2+ | Unified cross-round macro KL annealing |
-| P40 | BeliefNetwork 52→48 dim mismatch | `hand_to_belief_target()` applied correctly |
-| P41 | Critic prewarm degraded Actor | `store_episodes → compute_returns → Critic-only → buffer.reset()` |
-| P42 | Adaptive prewarm removed | Fixed 3 rounds × 128 deals |
-| P43 | BC over-training entropy=0 | Early stopping acc≥0.98 × patience=3 |
-| P44 | BC-N quality unknown | Added rule-N vs BC-N diagnostic |
-| P45 | entropy=0 → PPO cannot update | `_revive_entropy(temperature=2.0)` before Stage 2 |
-| P46 | temperature=2.0 → OOD bids | (reverted; 2.0 retained) |
-| P47 | N-phase prewarm vl diverges | `stage2_n_critic_prewarm_rounds=6` (superseded by P49) |
-| P48 | Shared actor → N/S gradient cross-contamination | HAPPO dual actor (actor_n + actor_s) |
-| P48b | Eval loops not passing player= | All eval loops fixed |
-| P49 | Shared critic → catastrophic forgetting (vl 2000+) | Dual independent centralized critic (critic_n + critic_s) |
-| P49b | Joint fine-tune destabilizes protocol | Removed joint fine-tune |
-| P50 | Fixed prewarm insufficient; KL stop batch-level | Adaptive prewarm; KL stop at epoch level (later found still insufficient → P51) |
-| P50b | Post-BC diagnostics OOD bids | `north_rule=True` diagnostics |
-| P51 | KL early stop batch-level never triggered | **Epoch-level KL**: accumulate across full epoch |
-| P51 | Critic prewarm 128 deals = statistical disaster | **Large static buffer**: 2048 deals, actor frozen, multi-epoch |
-| P51 | No global BC ceiling | **BC hard ceiling**: skip actor if KL(current∥BC) > 0.5 |
-| **P52** | **RL degrades BC (vl 2–7, policy cycling)** | **MLP+flat input (no LSTM)** following Kita et al. 2024; **FSP pool** following Kita et al. 2024; **lr 3e-5→3e-6** following Kita et al. 2024 |
-| **P52** | **_auto_play_non_agent: OOD bids after game-level** | Auto-pass all players once game-level contract reached (3NT/4M+); BC/RL never trained on post-game positions |
-| **P52** | **nofit→4M false positive in diagnostics** | Root cause: S gets OOD turn after N accepts invitation (4H); fixed by game-level auto-pass |
-| **P52** | **`networks/__init__.py` exports deleted classes** | Remove `HandEncoder`/`HistoryEncoder`/`ActorCritic`; export `PolicyNetwork`/`ValueNetwork`/`BeliefNetwork` |
-| **P52** | **Removed player weighting ×3 in BC** | Was LSTM workaround; MLP actors are independent, coupling no longer exists |
-| **P53** | **vl=0.07→2.8 on S-phase phase switch, requires asymmetric prewarm** | **PopArt value normalization** following Yu et al. 2022 (MAPPO Suggestion #1); vl stays in normalized space regardless of reward scale shifts |
+| P7–P53 | Various early issues | See previous README versions |
+| P54–P77 | Competitive env infrastructure | Dealer rotation, dual-table, FSP, batch rollout |
+| P82 | NS/EW asymmetry | Dual-table symmetric training |
+| P83 | r_info drowns base reward | Separate beta vs info_reward_weight |
+| P84 | Belief Net catastrophic forgetting | FIFO Replay Buffer (50k) — **superseded by P93** |
+| P86 | Belief Net miscalibration | No pos_weight, CE for length, prior bias init |
+| P87b | r_info signal invisible to PPO | info_reward_weight 0.02→0.2 |
+| P88 | KL=1.5 locked agent at SL | KL anneal: 0.5→0.0 over 50% rounds |
+| P89 | Pool=3 too homogeneous | Reverted to pool=10 |
+| P90 | FSP evicts SL | SL as permanent FSP member |
+| P91 | No absolute training metric | Mini DDS Oracle + vs SL eval every round |
+| **P93** | **`play_mixed` / `cross_evaluate` / `dds_oracle_evaluate` used wrong `env.dealer`** | **`self.dealer = dealer` in `play_mixed`; `env.dealer = dealer` in oracle eval** |
+| **P93** | **Belief Net trained on stale replay buffer data → length acc 0.49→0.23** | **On-policy update: train on current round's rollout only, no replay buffer** |
+| **P93** | **Eval used different deals per matchup → no paired comparison** | **`eval_paired.py`: pre-sample deals, all matchups on same deals, paired Wilcoxon** |
+
+---
+
+## Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| MLP+flat, no LSTM | Kita 2024: no benefit ≤12 tokens |
+| FSP pool=10 + SL permanent | Opponent diversity prevents co-adaptation; SL anchor prevents forgetting |
+| KL anneal 0.5→0.0 over 50% | Early stability for belief learning; late freedom for specialization |
+| On-policy belief update (P93) | Belief Net = Information Critic; must track current policy like Value Critic |
+| Dynamic r_info normalization | `(imp_std/rinfo_std) * w` auto-scales to IMP magnitude |
+| eval_paired.py for H2H | Same deals across matchups enables paired statistical test |
+
+---
+
+## Key Lessons Learned
+
+1. **Dealer encoding is catastrophic when wrong.** `encode_obs_flat` uses dealer to assign `who_called` — wrong dealer = wrong input for every bid in history. Always verify `env.dealer` matches the actual dealer in eval paths.
+2. **Training data was correct all along.** `_collect_episodes_batch` uses independent envs with correct dealer. The bug was eval-only, meaning trained agents were always stronger than eval indicated.
+3. **FSP pool diversity > self-play purity.** P88 (FSP, 20 rounds) produced B>>A; P92 (self-play, 30 rounds) produced B≈A. Multiple diverse opponents prevent co-adaptation and slow entropy collapse.
+4. **KL anneal is not "constraining r_info" — it's stabilizing belief learning.** The first 10 rounds with λ=0.5→0.25 keep policy drift slow enough for belief net to build a robust foundation. r_info becomes effective in the second half when λ→0.
+5. **Belief Net must be on-policy.** Stale replay data from earlier strategies has different bid→hand mappings. This poisons belief estimates, making r_info = noise. Treat belief net like a Critic.
+6. **Paired eval is essential.** Unpaired eval (different deals per matchup) cannot detect 0.3 IMP differences. `eval_paired.py` with 5000 shared deals detected B > A at p=0.000 for P88.
 
 ---
 
@@ -374,50 +304,55 @@ P0 package · P1 termination · P2 reward · P3 eval · P4 scoring · P5 vulnera
 
 ```
 bridge-coma/
-├── env/
-│   ├── bridge_bidding_env.py
-│   └── dual_table_env.py
-├── networks/
-│   ├── policy_net.py        # P52: MLP+flat; P53: PopArtLayer in ValueNetwork
-│   └── belief_net.py        # P52: MLP+flat (no LSTM); 48-dim, BCEWithLogitsLoss(pw=3)
-├── utils/
-│   ├── scoring.py
-│   ├── imp.py
-│   ├── dds_data.py
-│   ├── running_stats.py
-│   ├── hand_features.py
-│   └── generate_subgame_data.py
-├── algorithms/
-│   ├── ippo.py              # P52: updated to PolicyNetwork/ValueNetwork
-│   ├── mappo.py             # P52: FSPPool; P53: PopArt-aware critic calls
-│   └── behavioral_cloning.py
 ├── subgames/
-│   ├── stayman_env.py       # P52: game-level auto-pass in _auto_play_non_agent
-│   ├── competitive_env.py
-│   ├── subgame_trainer.py   # P53: PopArt in warmup+safe_update; P52: FSP rollout
+│   ├── competitive_env.py      # P93: dealer fix in play_mixed + dds_oracle_evaluate
+│   ├── subgame_trainer.py      # P93: on-policy belief update, no replay buffer
+│   ├── subgame_validation.py   # P93: KL 0.5→0.0, 20 rounds, load_agent_a
 │   └── action_mask.py
-├── experiments/
-│   ├── train.py
-│   └── subgame_validation.py  # P52: FSP config, new lr/steps; P53: simplified prewarm
-├── tests/
-├── results/
-├── data/
-├── setup_project.py
-└── requirements.txt
+├── networks/
+│   ├── policy_net.py           # 301-dim MLP, encode_obs_flat
+│   └── belief_net.py           # P86: dual-head, no pos_weight, prior bias init
+├── algorithms/
+│   ├── mappo.py                # HAPPO: actor/critic ×4
+│   └── ippo.py
+├── utils/
+│   ├── hand_features.py        # P86: Brier/NLL metrics
+│   ├── fsp_pool.py             # P90: permanent member support
+│   ├── sl_pretrain.py / scoring.py / imp.py
+│   ├── dds_data.py / running_stats.py
+│   └── generate_subgame_data.py
+├── eval_paired.py              # P93: paired eval (same deals, paired Wilcoxon)
+├── eval_vs_sl.py               # OLD standalone eval (unpaired, deprecated)
+├── belief_diagnostic.py
+├── results/competitive/
+│   ├── agent_a_seed42.pt       # P88 Agent A (can be reused with --load_agent_a)
+│   └── agent_b_seed42.pt
+└── data/competitive_500k.npz
 ```
 
 ---
 
-## Key Design Decisions & Learnings
+## Pending / Next Steps
 
-| Decision | Rationale |
-|----------|-----------|
-| MLP+flat over LSTM | Kita et al. 2024: LSTM provides no benefit for short bridge sequences (≤12 tokens); MLP trains faster and more stably |
-| Who-made-it history encoding | Lossless for monotone bidding; 152 dims vs 2280 (naive flatten); Kita et al. use similar 480-dim variant |
-| FSP over latest-policy self-play | IBR in cooperative games not guaranteed to converge; FSP approximates average policy, prevents cycling (Kita et al. 2024, Brown 2019) |
-| PopArt over prewarm tuning | Yu et al. 2022 Suggestion #1; normalizes value targets, eliminates phase-switch vl explosions at the source rather than treating symptoms |
-| lr=3e-6 (not 1e-6) | Kita uses 1e-6 for full-game training on 1M boards; subgame scale allows slight relaxation |
-| Dual independent critic (N+S) | Phase switches create non-stationarity; shared critic causes catastrophic forgetting (vl=2000+) |
-| Epoch-level KL early stop | Single-batch KL ≈ 0.001 (never triggers at 0.015); epoch-average KL correctly reflects cumulative drift |
-| BC hard ceiling (skip actor) | λ→0.1 insufficient restraint late in training; ceiling prevents irreversible BC destruction |
-| Stayman as infrastructure test | 3-bit protocol is BC-optimal; r_info signal is structurally saturated; serves as stability check only |
+1. **P93 experiment running**: P88 config + on-policy belief update. Only Agent B trains (Agent A loaded from P88 checkpoint). Watch belief_loss and length accuracy — should stay above 0.40.
+2. **If B > A confirmed with healthy belief**: Multi-seed validation (seeds 42, 123, 456).
+3. **If belief still degrades**: Consider lower belief_update_lr (1e-5) or fewer epochs.
+4. **Paper narrative**: P88 corrected results are the centerpiece — r_info produces +1.9 IMP generalization advantage (paired, p=0.000). KL anneal + FSP diversity are necessary enabling conditions.
+
+---
+
+## Compute Budget (T4 GPU)
+
+| Stage | Time |
+|-------|------|
+| SL pretrain (10 epochs) | ~20 min |
+| Belief pretrain (300 epochs) | ~15 min |
+| Agent A (20 rounds, if not loaded) | ~80 min |
+| Agent B (20 rounds + on-policy belief) | ~90 min |
+| Stage 3 eval (3×1000 deals) | ~5 min |
+| eval_paired.py (5000 deals ×3) | ~10 min |
+
+---
+
+*README version: P93*
+*Last updated: 2026-03-22*

@@ -95,10 +95,11 @@ class SubgameConfig:
     fsp_pool_size:    int   = 10          # Kita et al. 2024
     fsp_add_interval: int   = 2           # 每 N 轮将 actor 存入 pool
 
-    # ── JIT Belief Burn-in + Replay Buffer ───────────────────────────────
-    jit_burnin_deals:  int  = 3000        # 每轮新采集的belief数据量
-    jit_burnin_epochs: int  = 5           # P84: 3→5, replay buffer数据更多可多训几轮
-    belief_replay_capacity: int = 50000   # P84: FIFO replay buffer容量（样本数）
+    # ── Belief Net On-Policy Update (P93) ────────────────────────────────
+    # Replaces JIT burn-in + replay buffer.  Belief Net is trained like
+    # a Critic: on-policy data only, continual learning on previous weights.
+    belief_update_epochs: int  = 8            # P93: epochs per round (early-stop may cut short)
+    belief_update_lr:     float = 5e-5        # P93: lower than pretrain 1e-4, smooth continual learning
 
     # ── Critic Warmup ───────────────────────────────────────────────────────
     critic_prewarm_deals:  int   = 2048
@@ -336,10 +337,8 @@ class SubgameTrainer:
             self.belief_net  = BeliefNetwork(hidden_dim=config.hidden_dim).to(self.device)
             self.dual_info   = DualInfoComputer(self.belief_net, beta=config.beta)
             self.belief_optimizer = torch.optim.Adam(
-                self.belief_net.parameters(), lr=config.belief_lr)
+                self.belief_net.parameters(), lr=config.belief_update_lr)  # P93: use belief_update_lr
             self.partner_stats  = RunningStats()
-            self.belief_replay  = BeliefReplayBuffer(
-                capacity=config.belief_replay_capacity)
 
         # ── reward 归一化（外部传入，跨 phase 持久）────────────────────────
         self.reward_stats: RunningStats = reward_stats or RunningStats()
@@ -888,74 +887,92 @@ class SubgameTrainer:
         self.belief_net.train()
         print(f"[Belief Pretrain] Done. best_val_loss={best_val:.4f}")
 
-        # P84: 将pretrain数据填入replay buffer作为初始先验
-        if hasattr(self, 'belief_replay'):
-            self.belief_replay.add_batch(belief_data)
-            print(f"  [Replay Buffer] Seeded with {len(belief_data)} pretrain samples "
-                  f"(buffer size: {len(self.belief_replay)})")
-
     # ======================================================================
-    # JIT Belief Burn-in
+    # On-Policy Belief Update (P93)
     # ======================================================================
 
-    def jit_belief_burnin(self):
+    def update_belief_on_policy(self, episodes: List[List[dict]]) -> Optional[float]:
         """
-        P84: Replay Buffer版JIT Belief Burn-in.
+        P93: Train Belief Net on current round's rollout data only.
 
-        1. 采集 jit_burnin_deals 局新数据
-        2. 将新数据加入 belief_replay（FIFO，自动淘汰最老数据）
-        3. 从整个 replay buffer 采样训练 jit_burnin_epochs 个epoch
+        Like a Critic, the Belief Net must track the current policy's
+        semantics. Using stale replay data poisons the belief estimate
+        when the policy's bidding language has drifted.
 
-        解决灾难性遗忘：训练数据包含历史先验，不会被当前轮的小数据集洗掉。
+        Args:
+            episodes: rollout episodes from the current round (ns_eps + ew_eps)
+                      Each step may contain belief_target, observer_hand, etc.
+
+        Returns:
+            final validation loss, or None if no data
         """
         if self.belief_net is None or self.belief_optimizer is None:
-            return
+            return None
 
-        print(f"  [JIT Burn-in] Collecting {self.config.jit_burnin_deals} deals...")
-        episodes = self._collect_episodes_batch(
-            self.config.jit_burnin_deals, train_side='NS',
-            fsp_sd=None, batch_size=self.config.deals_per_step,
-            skip_dual_table=True)
-
-        # 提取belief数据
-        new_belief_data = []
+        # ── Extract belief data from episodes ──
+        belief_data = []
         for ep in episodes:
             for step in ep:
                 if 'belief_target' in step and not step.get('ew_diagnostic'):
-                    new_belief_data.append(step)
+                    belief_data.append(step)
 
-        if not new_belief_data:
+        if len(belief_data) < 100:
             return None
 
-        # 加入replay buffer
-        self.belief_replay.add_batch(new_belief_data)
+        oh  = torch.tensor(np.stack([s['observer_hand']  for s in belief_data]), dtype=torch.float32)
+        h   = torch.tensor(np.stack([s['history']        for s in belief_data]), dtype=torch.float32)
+        op  = torch.tensor(np.array([s['observer_pos']   for s in belief_data]), dtype=torch.long)
+        tp  = torch.tensor(np.array([s['target_pos']     for s in belief_data]), dtype=torch.long)
+        tgt = torch.tensor(np.stack([s['belief_target']  for s in belief_data]), dtype=torch.float32)
 
-        # 从整个buffer采样训练
-        oh_t, h_t, op_t, tp_t, tgt_t = self.belief_replay.get_tensors()
-        N = len(self.belief_replay)
+        N = len(belief_data)
+        split = int(N * 0.9)
+        perm = np.random.permutation(N)
+        tr_idx = perm[:split]
+        va_idx = perm[split:]
 
         self.belief_net.train()
-        bs = min(512, N)
+        bs = min(512, split)
+        best_val = float('inf')
+        no_improve = 0
         final_loss = 0.0
 
-        for epoch in range(self.config.jit_burnin_epochs):
-            perm = np.random.permutation(N)
+        for epoch in range(self.config.belief_update_epochs):
+            ep_perm = np.random.permutation(split)
             tl = 0.0; nb = 0
-            for s in range(0, N, bs):
-                idx = perm[s:s+bs]
+            for s in range(0, split, bs):
+                idx = tr_idx[ep_perm[s:s+bs]]
                 loss = self.belief_net.compute_loss(
-                    oh_t[idx].to(self.device), h_t[idx].to(self.device),
-                    op_t[idx].to(self.device), tp_t[idx].to(self.device),
-                    tgt_t[idx].to(self.device))
-                self.belief_optimizer.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.belief_net.parameters(), self.config.max_grad_norm)
+                    oh[idx].to(self.device), h[idx].to(self.device),
+                    op[idx].to(self.device), tp[idx].to(self.device),
+                    tgt[idx].to(self.device))
+                self.belief_optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.belief_net.parameters(), self.config.max_grad_norm)
                 self.belief_optimizer.step()
                 tl += loss.item(); nb += 1
-            final_loss = tl / max(1, nb)
+            train_loss = tl / max(1, nb)
 
-        print(f"  [JIT Burn-in] Done. loss={final_loss:.4f} "
-              f"new={len(new_belief_data)} buffer={N}")
+            # Validation
+            self.belief_net.eval()
+            with torch.no_grad():
+                val_loss = self.belief_net.compute_loss(
+                    oh[va_idx].to(self.device), h[va_idx].to(self.device),
+                    op[va_idx].to(self.device), tp[va_idx].to(self.device),
+                    tgt[va_idx].to(self.device)).item()
+            self.belief_net.train()
+
+            final_loss = val_loss
+            if val_loss < best_val - 1e-4:
+                best_val = val_loss
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= 2:  # early stop after 2 epochs no improvement
+                    break
+
+        print(f"  [Belief Update] {len(belief_data)} samples, "
+              f"{epoch+1} epochs, val_loss={final_loss:.4f}")
         return final_loss
 
     # ======================================================================
@@ -1551,7 +1568,8 @@ class SubgameTrainer:
     # 主训练循环：IBR 交替训练
     # ======================================================================
 
-    def run(self, num_rounds: int = None) -> List[dict]:
+    def run(self, num_rounds: int = None, sl_trainer: "SubgameTrainer" = None,
+            h2h_deals: int = 500) -> List[dict]:
         """
         双桌对称训练 (P82):
           每轮对同一批牌做两次 rollout:
@@ -1583,12 +1601,7 @@ class SubgameTrainer:
             _ir_vals: list = []; _bl_vals: list = []
             ns_metrics: dict = {}; ew_metrics: dict = {}
 
-            # ── JIT Belief Burn-in（Agent B only，轮首更新）─────────────
-            # P85b: 移到轮首，确保两桌的r_info计算基于同一个Belief Net
-            if self.belief_net is not None:
-                print("  [JIT Belief Burn-in]...")
-                bl = self.jit_belief_burnin()
-                if bl is not None: _bl_vals.append(bl)
+            # ── (P93: JIT burn-in removed — belief update moved to after PPO) ──
 
             # ── 桌1: agent=NS, FSP=EW ──────────────────────────────────
             print(f"  [Table1/NS] Collecting {n_deals} deals (batch={batch_sz})...")
@@ -1662,6 +1675,11 @@ class SubgameTrainer:
                 m = self._safe_update(p, rnd)
                 if m: ew_metrics[p] = m
 
+            # ── P93: On-policy Belief Update (after PPO, using this round's data) ──
+            if self.belief_net is not None:
+                bl = self.update_belief_on_policy(ns_eps + ew_eps)
+                if bl is not None: _bl_vals.append(bl)
+
             # ── 日志 ────────────────────────────────────────────────────
             all_vals = raw_ns_vals + raw_ew_vals
             mean_r = float(np.mean(all_vals)) if all_vals else 0.0
@@ -1680,6 +1698,14 @@ class SubgameTrainer:
             }
             self.log.append(log_entry)
             self._print_log(log_entry)
+
+            # ── P91: Mini vs SL eval (every round, 500 deals) ────────
+            if sl_trainer is not None:
+                h2h_result = self.evaluate_head_to_head(
+                    sl_trainer, num_deals=h2h_deals,
+                    label_self="agent", label_other="SL")
+                log_entry['vs_sl_imp'] = h2h_result['mean_imp']
+                log_entry['vs_sl_p'] = h2h_result['p_value']
 
             # P74: 早停——基于value_loss平稳性
             if self.config.early_stop_enabled:
@@ -1877,7 +1903,9 @@ class SubgameTrainer:
             num_deals=num_deals,
         )
 
-        verdict = "✅ A>B" if result.mean_imp > 0 else ("❌ B>A" if result.mean_imp < 0 else "— tie")
+        verdict = (f"✅ {label_self}>{label_other}" if result.mean_imp > 0
+                   else f"❌ {label_other}>{label_self}" if result.mean_imp < 0
+                   else "— tie")
         sig_str  = f"p={result.p_value:.3f} {'✅ sig' if result.significant else '(ns)'}"
         print(f"\n  [Head-to-Head] {label_self} vs {label_other}  "
               f"n={num_deals}  {sig_str}")

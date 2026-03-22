@@ -65,11 +65,11 @@ def run_competitive(args):
         batch_size       = 256,
         use_info_bonus   = False,
         beta             = 0.0,
-        fsp_pool_size    = 10,   # P90: restored (P89's 3 was too homogeneous)
-        fsp_add_interval = 2,    # P90: restored
-        kl_lambda_start  = 0.5,   # P88
-        kl_lambda_end    = 0.1,   # P90: floor 0.1 (was 0.0, caused entropy collapse)
-        kl_anneal_frac   = 0.3,   # P90: fast anneal in first 30%, then hold at 0.1
+        fsp_pool_size    = 10,
+        fsp_add_interval = 2,
+        kl_lambda_start  = 0.5,   # P93: restore P88 KL anneal
+        kl_lambda_end    = 0.0,   # anneal to 0
+        kl_anneal_frac   = 0.5,   # over first 50% of rounds
         bc_warmup_samples= 1000 if args.quick else 5000,
         bc_warmup_epochs = 5    if args.quick else 20,
         device           = device,
@@ -89,11 +89,11 @@ def run_competitive(args):
         use_info_bonus   = True,
         beta             = args.beta,
         info_reward_weight = args.info_weight,
-        fsp_pool_size    = 10,   # P90: restored
-        fsp_add_interval = 2,    # P90: restored
-        kl_lambda_start  = 0.5,   # P88
-        kl_lambda_end    = 0.1,   # P90: floor 0.1
-        kl_anneal_frac   = 0.3,   # P90: fast anneal in first 30%
+        fsp_pool_size    = 10,
+        fsp_add_interval = 2,
+        kl_lambda_start  = 0.5,   # P93: restore P88 KL anneal
+        kl_lambda_end    = 0.0,
+        kl_anneal_frac   = 0.5,
         bc_warmup_samples= 1000 if args.quick else 5000,
         bc_warmup_epochs = 5    if args.quick else 20,
         device           = device,
@@ -146,27 +146,7 @@ def run_competitive(args):
             max_epochs=getattr(args, 'belief_pretrain_max_epochs', 300),
         )
 
-    # ── Stage 2: RL 微调 ────────────────────────────────────────────────────
-    print("\n[Stage 2] RL Fine-tuning...")
-
-    if args.load_agent_a:
-        # 直接加载预训练好的Agent A checkpoint，跳过训练
-        print(f"  ── Agent A (loading from {args.load_agent_a}) ──")
-        trainer_a.agent.load(args.load_agent_a)
-        log_a = []
-        print(f"  [Agent A] Loaded from checkpoint. Training skipped.")
-    else:
-        print("  ── Agent A ──")
-        log_a = trainer_a.run(num_rounds=args.rounds)
-
-    print("\n  ── Agent B ──")
-    log_b = trainer_b.run(num_rounds=args.rounds)
-
-    # ── Stage 3: 评估 ───────────────────────────────────────────────────────
-    print("\n[Stage 3] Evaluation...")
-    h2h_deals = 200 if args.quick else 1000
-
-    # ── Build SL baseline agent for evaluation ─────────────────────────────
+    # ── Build SL baseline trainer for mini eval during training ──────────────
     from algorithms.mappo import MAPPOAgent, MAPPOConfig
     sl_agent_eval = MAPPOAgent(MAPPOConfig(device=device))
     if sl_path and os.path.exists(sl_path):
@@ -176,9 +156,29 @@ def run_competitive(args):
             if key in ckpt_sl:
                 sl_agent_eval.get_actor(player).load_state_dict(
                     {k: v.to(device) for k, v in ckpt_sl[key].items()})
-    # Wrap SL agent in a temporary trainer for H2H API
     sl_trainer = SubgameTrainer(env, cfg_a, reward_stats=RunningStats())
     sl_trainer.agent = sl_agent_eval
+
+    # ── Stage 2: RL 微调 ────────────────────────────────────────────────────
+    print("\n[Stage 2] RL Fine-tuning...")
+
+    if args.load_agent_a:
+        print(f"  ── Agent A (loading from {args.load_agent_a}) ──")
+        trainer_a.agent.load(args.load_agent_a)
+        log_a = []
+        print(f"  [Agent A] Loaded from checkpoint. Training skipped.")
+    else:
+        print("  ── Agent A ──")
+        log_a = trainer_a.run(num_rounds=args.rounds, sl_trainer=sl_trainer)
+
+    print("\n  ── Agent B ──")
+    log_b = trainer_b.run(num_rounds=args.rounds, sl_trainer=sl_trainer)
+
+    # ── Stage 3: 评估 ───────────────────────────────────────────────────────
+    print("\n[Stage 3] Evaluation...")
+    h2h_deals = 200 if args.quick else 1000
+
+    # sl_trainer already built before Stage 2
 
     # ── A vs SL ────────────────────────────────────────────────────────────
     print("\n  → Agent A vs SL baseline")
@@ -315,8 +315,8 @@ def parse_args():
                         help='Internal β: r_info = I(partner) - β·I(opponent)')
     parser.add_argument('--info_weight', type=float, default=0.2,
                         help='r_info as fraction of IMP variance (P87b: 0.02→0.2, step_ir≈1.4)')
-    parser.add_argument('--rounds', type=int, default=30,
-                        help='Number of IBR rounds (P90: 20→30)')
+    parser.add_argument('--rounds', type=int, default=20,
+                        help='Number of rounds (P93: 20, matching P88)')
     parser.add_argument('--quick', action='store_true',
                         help='Quick mode: fewer deals for debugging')
     parser.add_argument('--belief_pretrain_rounds', type=int, default=5,
