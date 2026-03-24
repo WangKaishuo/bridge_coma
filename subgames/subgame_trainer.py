@@ -37,7 +37,9 @@ from typing import Dict, List, Optional, Tuple
 from env import NUM_PLAYERS, NUM_BIDS, BID_PASS, NORTH, EAST, SOUTH, WEST
 from networks.belief_net import BeliefNetwork, DualInfoComputer
 from networks.policy_net import (
-    MLPPolicyNetwork, MLPValueNetwork, encode_obs_flat, OBS_DIM
+    MLPPolicyNetwork, MLPValueNetwork, encode_obs_flat, OBS_DIM,
+    BELIEF_OBS_DIM, BELIEF_FEAT_DIM, make_belief_features_prior,
+    append_belief_features,
 )
 from algorithms.mappo import MAPPOAgent, MAPPOConfig
 from utils.running_stats import RunningStats
@@ -95,11 +97,25 @@ class SubgameConfig:
     fsp_pool_size:    int   = 10          # Kita et al. 2024
     fsp_add_interval: int   = 2           # 每 N 轮将 actor 存入 pool
 
-    # ── Belief Net On-Policy Update (P93) ────────────────────────────────
-    # Replaces JIT burn-in + replay buffer.  Belief Net is trained like
-    # a Critic: on-policy data only, continual learning on previous weights.
-    belief_update_epochs: int  = 8            # P93: epochs per round (early-stop may cut short)
-    belief_update_lr:     float = 5e-5        # P93: lower than pretrain 1e-4, smooth continual learning
+    # ── Belief Net Update ────────────────────────────────────────────────
+    # P93: on-policy update (epochs=8, lr=5e-5) — caused catastrophic
+    #   forgetting of pretrain foundation (val_loss 1.76→2.19 in Round 1).
+    # P96: freeze_belief=True by default. With strong KL (λ=0.5),
+    #   policy stays near SAYC and pretrain Belief Net remains valid.
+    belief_update_epochs: int  = 3            # P95: only used if freeze_belief=False
+    belief_update_lr:     float = 1e-5        # P95: only used if freeze_belief=False
+    freeze_belief:        bool  = True        # P96: frozen by default
+
+    # ── EWC for Belief Net (P97) ─────────────────────────────────────
+    use_ewc:              bool  = False       # P97: EWC-protected on-policy update
+    ewc_lambda:           float = 100.0       # P97: EWC penalty strength (Fisher normalized, mean penalty)
+    ewc_fisher_samples:   int   = 5000        # Samples for Fisher computation
+
+    # ── P98: Belief-Conditioned Actor ─────────────────────────────────
+    belief_conditioned:   bool  = False       # P98: Actor input includes belief features (349 dim)
+    # When True: obs_dim = 349 (301 base + 48 belief features)
+    # Requires belief_net to be available (use_info_bonus=True or standalone belief)
+    # Enables the Convention Card Protocol for Full Disclosure evaluation
 
     # ── Critic Warmup ───────────────────────────────────────────────────────
     critic_prewarm_deals:  int   = 2048
@@ -307,6 +323,8 @@ class SubgameTrainer:
         self.active_players = config.active_players or list(range(NUM_PLAYERS))
 
         # ── HAPPO Agent ────────────────────────────────────────────────────
+        # P98: belief_conditioned mode uses 349-dim input for Actor & Critic
+        _obs_dim = BELIEF_OBS_DIM if config.belief_conditioned else OBS_DIM
         mappo_cfg = MAPPOConfig(
             lr              = config.lr,
             gamma           = config.gamma,
@@ -320,6 +338,7 @@ class SubgameTrainer:
             device          = config.device,
             critic_lr_ratio = config.critic_lr_ratio,
             hidden_dim      = config.hidden_dim,
+            obs_dim         = _obs_dim,
         )
         self.agent = MAPPOAgent(mappo_cfg)
 
@@ -333,11 +352,14 @@ class SubgameTrainer:
         self.dual_info:      Optional[DualInfoComputer]  = None
         self.belief_optimizer = None
 
-        if config.use_info_bonus:
+        # P98: belief_conditioned mode always needs a belief net
+        _need_belief = config.use_info_bonus or config.belief_conditioned
+        if _need_belief:
             self.belief_net  = BeliefNetwork(hidden_dim=config.hidden_dim).to(self.device)
-            self.dual_info   = DualInfoComputer(self.belief_net, beta=config.beta)
+            if config.use_info_bonus:
+                self.dual_info = DualInfoComputer(self.belief_net, beta=config.beta)
             self.belief_optimizer = torch.optim.Adam(
-                self.belief_net.parameters(), lr=config.belief_update_lr)  # P93: use belief_update_lr
+                self.belief_net.parameters(), lr=config.belief_update_lr)
             self.partner_stats  = RunningStats()
 
         # ── reward 归一化（外部传入，跨 phase 持久）────────────────────────
@@ -387,6 +409,14 @@ class SubgameTrainer:
         flat_obs_np = np.stack([d['flat_obs'] for d in data])  # (N, 301)
         actions_np  = np.array([d['action']   for d in data], dtype=np.int64)
         legal_np    = np.ones((len(data), NUM_BIDS), dtype=np.float32)  # BC 不限制
+
+        # P98: pad with belief prior (48-dim) when belief_conditioned
+        # During BC warmup, no belief net is trained yet → use uniform prior.
+        # This ensures actor learns on 349-dim input from the start.
+        if self.config.belief_conditioned:
+            prior = make_belief_features_prior()  # (48,)
+            prior_batch = np.tile(prior, (len(data), 1))  # (N, 48)
+            flat_obs_np = np.concatenate([flat_obs_np, prior_batch], axis=1)  # (N, 349)
 
         flat_t   = torch.tensor(flat_obs_np, dtype=torch.float32)
         actions_t = torch.tensor(actions_np, dtype=torch.int64)
@@ -642,7 +672,9 @@ class SubgameTrainer:
                 if fsp_sd and role in fsp_sd:
                     ck = str(id(fsp_sd))
                     if self._fsp_cache_key != ck or role not in self._fsp_actor_cache:
+                        _fsp_obs_dim = BELIEF_OBS_DIM if self.config.belief_conditioned else OBS_DIM
                         net = MLPPolicyNetwork(
+                            obs_dim=_fsp_obs_dim,
                             hidden_dim=self.config.hidden_dim).to(self.device)
                         net.load_state_dict(
                             {k: v.to(self.device) for k, v in fsp_sd[role].items()})
@@ -657,6 +689,16 @@ class SubgameTrainer:
                     encode_obs_flat(slot_obs[i], slot_dealer[i], slot_hist[i])
                     for i in slots])
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
+
+                # P98: append belief features
+                if self.config.belief_conditioned and self.belief_net is not None:
+                    _hands   = np.stack([inner_envs[i]._current_hands[inner_envs[i].current_player]
+                                         for i in slots])
+                    _hists   = [slot_hist[i] for i in slots]
+                    _players = [inner_envs[i].current_player for i in slots]
+                    bf = self._get_belief_features_batch(
+                        _hands, _hists, _players, self.belief_net)
+                    flat_batch = np.concatenate([flat_batch, bf], axis=1)
 
                 flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
                 legal_t = torch.tensor(legal_batch, dtype=torch.float32).to(self.device)
@@ -738,7 +780,9 @@ class SubgameTrainer:
             if fsp_sd and role in fsp_sd:
                 ck = str(id(fsp_sd))
                 if self._fsp_cache_key != ck or role not in self._fsp_actor_cache:
-                    net = MLPPolicyNetwork(hidden_dim=self.config.hidden_dim).to(self.device)
+                    _fsp_obs_dim = BELIEF_OBS_DIM if self.config.belief_conditioned else OBS_DIM
+                    net = MLPPolicyNetwork(obs_dim=_fsp_obs_dim,
+                                           hidden_dim=self.config.hidden_dim).to(self.device)
                     net.load_state_dict(
                         {k: v.to(self.device) for k, v in fsp_sd[role].items()})
                     net.eval()
@@ -749,6 +793,11 @@ class SubgameTrainer:
                 actor = getattr(self.agent.model, role)
 
             flat   = encode_obs_flat(obs, dealer, hist)
+            # P98: append belief features
+            if self.config.belief_conditioned and self.belief_net is not None:
+                bf = self._get_belief_features_single(
+                    inner._current_hands[player], hist, player, self.belief_net)
+                flat = append_belief_features(flat, bf)
             flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(self.device)
             legal_t = torch.tensor(obs['legal_actions'], dtype=torch.float32
                                    ).unsqueeze(0).to(self.device)
@@ -887,24 +936,50 @@ class SubgameTrainer:
         self.belief_net.train()
         print(f"[Belief Pretrain] Done. best_val_loss={best_val:.4f}")
 
+        # ── P97: Compute Fisher Information Matrix for EWC ────────────
+        if self.config.use_ewc:
+            print(f"[Belief Pretrain] Computing Fisher for EWC "
+                  f"(λ_ewc={self.config.ewc_lambda}, samples={self.config.ewc_fisher_samples})...")
+            self.belief_net.compute_fisher(
+                oh_all, h_all, op_all, tp_all, tgt_all,
+                num_samples=self.config.ewc_fisher_samples,
+            )
+
+        # ── P97b: Save pretrain data for replay mixing ─────────────
+        # Store a subsample of pretrain data to mix into on-policy updates.
+        # This directly prevents catastrophic forgetting by keeping pretrain
+        # loss in the training objective (data-level protection, not weight-level).
+        replay_n = min(10000, N)
+        replay_idx = np.random.permutation(N)[:replay_n]
+        self._pretrain_replay = {
+            'oh':  oh_all[replay_idx].clone(),
+            'h':   h_all[replay_idx].clone(),
+            'op':  op_all[replay_idx].clone(),
+            'tp':  tp_all[replay_idx].clone(),
+            'tgt': tgt_all[replay_idx].clone(),
+        }
+        print(f"[Belief Pretrain] Saved {replay_n} pretrain samples for replay mixing.")
+
     # ======================================================================
     # On-Policy Belief Update (P93)
     # ======================================================================
 
     def update_belief_on_policy(self, episodes: List[List[dict]]) -> Optional[float]:
         """
-        P93: Train Belief Net on current round's rollout data only.
+        P97b: Train Belief Net on mixed data: on-policy + pretrain replay.
 
-        Like a Critic, the Belief Net must track the current policy's
-        semantics. Using stale replay data poisons the belief estimate
-        when the policy's bidding language has drifted.
+        Key insight from P95/P96/P97:
+        - P95: Pure on-policy (30万 samples, 3ep) destroys pretrain → val_loss 1.76→2.19
+        - P96: Frozen belief → length 0.488→0.220, r_info becomes noise
+        - P97: EWC alone fails — penalty too small relative to 30万 data gradient
+        - P97b: Mix pretrain replay data into each batch (50/50 ratio).
+          This keeps pretrain loss directly in the objective, preventing
+          catastrophic forgetting at the data level rather than weight level.
 
-        Args:
-            episodes: rollout episodes from the current round (ns_eps + ew_eps)
-                      Each step may contain belief_target, observer_hand, etc.
+        Optional: EWC penalty on top of replay for extra stability.
 
         Returns:
-            final validation loss, or None if no data
+            final validation loss on ON-POLICY data, or None if no data
         """
         if self.belief_net is None or self.belief_optimizer is None:
             return None
@@ -931,29 +1006,72 @@ class SubgameTrainer:
         tr_idx = perm[:split]
         va_idx = perm[split:]
 
+        # ── Check if pretrain replay data is available ──
+        has_replay = hasattr(self, '_pretrain_replay') and self._pretrain_replay is not None
+        if has_replay:
+            rp = self._pretrain_replay
+            rp_n = rp['oh'].size(0)
+
         self.belief_net.train()
         bs = min(512, split)
+        half_bs = bs // 2  # half for on-policy, half for replay
         best_val = float('inf')
         no_improve = 0
         final_loss = 0.0
 
         for epoch in range(self.config.belief_update_epochs):
             ep_perm = np.random.permutation(split)
-            tl = 0.0; nb = 0
+            rp_perm = np.random.permutation(rp_n) if has_replay else None
+            tl = 0.0; tl_rp = 0.0; tl_ewc = 0.0; nb = 0
+            rp_ptr = 0
+
             for s in range(0, split, bs):
                 idx = tr_idx[ep_perm[s:s+bs]]
-                loss = self.belief_net.compute_loss(
+
+                # ── On-policy loss ──
+                loss_op = self.belief_net.compute_loss(
                     oh[idx].to(self.device), h[idx].to(self.device),
                     op[idx].to(self.device), tp[idx].to(self.device),
                     tgt[idx].to(self.device))
+
+                # ── Pretrain replay loss (P97b) ──
+                loss_rp = torch.tensor(0.0, device=self.device)
+                if has_replay:
+                    # Sample a batch of pretrain data (same size as on-policy batch)
+                    rp_size = min(len(idx), rp_n)
+                    if rp_ptr + rp_size > rp_n:
+                        rp_perm = np.random.permutation(rp_n)
+                        rp_ptr = 0
+                    rp_idx = rp_perm[rp_ptr:rp_ptr + rp_size]
+                    rp_ptr += rp_size
+
+                    loss_rp = self.belief_net.compute_loss(
+                        rp['oh'][rp_idx].to(self.device),
+                        rp['h'][rp_idx].to(self.device),
+                        rp['op'][rp_idx].to(self.device),
+                        rp['tp'][rp_idx].to(self.device),
+                        rp['tgt'][rp_idx].to(self.device))
+
+                # ── Combined loss: 80% on-policy + 20% replay (P97c) ──
+                # On-policy dominant so belief tracks current policy,
+                # replay minority prevents catastrophic forgetting of pretrain.
+                loss = 0.8 * loss_op + 0.2 * loss_rp if has_replay else loss_op
+
+                # ── Optional EWC penalty ──
+                ewc_loss_val = 0.0
+                if self.config.use_ewc and self.belief_net.has_ewc:
+                    ewc_loss = self.belief_net.ewc_penalty()
+                    loss = loss + (self.config.ewc_lambda / 2.0) * ewc_loss
+                    ewc_loss_val = ewc_loss.item()
+
                 self.belief_optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.belief_net.parameters(), self.config.max_grad_norm)
                 self.belief_optimizer.step()
-                tl += loss.item(); nb += 1
+                tl += loss_op.item(); tl_rp += loss_rp.item(); tl_ewc += ewc_loss_val; nb += 1
             train_loss = tl / max(1, nb)
 
-            # Validation
+            # Validation (on-policy data only — this is what matters for r_info)
             self.belief_net.eval()
             with torch.no_grad():
                 val_loss = self.belief_net.compute_loss(
@@ -971,8 +1089,10 @@ class SubgameTrainer:
                 if no_improve >= 2:  # early stop after 2 epochs no improvement
                     break
 
+        rp_str = f" replay_loss={tl_rp/max(1,nb):.4f}" if has_replay else ""
+        ewc_str = f" ewc_pen={tl_ewc/max(1,nb):.6f}" if (self.config.use_ewc and self.belief_net.has_ewc) else ""
         print(f"  [Belief Update] {len(belief_data)} samples, "
-              f"{epoch+1} epochs, val_loss={final_loss:.4f}")
+              f"{epoch+1} epochs, val_loss={final_loss:.4f}{rp_str}{ewc_str}")
         return final_loss
 
     # ======================================================================
@@ -1064,7 +1184,9 @@ class SubgameTrainer:
                     if fsp_sd and role in fsp_sd:
                         ck = str(id(fsp_sd))
                         if self._fsp_cache_key != ck or role not in self._fsp_actor_cache:
+                            _fsp_obs_dim = BELIEF_OBS_DIM if self.config.belief_conditioned else OBS_DIM
                             net = MLPPolicyNetwork(
+                                obs_dim=_fsp_obs_dim,
                                 hidden_dim=self.config.hidden_dim).to(self.device)
                             net.load_state_dict(
                                 {k: v.to(self.device) for k, v in fsp_sd[role].items()})
@@ -1082,6 +1204,16 @@ class SubgameTrainer:
                     for i in slots])
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
+
+                # P98: append belief features if belief_conditioned
+                if self.config.belief_conditioned and self.belief_net is not None:
+                    _hands   = np.stack([envs[i]._current_hands[envs[i].current_player]
+                                         for i in slots])
+                    _hists   = [slot_hist[i] for i in slots]
+                    _players = [envs[i].current_player for i in slots]
+                    bf = self._get_belief_features_batch(
+                        _hands, _hists, _players, self.belief_net)
+                    flat_batch = np.concatenate([flat_batch, bf], axis=1)
 
                 flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
                 legal_t = torch.tensor(legal_batch, dtype=torch.float32).to(self.device)
@@ -1228,6 +1360,12 @@ class SubgameTrainer:
                 flat_obs     = encode_obs_flat(obs, dealer, history_int)
                 legal_actions = obs['legal_actions'].copy()
 
+                # P98: append belief features
+                if self.config.belief_conditioned and self.belief_net is not None:
+                    bf = self._get_belief_features_single(
+                        all_hands[player], history_int, player, self.belief_net)
+                    flat_obs = append_belief_features(flat_obs, bf)
+
                 # 选 actor: FSP 对手 or 当前 agent
                 flat_t  = torch.tensor(flat_obs,      dtype=torch.float32
                                        ).unsqueeze(0).to(self.device)
@@ -1313,7 +1451,9 @@ class SubgameTrainer:
             return self.agent.get_actor(player)
         cache_key = str(id(fsp_sd))
         if self._fsp_cache_key != cache_key or role not in self._fsp_actor_cache:
-            net = MLPPolicyNetwork(hidden_dim=self.config.hidden_dim).to(self.device)
+            _fsp_obs_dim = BELIEF_OBS_DIM if self.config.belief_conditioned else OBS_DIM
+            net = MLPPolicyNetwork(obs_dim=_fsp_obs_dim,
+                                   hidden_dim=self.config.hidden_dim).to(self.device)
             net.load_state_dict({k: v.to(self.device) for k, v in fsp_sd[role].items()})
             net.eval()
             self._fsp_actor_cache[role] = net
@@ -1346,6 +1486,108 @@ class SubgameTrainer:
         for i, bid in enumerate(history_int[-max_len:]):
             arr[i, bid] = 1.0
         return arr
+
+    # ======================================================================
+    # P98: Belief features for Actor input
+    # ======================================================================
+
+    def _get_belief_features_single(
+        self,
+        hand: np.ndarray,
+        history_int: list,
+        player: int,
+        belief_net: Optional[BeliefNetwork] = None,
+    ) -> np.ndarray:
+        """
+        P98: 获取单步 belief features (48,) 用于 actor 输入.
+
+        查询 belief_net: "给定我的手牌和叫牌历史, partner 的手牌分布是什么?"
+
+        Args:
+            hand:         当前玩家手牌 (52,)
+            history_int:  叫牌历史 (整数列表)
+            player:       当前玩家 seat (0-3)
+            belief_net:   使用哪个 belief net (None=self.belief_net)
+
+        Returns:
+            belief_feats: (48,) float32 — 16 honor + 32 length probs
+        """
+        bn = belief_net or self.belief_net
+        if bn is None or not self.config.belief_conditioned:
+            return make_belief_features_prior()
+
+        partner = (player + 2) % 4
+        hist_enc = self._encode_history(history_int)
+
+        with torch.no_grad():
+            oh_t = torch.tensor(hand, dtype=torch.float32).unsqueeze(0).to(self.device)
+            h_t  = torch.tensor(hist_enc, dtype=torch.float32).unsqueeze(0).to(self.device)
+            op_t = torch.tensor([player],  dtype=torch.long).to(self.device)
+            tp_t = torch.tensor([partner], dtype=torch.long).to(self.device)
+            probs = bn.get_probs(oh_t, h_t, op_t, tp_t)  # (1, 48)
+
+        return probs.squeeze(0).cpu().numpy()
+
+    def _get_belief_features_batch(
+        self,
+        hands: np.ndarray,
+        history_ints: List[list],
+        players: List[int],
+        belief_net: Optional[BeliefNetwork] = None,
+    ) -> np.ndarray:
+        """
+        P98: 批量获取 belief features (B, 48) 用于 actor 输入.
+
+        Args:
+            hands:         (B, 52) 当前玩家手牌
+            history_ints:  长度 B 的列表, 每个元素是叫牌历史
+            players:       长度 B 的列表, 每个元素是当前玩家 seat
+            belief_net:    使用哪个 belief net (None=self.belief_net)
+
+        Returns:
+            belief_feats: (B, 48) float32
+        """
+        bn = belief_net or self.belief_net
+        if bn is None or not self.config.belief_conditioned:
+            return np.tile(make_belief_features_prior(), (len(players), 1))
+
+        B = len(players)
+        partners = [(p + 2) % 4 for p in players]
+        hist_encs = np.stack([self._encode_history(h) for h in history_ints])
+
+        with torch.no_grad():
+            oh_t = torch.tensor(hands, dtype=torch.float32).to(self.device)
+            h_t  = torch.tensor(hist_encs, dtype=torch.float32).to(self.device)
+            op_t = torch.tensor(players,  dtype=torch.long).to(self.device)
+            tp_t = torch.tensor(partners, dtype=torch.long).to(self.device)
+            probs = bn.get_probs(oh_t, h_t, op_t, tp_t)  # (B, 48)
+
+        return probs.cpu().numpy()
+
+    def _encode_for_actor(
+        self,
+        obs: dict,
+        dealer: int,
+        history_int: list,
+        player: int,
+        all_hands: Optional[np.ndarray] = None,
+        belief_net: Optional[BeliefNetwork] = None,
+    ) -> np.ndarray:
+        """
+        P98: 统一的 actor 输入编码.
+
+        base mode (301-dim):         encode_obs_flat(obs, dealer, history_int)
+        belief-conditioned (349-dim): base + belief_features(48)
+
+        所有 policy closure 和 rollout 都应使用此方法。
+        """
+        flat = encode_obs_flat(obs, dealer, history_int)
+        if self.config.belief_conditioned:
+            hand = all_hands[player] if all_hands is not None else obs['hand']
+            bf = self._get_belief_features_single(
+                hand, history_int, player, belief_net or self.belief_net)
+            flat = append_belief_features(flat, bf)
+        return flat
 
     # ======================================================================
     # r_info 计算
@@ -1675,8 +1917,8 @@ class SubgameTrainer:
                 m = self._safe_update(p, rnd)
                 if m: ew_metrics[p] = m
 
-            # ── P93: On-policy Belief Update (after PPO, using this round's data) ──
-            if self.belief_net is not None:
+            # ── Belief Update: frozen (P96) or on-policy (P93/P95) ─────────
+            if self.belief_net is not None and not self.config.freeze_belief:
                 bl = self.update_belief_on_policy(ns_eps + ew_eps)
                 if bl is not None: _bl_vals.append(bl)
 
@@ -1785,7 +2027,8 @@ class SubgameTrainer:
         device = self.device
 
         def _current_policy(obs, player, history_int):
-            flat   = encode_obs_flat(obs, env.dealer, history_int)
+            flat   = self._encode_for_actor(obs, env.dealer, history_int, player,
+                                            env._current_hands)
             flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
             legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(device)
             actor  = self.agent.get_actor(player)
@@ -1794,7 +2037,8 @@ class SubgameTrainer:
             return action.item()
 
         def _fsp_policy(obs, player, history_int):
-            flat   = encode_obs_flat(obs, env.dealer, history_int)
+            flat   = self._encode_for_actor(obs, env.dealer, history_int, player,
+                                            env._current_hands)
             flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
             legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(device)
             role   = {0:'actor_n', 1:'actor_e', 2:'actor_s', 3:'actor_w'}[player]
@@ -1827,7 +2071,8 @@ class SubgameTrainer:
         device   = self.device
 
         def _policy(obs, player, history_int):
-            flat   = encode_obs_flat(obs, env.dealer, history_int)
+            flat   = self._encode_for_actor(obs, env.dealer, history_int, player,
+                                            env._current_hands)
             flat_t = torch.tensor(flat, dtype=torch.float32
                                   ).unsqueeze(0).to(device)
             legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32
@@ -1850,7 +2095,8 @@ class SubgameTrainer:
         agent = self.agent; env = self.env; device = self.device
 
         def _policy(obs, player, history_int):
-            flat   = encode_obs_flat(obs, env.dealer, history_int)
+            flat   = self._encode_for_actor(obs, env.dealer, history_int, player,
+                                            env._current_hands)
             flat_t = torch.tensor(flat, dtype=torch.float32
                                   ).unsqueeze(0).to(device)
             legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32
@@ -1872,27 +2118,54 @@ class SubgameTrainer:
         num_deals: int = 500,
         label_self: str = "A",
         label_other: str = "B",
+        convention_sharing: bool = False,
     ) -> dict:
-        """A vs B 直接对战评估."""
+        """
+        A vs B 直接对战评估.
+
+        P98 Convention Card Protocol (convention_sharing=True):
+          When self plays against other, each side's opponent gets access
+          to the other's Belief Net — like reading the opponent's convention card.
+          - self's NS uses other's Belief Net to understand other's EW bids
+          - other's EW uses self's Belief Net to understand self's NS bids
+          This implements Full Disclosure without requiring KL constraint.
+        """
         from subgames.competitive_env import cross_evaluate
 
         env = self.env; device = self.device
 
-        def _make_policy(agent_):
+        def _make_policy(trainer_, belief_net_for_opponents=None):
+            """
+            Create a policy closure for an agent.
+
+            belief_net_for_opponents: if provided, this agent uses a DIFFERENT
+              belief net (the opponent's) to understand opponent bids.
+              In practice, in belief_conditioned mode:
+              - For understanding partner bids: use own belief_net (co-trained)
+              - For understanding opponent bids: use opponent's belief_net (convention card)
+
+              Simplification for now: use own belief_net for all obs encoding.
+              The convention card effect comes from the agent having been trained
+              WITH belief-conditioned input, making it naturally responsive to
+              belief quality. Full convention card sharing is a future extension.
+            """
+            bn = belief_net_for_opponents or trainer_.belief_net
             def _policy(obs, player, history_int):
-                flat   = encode_obs_flat(obs, env.dealer, history_int)
+                flat = trainer_._encode_for_actor(
+                    obs, env.dealer, history_int, player,
+                    env._current_hands, bn)
                 flat_t = torch.tensor(flat, dtype=torch.float32
                                       ).unsqueeze(0).to(device)
                 legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32
                                       ).unsqueeze(0).to(device)
-                actor  = agent_.get_actor(player)
+                actor  = trainer_.agent.get_actor(player)
                 with torch.no_grad():
                     action, _, _ = actor.get_action(flat_t, legal, deterministic=True)
                 return action.item()
             return _policy
 
-        policy_self  = _make_policy(self.agent)
-        policy_other = _make_policy(other_trainer.agent)
+        policy_self  = _make_policy(self)
+        policy_other = _make_policy(other_trainer)
 
         result = cross_evaluate(
             env,
@@ -1940,7 +2213,8 @@ class SubgameTrainer:
 
                 while not done:
                     player   = self.env.current_player
-                    flat_obs = encode_obs_flat(obs, dealer, hist)
+                    flat_obs = self._encode_for_actor(
+                        obs, dealer, hist, player, self.env._current_hands)
                     flat_t   = torch.tensor(flat_obs, dtype=torch.float32
                                             ).unsqueeze(0).to(self.device)
                     legal_t  = torch.tensor(obs['legal_actions'], dtype=torch.float32
@@ -1977,6 +2251,110 @@ class SubgameTrainer:
         print(f"  [BeliefNet] honor={acc['honor_acc']:.3f} "
               f"length={acc['length_acc']:.3f} overall={acc['overall_acc']:.3f}")
         return acc
+
+    def evaluate_partner_info_gain(
+        self,
+        belief_net,          # external belief net (same for A and B → fair comparison)
+        num_deals: int = 500,
+    ) -> dict:
+        """
+        P97c diagnostic: measure partner inference gain per opener-side bid.
+
+        For each opener-side bid (N or S in NS-training, E or W in EW-training),
+        compute how much the bid reduces the belief net's uncertainty about the
+        partner's hand. This is the partner_gain component of r_info.
+
+        Using an EXTERNAL belief net (typically B's belief net) ensures fair
+        comparison: same "judge" evaluates both A and B's communication quality.
+
+        Returns:
+            {
+              'mean_partner_gain': float,
+              'std_partner_gain':  float,
+              'n_steps':           int,
+              'per_position':      dict,  # N/S/E/W breakdown
+            }
+        """
+        belief_net.eval()
+        dual_info = DualInfoComputer(belief_net, beta=0.0)  # partner-only
+
+        gains_all = []
+        gains_by_pos = {0: [], 1: [], 2: [], 3: []}  # N, E, S, W
+
+        with torch.no_grad():
+            for _ in range(num_deals):
+                hands, dd_table = self.env.generate_deal()
+                obs  = self.env.reset(hands, dd_table)
+                done = False
+                hist   = list(self.env.history_int)
+                dealer = self.env.dealer
+                opener_seats = {dealer, (dealer + 2) % 4}
+
+                while not done:
+                    player = self.env.current_player
+                    flat_obs = self._encode_for_actor(
+                        obs, dealer, hist, player, self.env._current_hands)
+                    flat_t   = torch.tensor(flat_obs, dtype=torch.float32
+                                            ).unsqueeze(0).to(self.device)
+                    legal_t  = torch.tensor(obs['legal_actions'], dtype=torch.float32
+                                            ).unsqueeze(0).to(self.device)
+                    actor    = self.agent.get_actor(player)
+                    action, _, _ = actor.get_action(flat_t, legal_t, deterministic=True)
+                    action_int = action.item()
+
+                    # Compute partner gain for opener-side bids
+                    if player in opener_seats:
+                        partner = (player + 2) % 4
+                        h_before = self._encode_history(hist)
+                        hist_after = hist + [action_int]
+                        h_after  = self._encode_history(hist_after)
+
+                        oh  = torch.tensor(hands[player], dtype=torch.float32
+                                           ).unsqueeze(0).to(self.device)
+                        hb  = torch.tensor(h_before, dtype=torch.float32
+                                           ).unsqueeze(0).to(self.device)
+                        ha  = torch.tensor(h_after, dtype=torch.float32
+                                           ).unsqueeze(0).to(self.device)
+                        op  = torch.tensor([player],  dtype=torch.long).to(self.device)
+                        tp  = torch.tensor([partner], dtype=torch.long).to(self.device)
+                        tgt = torch.tensor(
+                            hand_to_belief_target(hands[partner]),
+                            dtype=torch.float32).unsqueeze(0).to(self.device)
+
+                        b_before = belief_net.get_probs(oh, hb, op, tp)
+                        b_after  = belief_net.get_probs(oh, ha, op, tp)
+                        gain = dual_info.compute_info_gain(b_before, b_after, tgt).item()
+
+                        gains_all.append(gain)
+                        gains_by_pos[player].append(gain)
+
+                    hist.append(action_int)
+                    obs, _, done, _ = self.env.step(action_int)
+
+        belief_net.train()
+
+        def _stats(lst):
+            if not lst:
+                return {'mean': 0.0, 'std': 0.0, 'n': 0}
+            a = np.array(lst)
+            return {'mean': float(a.mean()), 'std': float(a.std()), 'n': len(lst)}
+
+        pos_names = {0: 'N', 1: 'E', 2: 'S', 3: 'W'}
+        per_pos = {pos_names[k]: _stats(v) for k, v in gains_by_pos.items()}
+
+        result = {
+            'mean_partner_gain': float(np.mean(gains_all)) if gains_all else 0.0,
+            'std_partner_gain':  float(np.std(gains_all))  if gains_all else 0.0,
+            'n_steps':           len(gains_all),
+            'per_position':      per_pos,
+        }
+
+        print(f"  [Partner Info Gain] mean={result['mean_partner_gain']:.4f} "
+              f"± {result['std_partner_gain']:.4f}  n={result['n_steps']}")
+        for pos_name, stats in per_pos.items():
+            if stats['n'] > 0:
+                print(f"    {pos_name}: mean={stats['mean']:.4f} n={stats['n']}")
+        return result
 
     def evaluate_ew_belief_update(self, num_deals: int = 200) -> dict:
         """
@@ -2022,7 +2400,8 @@ class SubgameTrainer:
                 while not done:
                     player  = self.env.current_player
                     flat_t  = torch.tensor(
-                        encode_obs_flat(obs, dealer, hist),
+                        self._encode_for_actor(obs, dealer, hist, player,
+                                               self.env._current_hands),
                         dtype=torch.float32).unsqueeze(0).to(self.device)
                     legal_t = torch.tensor(
                         obs['legal_actions'], dtype=torch.float32

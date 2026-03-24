@@ -170,6 +170,103 @@ class BeliefNetwork(nn.Module):
     def evaluate_accuracy(probs: torch.Tensor, targets: torch.Tensor) -> dict:
         return belief_accuracy(probs, targets)
 
+    # ==================================================================
+    # EWC (Elastic Weight Consolidation) — P97
+    # ==================================================================
+
+    def compute_fisher(
+        self,
+        oh: torch.Tensor,
+        h:  torch.Tensor,
+        op: torch.Tensor,
+        tp: torch.Tensor,
+        tgt: torch.Tensor,
+        num_samples: int = 5000,
+    ):
+        """
+        Compute diagonal Fisher Information Matrix on pretrain data.
+        Call ONCE after pretrain_belief() converges.
+
+        F_i = E[ (d log p(y|x;θ) / d θ_i)^2 ]
+        Approximated by averaging squared gradients over pretrain samples.
+
+        Stores:
+            self._ewc_fisher: dict  param_name -> diagonal Fisher (same shape as param)
+            self._ewc_star:   dict  param_name -> pretrain param values (frozen copy)
+        """
+        self.eval()
+        fisher = {n: torch.zeros_like(p) for n, p in self.named_parameters()
+                  if p.requires_grad}
+
+        device = next(self.parameters()).device
+        N = min(num_samples, oh.size(0))
+        perm = torch.randperm(oh.size(0))[:N]
+
+        # Process in chunks to avoid OOM
+        CHUNK = 256
+        count = 0
+        for start in range(0, N, CHUNK):
+            idx = perm[start:start + CHUNK]
+            self.zero_grad()
+            loss = self.compute_loss(
+                oh[idx].to(device), h[idx].to(device),
+                op[idx].to(device), tp[idx].to(device),
+                tgt[idx].to(device),
+            )
+            loss.backward()
+            for n, p in self.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    fisher[n] += (p.grad.data ** 2) * len(idx)
+            count += len(idx)
+
+        # Average
+        for n in fisher:
+            fisher[n] /= max(count, 1)
+
+        # ── Normalize Fisher per-parameter ──────────────────────────
+        # At pretrain convergence, gradients are tiny → raw Fisher is ~1e-6.
+        # This makes (λ/2)*F*(Δθ)^2 negligible for any reasonable λ.
+        # Fix: normalize each parameter's Fisher so its mean = 1.0.
+        # Then λ directly controls the penalty magnitude in loss units.
+        for n in fisher:
+            f_mean = fisher[n].mean()
+            if f_mean > 1e-12:
+                fisher[n] = fisher[n] / f_mean
+            # else: leave as zeros — this param has no Fisher signal
+
+        self._ewc_fisher = {n: f.detach().clone() for n, f in fisher.items()}
+        self._ewc_star = {n: p.data.detach().clone()
+                          for n, p in self.named_parameters() if p.requires_grad}
+
+        # Report: after normalization, mean should be ~1.0 per param
+        n_params = sum(f.numel() for f in self._ewc_fisher.values())
+        total_sum = sum(f.sum().item() for f in self._ewc_fisher.values())
+        print(f"  [EWC] Fisher computed on {count} samples, {n_params} params. "
+              f"Normalized (mean per-tensor = 1.0). Total sum: {total_sum:.1f}")
+        self.train()
+
+    def ewc_penalty(self) -> torch.Tensor:
+        """
+        EWC penalty: mean_i [ F_i * (θ_i - θ*_i)^2 ]
+
+        Returns MEAN (not sum) so that λ_ewc is network-size-independent.
+        Returns 0 if Fisher has not been computed.
+        """
+        if not hasattr(self, '_ewc_fisher') or not self._ewc_fisher:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        n_params = 0
+        for n, p in self.named_parameters():
+            if n in self._ewc_fisher:
+                loss += (self._ewc_fisher[n] * (p - self._ewc_star[n]) ** 2).sum()
+                n_params += p.numel()
+        return loss / max(n_params, 1)
+
+    @property
+    def has_ewc(self) -> bool:
+        return hasattr(self, '_ewc_fisher') and bool(self._ewc_fisher)
+
 
 class DualInfoComputer:
     """

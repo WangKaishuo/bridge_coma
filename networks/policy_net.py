@@ -1,10 +1,24 @@
 """
-Policy and Value Networks — 301-dim MLP Architecture
+Policy and Value Networks — MLP Architecture
 =====================================================
 
-对齐 README §3.1 / Kita et al. 2024.
+P98: Belief-Conditioned Actor (BCA)
 
-输入向量 (301 维，固定长度，无 LSTM):
+支持两种输入模式:
+  1. Base mode (301 维) — 向后兼容旧实验
+  2. Belief-conditioned mode (349 维) — P98 新框架
+     = base obs (301) + belief features (48)
+     belief features = BeliefNetwork.get_probs() 输出
+       [0:16]  honor probs (sigmoid)
+       [16:48] length probs (softmax per suit)
+
+设计理由 (参考 PBL, Tian et al. AAAI 2020):
+  - Belief 输出作为 Actor 直接输入，使 partner 能"听懂"叫品含义
+  - r_info 的信息增益闭环: sender 传递更多信息 → receiver 的 belief
+    更准确 → receiver 做出更好的决策 → 更好的 IMP
+  - 去除对 KL 约束的依赖: Full Disclosure 由评估时交换 BeliefNet 实现
+
+原始 301 维输入向量:
     vulnerability             :   4 维 (one-hot，4 种局况组合)
     当前玩家手牌 (one-hot)     :  52 维
     每个 bid 谁叫 (35 × 4)   : 140 维 — 4 维 one-hot，表示 N/E/S/W 谁叫
@@ -12,17 +26,11 @@ Policy and Value Networks — 301-dim MLP Architecture
     ─────────────────────────────────
     合计                      : 301 维
 
-设计说明:
-    - 展开历史替代 LSTM: 批量 rollout 无需 padding，与 OpenSpiel 格式对齐
-    - 每个 bid 的"谁叫"信息天然编码叫牌顺序（位置蕴含轮次）
-    - 加倍状态用 35×3 one-hot，每个实质叫品独立被加倍/再加倍
-    - Actor: 4 × 1024 MLP + ReLU + 38 维 logits + action mask
-    - Critic: 同 Actor 结构，额外接收 AllHandsEncoder (4×52 → 256)
-
-Belief Network 保留 LSTM (推断任务叫牌顺序有语义).
-
-注: 旧的 HandEncoder/HistoryEncoder/PolicyNetwork 已废弃.
-    向后兼容别名保留在文件末尾.
+P98 额外 48 维 belief features:
+    honor probs (16 dim)      :  16 维 — partner 持有 AKQJ 各花色的概率
+    length probs (32 dim)     :  32 维 — partner 各花色套长的分布 (8 bins × 4)
+    ─────────────────────────────────
+    合计                      : 349 维
 """
 
 import numpy as np
@@ -37,6 +45,11 @@ from env import NUM_BIDS, NUM_PLAYERS
 NUM_REAL_BIDS  = 35      # 1C–7NT (bid index 3–37)
 OBS_DIM        = 301     # 4 + 52 + 35×4 + 35×3
 BASE_INPUT_DIM = OBS_DIM  # 向后兼容别名
+
+# P98: Belief-conditioned Actor
+# Actor input = base obs (301) + belief features (48: 16 honor + 32 length)
+BELIEF_FEAT_DIM = 48     # BeliefNetwork output: 16 honor probs + 32 length probs
+BELIEF_OBS_DIM  = OBS_DIM + BELIEF_FEAT_DIM  # 301 + 48 = 349
 
 
 # ==============================================================================
@@ -115,6 +128,38 @@ def batch_encode_obs(obs_list, dealers, history_ints):
         encode_obs_flat(o, d, h)
         for o, d, h in zip(obs_list, dealers, history_ints)
     ])
+
+
+def make_belief_features_prior() -> np.ndarray:
+    """
+    P98: 返回 belief 先验特征向量 (48,).
+
+    在没有叫牌信息时的 belief 输出:
+      - Honor (16 dim): 每张荣誉牌有 0.25 概率在 partner 手中
+      - Length (32 dim): 均匀分布 [0.125] × 8 per suit
+
+    用于:
+      1. BC pretrain 时 actor 的 belief 输入（尚无 belief net）
+      2. 开叫前第一步的 belief 输入（无历史信息）
+    """
+    honor_prior = np.full(16, 0.25, dtype=np.float32)
+    length_prior = np.full(32, 0.125, dtype=np.float32)
+    return np.concatenate([honor_prior, length_prior])
+
+
+def append_belief_features(flat_obs: np.ndarray,
+                           belief_feats: np.ndarray) -> np.ndarray:
+    """
+    P98: 拼接 base obs (301) + belief features (48) → (349,).
+
+    Args:
+        flat_obs:      (301,) from encode_obs_flat
+        belief_feats:  (48,)  from belief_net.get_probs() or prior
+
+    Returns:
+        combined: (349,) float32
+    """
+    return np.concatenate([flat_obs, belief_feats])
 
 
 def encode_history_flat(history: torch.Tensor) -> torch.Tensor:

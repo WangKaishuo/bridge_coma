@@ -14,6 +14,10 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 3. **Config lives in `subgame_validation.py`, not `subgame_trainer.py`.** SubgameConfig kwargs in `subgame_validation.py` override all defaults. Always edit `subgame_validation.py` for hyperparameter changes.
 4. **Five files to keep in sync:** `subgame_trainer.py`, `subgame_validation.py`, `competitive_env.py`, `belief_net.py`, `fsp_pool.py`.
 5. **belief_net.py and hand_features.py were rewritten in P86.** Do NOT reference old versions with pos_weight=3.0/7.0 or unified BCE loss.
+6. **belief_net.py was extended in P97** with EWC support (`compute_fisher`, `ewc_penalty`). These are optional and currently disabled.
+7. **subgame_trainer.py was extended in P97b/c** with pretrain replay mixing in `update_belief_on_policy()` and `evaluate_partner_info_gain()` diagnostic.
+8. **`sl_pretrain.py` is the BCA (349-dim) version** (P98 refactor). Do NOT use the old 301-dim `sl_pretrain.py`; that file no longer exists. Output: `results/sl_base_bca.pt`.
+9. **Paired eval is now built into `subgame_validation.py`** via `--eval-only`. `eval_paired.py`, `diagnose_partner_gain.py`, and `test_phase2.py` have been removed.
 
 ---
 
@@ -21,232 +25,201 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 
 ### Phase 1: Environment & Infrastructure ✅ Complete
 
-### Phase 2: Subgame Validation 🔄 In Progress
+### Phase 2: Subgame Validation ✅ Complete (preparing for thesis write-up)
 
 #### Stayman ⏸ Deferred — null result structurally expected
 
-#### Competitive Subgame 🔄 Active
+#### Competitive Subgame ✅ Complete — key findings established
 
 | Item | Status |
 |------|--------|
 | Env + DDS data (500k deals) | ✅ |
 | P54–P86: Core infrastructure + Belief Net rewrite | ✅ |
 | P87b: r_info weight 0.02→0.2 | ✅ |
-| P88: KL anneal 0.5→0.0, first B>A result | ✅ |
-| **P93: Dealer eval bug fix** | ✅ |
-| **P93: Belief Net on-policy update (replaces replay buffer)** | ✅ |
-| **P93: Corrected eval (eval_paired.py)** | ✅ |
-| P93 experiment run (P88 config + on-policy belief) | 🔄 In progress |
-| Multi-seed validation (3 seeds) | ⏳ After P93 confirmed |
+| P88: KL anneal 0.5→0.0, first B>A result (contaminated) | ✅ |
+| P93: Dealer eval bug fix + paired eval | ✅ |
+| P94: Convention drift discovery + quantification | ✅ |
+| P95: λ=0.5, on-policy belief (B>A +0.31, p<0.001) | ✅ |
+| P96: λ=0.5, frozen belief (A>B, noise r_info) | ✅ |
+| **P97a-d: Belief Net stabilization + communication diagnostic** | ✅ |
+| **P97d: λ=0.3, partner_gain +10.8%, but A>B in IMP** | ✅ |
 
 ---
 
-## ⚠️ P93 CRITICAL BUG FIX: Dealer Encoding in Eval
+## ⚠️ KEY DISCOVERY: Convention Drift (P94)
 
-### The Bug
-`play_mixed()` and `dds_oracle_evaluate()` in `competitive_env.py` never updated `env.dealer` (i.e. `self.dealer`). Policy closures read `env.dealer` for `encode_obs_flat()`, which uses `dealer` to compute `caller = (dealer + step_idx) % 4` — determining which player made each bid in the `who_called` matrix.
+When KL anchor is weak (λ→0) or moderate (λ=0.3), RL agents develop **convention drift** — bidding semantics diverge from the shared SAYC protocol. This violates bridge's **Full Disclosure principle** and creates an illegitimate advantage in cross-system evaluation.
 
-**Training was NOT affected** — `_collect_episodes_batch` uses independent `envs[i]` with correct per-slot `slot_dealer[i]`.
+**Quantitative evidence (P94b, λ=0.3):** DDS regret +1.79 IMP vs vs-SL +3.80 IMP → **~2 IMP convention drift advantage**.
 
-**All eval H2H numbers from P82–P92 were wrong** — `cross_evaluate()`, `evaluate_head_to_head()`, and `dds_oracle_evaluate()` all had incorrect dealer encoding, systematically underestimating agent strength.
+**Impact:** All prior bridge AI papers (Kita 2024, Gong 2024) use SL→RL with no KL constraint. Their reported improvements may partially reflect convention drift, not pure bidding quality. None discussed this confound.
 
-### The Fix (competitive_env.py)
-```python
-# play_mixed(): line 542
-self.dealer = dealer  # P93 fix: policy closures read env.dealer
-
-# dds_oracle_evaluate(): line 667
-env.dealer = dealer   # P93 fix
-```
-
-### Impact
-- vs SL IMP jumped from ~+1 to ~+7–8 (agents were always stronger than we thought)
-- A vs B **direction may have been wrong** in some experiments
-- All historical eval numbers must be re-verified with `eval_paired.py`
+**MARL translation:** "Full disclosure" = shared communication protocol (Hu et al. 2020); "convention drift" = arbitrary handshakes; KL anchor = protocol regularization.
 
 ---
 
-## Experimental Results History (Corrected)
+## ⚠️ KEY FINDING: r_info Changes Communication But Not Outcomes (P97d)
 
-### P88 — Re-evaluated with dealer fix (eval_paired.py, 5000 deals)
+### The Communication-Outcome Disconnect
 
-**Config**: 20 rounds, λ: 0.5→0.0 over 50%, pool=10, interval=2
+Under λ=0.3, r_info produces a **measurable 10.8% increase in partner information gain** (S-position: +10.1%), confirming that the dual-information bonus successfully modifies communication behavior. However, this improved communication does **not translate to better IMP outcomes** — in fact, Agent B (with r_info) performs slightly worse than Agent A in head-to-head evaluation.
+
+This suggests that **optimizing "how clearly to communicate" and "what is the best bid"** are partially conflicting objectives: the auxiliary reward diverts policy optimization away from the primary IMP objective.
+
+---
+
+## Belief Net Degradation: Root Cause + Solution (P97 series)
+
+### Root cause: Pretrain overfitting, not catastrophic forgetting
+
+The original pretrain (10k deals, 300 epochs) produced val_loss=1.76 with severe overfitting (train-val gap: 1.19 vs 1.76). On new RL-trajectory data, loss jumped to 2.19 — this was **distribution shift to unseen samples**, not policy-induced OOD.
+
+### P97 series: systematic investigation
+
+| Experiment | Belief Strategy | Pretrain | length_acc | val_loss trajectory |
+|-----------|----------------|----------|------------|-------------------|
+| P95 | On-policy 3ep/1e-5 | 10k, 300ep | 0.255 | 1.76→2.19 (Round 1 destruction) |
+| P96 | Frozen | 10k, 300ep | 0.220 | N/A (frozen, OOD) |
+| P97a | EWC (λ_ewc=5000) | 10k, 300ep | — | ewc_pen=0.000005 (no effect) |
+| P97a' | EWC (normalized Fisher) | 10k, 300ep | — | ewc_pen=0.000002 (still no effect) |
+| P97b-50/50 | Replay 50/50 mix | 10k, 300ep | — | val_loss=2.34 (worse—conflicting gradients) |
+| P97b | Frozen | **100k, 50ep** | 0.278 | No overfitting; frozen still OOD |
+| **P97c** | **Unfreeze 1ep + 80/20 replay** | **100k, 50ep** | **0.262** | **1.89→1.94 (stable!)** |
+| **P97d** | **Same as P97c, λ=0.3** | **100k, 50ep** | **0.265** | **1.89→1.95 (stable)** |
+
+### Key lessons
+
+1. **EWC failed** because at pretrain convergence, gradients are tiny → Fisher diagonal ≈ 1e-6 → penalty negligible regardless of λ_ewc. The problem is data-level (new samples overwhelm), not weight-level.
+2. **50/50 replay was worse** because pretrain gradients pulled weights toward a direction that was bad for on-policy data — conflicting objectives in a single batch.
+3. **80/20 replay + 1 epoch works**: val_loss stable at ~1.95 across 15 rounds (Δ=+0.06 from pretrain, vs P95's Δ=+0.43). The key was: (a) 100k pretrain with no overfitting, (b) only 1 epoch per round, (c) 80/20 ratio so on-policy dominates.
+4. **length_acc remains at ~0.26-0.28 regardless**: this appears to be the **true ceiling** for this Belief Net architecture on RL trajectories with KL≈0.17-0.22. The pretrain's 0.391 is its accuracy on SL trajectories specifically.
+
+---
+
+## Full Experimental Results (Competitive Subgame)
+
+### Master comparison table
+
+| Exp | λ | Belief | length | A vs B H2H | Paired diff | partner_gain Δ | Conclusion |
+|-----|---|--------|--------|------------|-------------|----------------|------------|
+| P88 | →0 | JIT 10k | 0.261 | **B>A +3.18** ✅ | -1.89 ✅ | ? | ❌ Drift contaminated |
+| P95 | 0.5 | on-policy 3ep 10k | 0.255 | **B>A +0.31** ✅ | +0.01 ns | ? | ✅ First clean B>A (artifact?) |
+| P96 | 0.5 | frozen 10k | 0.220 | **A>B +0.30** ✅ | — | ? | ❌ Noise r_info harms B |
+| P97b | 0.5 | frozen 100k | 0.278 | A≈B -0.04 ns | -0.05 ns | ? | — No difference |
+| P97c | 0.5 | unfreeze+replay 100k | 0.262 | **A>B +0.18** ✅ | -0.007 ns | +1.3% | ❌ r_info slightly harmful |
+| **P97d** | **0.3** | **unfreeze+replay 100k** | **0.265** | **A>B +0.31** ✅ | +0.05 ns | **+10.8%** | ⚠️ Communication changes, IMP doesn't |
+
+### P97d detailed results (λ=0.3, 10 rounds, paired eval 5000 deals)
 
 | Matchup | IMP | p-value | |
 |---------|-----|---------|--|
-| A vs SL | **+6.176** | 0.000 ✅ | |
-| B vs SL | **+8.065** | 0.000 ✅ | |
-| A vs B  | **-3.181** | 0.000 ✅ | **B wins** |
-| Paired (A_SL - B_SL) | **-1.889** | 0.000 ✅ | **B stronger vs SL** |
+| A vs SL | +3.910 | 0.000 ✅ | |
+| B vs SL | +3.862 | 0.000 ✅ | |
+| A vs B (H2H) | **+0.307** | 0.000 ✅ | **A wins** |
+| Paired diff | +0.048 | 0.160 (ns) | No diff vs SL |
 
-**This is the strongest positive result.** r_info produces both internal superiority (B>>A) and external generalization (B vs SL > A vs SL by 1.9 IMP).
+### P97d partner info gain diagnostic (500 deals, B's belief net as judge)
 
-### P92 (self-play, λ=0 全程) — Re-evaluated with dealer fix
+| Position | Agent A | Agent B | Δ |
+|----------|---------|---------|---|
+| N (opener) | 0.0087 | 0.0086 | -0.1% |
+| S (responder) | 0.1335 | **0.1470** | **+10.1%** |
+| Overall | 0.0844 | **0.0934** | **+10.8%** |
 
-**Config**: 30 rounds, λ=0.0 throughout, no FSP (self-play only)
-
-| Matchup | IMP | p-value | |
-|---------|-----|---------|--|
-| A vs SL | +7.071 | 0.000 ✅ | |
-| B vs SL | +7.388 | 0.000 ✅ | |
-| A vs B  | +0.075 | 0.173 (ns) | No difference |
-| Paired (A_SL - B_SL) | -0.317 | 0.010 | Marginal |
-
-**r_info had no meaningful effect.** Cause identified: Belief Net degraded catastrophically during training — length accuracy fell from 0.488 (pretrain) to 0.230 (final), making r_info essentially random noise.
-
-### Key Comparison: Why P88 > P92
-
-| Factor | P88 (B>A ✅) | P92 (B≈A ❌) |
-|--------|-------------|-------------|
-| KL schedule | 0.5→0.0 over 50% | 0.0 throughout |
-| Opponent | FSP pool (10 checkpoints) | Self-play only |
-| Rounds | 20 | 30 |
-| Final NS entropy | ~0.52 | ~0.37 |
-| Belief Net health | Maintained (slow drift) | Collapsed (length 0.23) |
-| Diagnosis | KL stabilizes early training → belief net learns good foundation → r_info effective in later rounds | No KL → immediate drift → belief net can't track → r_info = noise |
-
-### Pre-P93 eval numbers (INVALID — dealer bug)
-
-All H2H numbers in previous README versions (P88: A vs SL = +2.4, etc.) were **systematically wrong** due to the dealer encoding bug. Only the corrected numbers above should be used.
+**Interpretation:** r_info successfully increases South's information transmission to North by 10%, but this does not improve (and slightly harms) IMP outcomes. The S-position is where communication decisions happen; N's opener rebids are low-information regardless.
 
 ---
 
-## P93: Belief Net On-Policy Update
-
-### Problem
-Belief Net was trained via JIT burn-in using a 50k FIFO replay buffer. As policy drifted (especially with low/no KL), buffer contained stale data from earlier strategies. This poisoned belief estimates — analogous to training a Critic on off-policy returns.
-
-### Solution
-Treat Belief Net like a Critic: train on current round's on-policy rollout data only, continual learning on previous weights.
-
-- **After** both tables' PPO updates, extract belief data from `ns_eps + ew_eps`
-- Train 8 epochs with early stopping (patience=2), 90/10 train/val split
-- LR = 5e-5 (lower than pretrain's 1e-4 for smooth continual learning)
-- No replay buffer — data from current round only, discarded after use
-- Network weights carry forward (not reset) — low-frequency knowledge preserved in weights
-
-### Why Not Other Approaches
-- **Replay buffer (old method)**: Stale data poisons belief when policy drifts
-- **Joint training (Rong et al.)**: Gradient interference between belief loss and PPO loss
-- **SL anchor buffer**: Only safe when KL keeps policy near SL; contradictory when λ→0
-- **On-policy (chosen)**: Matches Critic training paradigm; no distribution shift by construction
-
----
-
-## Architecture
-
-### Actor: `MLPPolicyNetwork` (301 dims → 4×1024 MLP → 38 logits)
-```
-hand(52) + history_flat(152, who-made-it) + position(4) + vulnerability(2) + dealer(1) = 301
-```
-Note: `encode_obs_flat(obs, dealer, history_int)` uses `dealer` to compute
-`caller = (dealer + step_idx) % 4` for the `who_called` matrix. **Getting dealer wrong
-causes catastrophic input corruption** (P93 bug).
-
-### Critic: `MLPValueNetwork` (CTDE, 509 dims)
-```
-flat_obs(301) + all_hands(4×52=208) = 509
-```
-
-### Belief Network (P86, 268 dims → shared 2×512 trunk → dual head)
-```
-Input: observer_hand(52) + history_flat(152) + pos_embed×2(64) = 268
-
-Honor head: trunk → Linear(512, 16) → sigmoid → calibrated P(honor)
-  Loss: BCEWithLogitsLoss (NO pos_weight)
-
-Length head: trunk → Linear(512, 32) → softmax(per suit, 8 bins) → P(length)
-  Loss: CrossEntropyLoss (8-class per suit)
-```
-
-### HAPPO: 8 independent networks — `actor_n/s/e/w` + `critic_n/s/e/w`
-
----
-
-## Training Pipeline (P93, current)
+## Current Training Pipeline (P97d)
 
 ### Stage 1: SL Initialization
 Load `results/sl_base.pt` (9.9M SAYC deals, 4 actors with identical weights).
 
 ### Stage 1.5: Belief Net Pretrain (Agent B only)
-10k deals → train to convergence (~300 epochs). No replay buffer seeding (P93: removed).
+**100k deals** (P97b fix: 10×previous), 50 epochs, no overfitting.
+Final: val_loss=1.89, honor=0.762, length=0.391.
 
-### Stage 2: RL Fine-tuning (20 rounds)
+### Stage 2: RL Fine-tuning (10 rounds)
 
 Each round:
-1. FSP pool: sample checkpoint as opponent (SL is permanent member)
+1. FSP pool: sample checkpoint as opponent (SL permanent, add every round)
 2. **Table 1 (NS)**: collect 32768 deals, agent=NS, FSP=EW → r_info bonus → PPO update N+S
 3. **Table 2 (EW)**: collect 32768 deals, agent=EW, FSP=NS → r_info bonus → PPO update E+W
-4. **On-policy Belief Update (P93)**: train belief net on this round's rollout data (ns_eps + ew_eps), 8 epochs, early stopping
-5. **Mini eval**: vs SL H2H (1000 deals)
-
-**Reward**: `score_to_imp(score - dds_optimal)`, terminal only.
-
-**r_info (P87b)**: Dynamic normalization. With w=0.2, step_ir ≈ 0.9–1.4 IMP.
-
-**KL schedule**: λ linearly 0.5→0.0 over first 50% of rounds (P88 config).
+4. **Belief Net: Unfreeze, 1 epoch on-policy + 20% pretrain replay** (P97c)
+5. **Mini eval**: vs SL H2H (500 deals)
 
 ### Stage 3: Evaluation
-- A vs SL, B vs SL, A vs B (1000 deals each, Wilcoxon)
-- **Paired eval** (`eval_paired.py`): same 5000 deals for all 3 matchups, paired Wilcoxon on (A_SL - B_SL)
-- Belief Net quality (honor/length accuracy)
+- A vs SL, B vs SL, A vs B (1000 deals each, Wilcoxon) — runs automatically at end of training
+- **Paired eval** (`subgame_validation.py --eval-only`): same deals, Wilcoxon signed-rank + paired diff test
+- **Belief eval**: frozen pretrain Belief Net accuracy on RL trajectories
+- **Partner info gain diagnostic**: A vs B communication comparison, runs inside Stage 3 when `use_info_bonus=True`
 
-### Hyperparameters (P93, set in `subgame_validation.py`)
+### Hyperparameters (P97d)
 
 | Param | Value | Note |
 |-------|-------|------|
 | lr | 3e-6 | Kita et al. |
-| kl_lambda_start / end | 0.5 / 0.0 | P93: restore P88 anneal |
-| kl_anneal_frac | 0.5 | Over first 50% of rounds |
+| kl_lambda | **0.3** | P97d: relaxed from 0.5 for more policy freedom |
 | deals_per_step | 512 | |
 | steps_per_phase | 64 | → 32768 deals/table/round |
-| num_rounds | 20 | P93: restore P88 |
+| num_rounds | **10** | Converges by Round 8 |
 | beta (internal) | 0.05 | I(partner) - β·I(opponent) |
-| info_reward_weight | 0.2 | P87b |
+| info_reward_weight | 0.2 | |
 | fsp_pool_size | 10 | 1 permanent SL + 9 FIFO |
-| fsp_add_interval | 2 | |
-| belief_update_epochs | 8 | P93: on-policy, early stop patience=2 |
-| belief_update_lr | 5e-5 | P93: lower than pretrain 1e-4 |
+| fsp_add_interval | **1** | Every round |
+| freeze_belief | **False** | P97c: unfreeze with replay |
+| belief_update_epochs | **1** | P97c: gentle adaptation |
+| belief_update_lr | 1e-5 | |
+| belief_pretrain_rounds | **50** | 100k deals total |
+| belief_pretrain_max_epochs | **50** | No overfitting |
+| replay mixing ratio | **80/20** | On-policy / pretrain |
 
 ---
 
-## Running the Experiment
+## Key Lessons Learned (P94–P97d)
 
-```bash
-# P93: Train Agent B only (load pre-trained Agent A)
-python experiments/subgame_validation.py \
-    --data data/competitive_500k.npz \
-    --sl_checkpoint results/sl_base.pt \
-    --load_agent_a results/competitive/agent_a_seed42.pt \
-    --seed 42
+1. **Convention drift is real and large.** ~2 IMP advantage from drift alone (P94b). Prior bridge AI papers do not account for this confound.
 
-# Paired eval (corrected, same deals for all matchups)
-python eval_paired.py \
-    --data data/competitive_500k.npz \
-    --sl_checkpoint results/sl_base.pt \
-    --agent_a results/competitive/agent_a_seed42.pt \
-    --agent_b results/competitive/agent_b_seed42.pt \
-    --num_deals 5000
-```
+2. **KL anchor is not a training trick — it's protocol compliance.** Without it, agents develop private conventions that violate Full Disclosure.
 
-### Key log indicators
-```
-[Round N] regret=+3.80±6.65  (NS=+3.99 EW=+3.65)  fsp=10
-  regret: mean DDS IMP regret vs FSP pool (relative, not absolute)
+3. **Belief Net pretrain overfitting was the hidden killer.** 10k deals × 300 epochs → severe overfitting → any new data caused apparent "catastrophic forgetting" that was actually distribution shift to unseen samples. Fix: 100k deals × 50 epochs.
 
-NS │ N: pl=-0.015 vl=6.8 ent=0.66 │ S: ... kl=0.97(λ=0.250)
-  ent: healthy range 0.5–0.8 for competitive bidding
-  kl: with λ annealing, expected to rise as λ decreases
+4. **EWC does not work for this problem.** At pretrain convergence, Fisher diagonal ≈ 1e-6 → penalty negligible. The problem is data-level (30万 new samples overwhelm 4.6万 pretrain), not weight-level.
 
-r_info │ step_ir=0.93  belief_loss=1.79
-  step_ir: ~0.9 IMP is the target range
+5. **80/20 pretrain replay + 1 epoch is the correct belief update strategy.** Val_loss stable at ~1.95 across 15 rounds (Δ=+0.06), vs P95's Δ=+0.43 destruction.
 
-[Belief Update] 45000 samples, 5 epochs, val_loss=1.8200
-  P93: on-policy update. Watch val_loss — should track, not diverge.
+6. **r_info changes communication behavior** (partner_gain +10.8% at λ=0.3) **but does not improve IMP outcomes** (A>B +0.31). "Saying more clearly" ≠ "bidding better". The auxiliary reward partially conflicts with the primary IMP objective.
 
-[Head-to-Head] agent vs SL  n=1000  p=0.003
-  PRIMARY convergence metric (now with correct dealer encoding)
-```
+7. **P95's B>A +0.308 was likely an artifact** of degraded belief (val_loss 2.19). When belief is properly maintained (P97c/d), B does not beat A.
+
+8. **The only genuine B>A effect comes from convention drift** (P88, λ→0, +3.18 IMP). Under protocol-compliant conditions, r_info has zero or slightly negative effect on IMP.
+
+---
+
+## Scientific Narrative for Thesis
+
+### Three contributions
+
+1. **Convention drift quantification** (novel): First quantitative evidence that RL self-play in bridge produces ~2 IMP illegitimate advantage through private conventions. Identifies a methodological blind spot in Kita 2024, Gong 2024, etc.
+
+2. **Protocol compliance as constrained optimization** (novel framing): Full Disclosure formalized as $\max_\pi J(\pi)$ s.t. $D_{\text{KL}}(\pi \| \pi_{\text{SL}}) \leq \epsilon$. KL anchor reframed from ad-hoc hyperparameter to Lagrange multiplier.
+
+3. **Communication-outcome disconnect** (honest negative finding): r_info successfully modifies communication behavior (+10.8% partner information gain) but this does not translate to IMP improvement. Demonstrates that **information-theoretic optimality and decision-theoretic optimality can diverge** in constrained policy spaces.
+
+### Pareto frontier (λ sweep)
+
+| λ | KL | DDS Regret | vs SL IMP | Drift advantage | r_info effect |
+|---|-----|------------|-----------|-----------------|---------------|
+| 0 (P88) | high | ~+1.8 | ~+6-8 | ~+4-6 | B>A +3.18 (contaminated) |
+| 0.3 (P97d) | ~0.22 | ~+1.5 | ~+3.9 | ~+1-2 | partner_gain +10.8%, IMP ns |
+| 0.5 (P97c) | ~0.17 | ~+1.6 | ~+3.6 | small | partner_gain +1.3%, IMP ns |
+| 1.5 | ~0.02 | ~-0.5 | ~0 | ~0 | locked at SL |
+
+### Open questions for thesis
+
+1. Would a **policy architecture that conditions on belief** (actor uses belief net output as input) allow r_info to actually improve decisions, not just communication?
+2. Can **Semantic Fidelity Score** (KL between SL and RL bid-conditioned hand posteriors) provide a finer-grained measure of convention drift than aggregate KL?
+3. Would the full bidding game (not 1H-1S subgame) provide more room for r_info to matter?
 
 ---
 
@@ -255,7 +228,7 @@ r_info │ step_ir=0.93  belief_loss=1.79
 ### Phase 1 (P0–P6)
 P0 package · P1 termination · P2 reward · P3 eval · P4 scoring · P5 vulnerability · P6 dealer
 
-### Phase 2 (P7–P93)
+### Phase 2 (P7–P97d)
 
 | # | Problem | Fix |
 |---|---------|-----|
@@ -263,40 +236,19 @@ P0 package · P1 termination · P2 reward · P3 eval · P4 scoring · P5 vulnera
 | P54–P77 | Competitive env infrastructure | Dealer rotation, dual-table, FSP, batch rollout |
 | P82 | NS/EW asymmetry | Dual-table symmetric training |
 | P83 | r_info drowns base reward | Separate beta vs info_reward_weight |
-| P84 | Belief Net catastrophic forgetting | FIFO Replay Buffer (50k) — **superseded by P93** |
+| P84 | Belief Net catastrophic forgetting | FIFO Replay Buffer (50k) — superseded |
 | P86 | Belief Net miscalibration | No pos_weight, CE for length, prior bias init |
 | P87b | r_info signal invisible to PPO | info_reward_weight 0.02→0.2 |
 | P88 | KL=1.5 locked agent at SL | KL anneal: 0.5→0.0 over 50% rounds |
-| P89 | Pool=3 too homogeneous | Reverted to pool=10 |
-| P90 | FSP evicts SL | SL as permanent FSP member |
-| P91 | No absolute training metric | Mini DDS Oracle + vs SL eval every round |
-| **P93** | **`play_mixed` / `cross_evaluate` / `dds_oracle_evaluate` used wrong `env.dealer`** | **`self.dealer = dealer` in `play_mixed`; `env.dealer = dealer` in oracle eval** |
-| **P93** | **Belief Net trained on stale replay buffer data → length acc 0.49→0.23** | **On-policy update: train on current round's rollout only, no replay buffer** |
-| **P93** | **Eval used different deals per matchup → no paired comparison** | **`eval_paired.py`: pre-sample deals, all matchups on same deals, paired Wilcoxon** |
-
----
-
-## Key Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| MLP+flat, no LSTM | Kita 2024: no benefit ≤12 tokens |
-| FSP pool=10 + SL permanent | Opponent diversity prevents co-adaptation; SL anchor prevents forgetting |
-| KL anneal 0.5→0.0 over 50% | Early stability for belief learning; late freedom for specialization |
-| On-policy belief update (P93) | Belief Net = Information Critic; must track current policy like Value Critic |
-| Dynamic r_info normalization | `(imp_std/rinfo_std) * w` auto-scales to IMP magnitude |
-| eval_paired.py for H2H | Same deals across matchups enables paired statistical test |
-
----
-
-## Key Lessons Learned
-
-1. **Dealer encoding is catastrophic when wrong.** `encode_obs_flat` uses dealer to assign `who_called` — wrong dealer = wrong input for every bid in history. Always verify `env.dealer` matches the actual dealer in eval paths.
-2. **Training data was correct all along.** `_collect_episodes_batch` uses independent envs with correct dealer. The bug was eval-only, meaning trained agents were always stronger than eval indicated.
-3. **FSP pool diversity > self-play purity.** P88 (FSP, 20 rounds) produced B>>A; P92 (self-play, 30 rounds) produced B≈A. Multiple diverse opponents prevent co-adaptation and slow entropy collapse.
-4. **KL anneal is not "constraining r_info" — it's stabilizing belief learning.** The first 10 rounds with λ=0.5→0.25 keep policy drift slow enough for belief net to build a robust foundation. r_info becomes effective in the second half when λ→0.
-5. **Belief Net must be on-policy.** Stale replay data from earlier strategies has different bid→hand mappings. This poisons belief estimates, making r_info = noise. Treat belief net like a Critic.
-6. **Paired eval is essential.** Unpaired eval (different deals per matchup) cannot detect 0.3 IMP differences. `eval_paired.py` with 5000 shared deals detected B > A at p=0.000 for P88.
+| P93 | Dealer encoding bug / stale replay / unpaired eval | P93 bundle fix; eval_paired logic later absorbed into subgame_validation.py |
+| P94 | Convention drift discovery | Quantified ~2 IMP drift advantage |
+| P95 | On-policy belief destroys pretrain | val_loss 1.76→2.19 in Round 1 |
+| P96 | Frozen belief OOD | length 0.488→0.220, noise r_info |
+| **P97a** | **EWC for belief protection** | **Failed: Fisher ≈ 1e-6 at convergence, penalty negligible** |
+| **P97b** | **Pretrain overfitting diagnosis** | **100k deals, 50 epochs → no overfitting, val_loss 1.89** |
+| **P97b-replay** | **50/50 replay mixing** | **Failed: conflicting gradients made val_loss worse (2.34)** |
+| **P97c** | **80/20 replay + 1 epoch** | **val_loss stable at 1.95 across 15 rounds ✅** |
+| **P97d** | **λ=0.3 + partner_gain diagnostic** | **partner_gain +10.8%, but IMP A>B +0.31** |
 
 ---
 
@@ -304,40 +256,45 @@ P0 package · P1 termination · P2 reward · P3 eval · P4 scoring · P5 vulnera
 
 ```
 bridge-coma/
-├── subgames/
-│   ├── competitive_env.py      # P93: dealer fix in play_mixed + dds_oracle_evaluate
-│   ├── subgame_trainer.py      # P93: on-policy belief update, no replay buffer
-│   ├── subgame_validation.py   # P93: KL 0.5→0.0, 20 rounds, load_agent_a
-│   └── action_mask.py
+├── env/
+│   ├── bridge_bidding_env.py       # single-table bidding env
+│   └── dual_table_env.py           # dual-table IMP env
 ├── networks/
-│   ├── policy_net.py           # 301-dim MLP, encode_obs_flat
-│   └── belief_net.py           # P86: dual-head, no pos_weight, prior bias init
+│   ├── policy_net.py               # MLPPolicyNetwork (301-dim / 349-dim BCA), encode_obs_flat
+│   └── belief_net.py               # P86: dual-head BCE; P97: optional EWC
 ├── algorithms/
-│   ├── mappo.py                # HAPPO: actor/critic ×4
-│   └── ippo.py
+│   ├── mappo.py                    # HAPPO: actor/critic ×4, independent optimizers
+│   ├── ippo.py
+│   └── behavioral_cloning.py
 ├── utils/
-│   ├── hand_features.py        # P86: Brier/NLL metrics
-│   ├── fsp_pool.py             # P90: permanent member support
-│   ├── sl_pretrain.py / scoring.py / imp.py
-│   ├── dds_data.py / running_stats.py
+│   ├── scoring.py                  # bridge score SSOT
+│   ├── imp.py                      # IMP conversion table
+│   ├── dds_data.py                 # DDS data generation/loading
+│   ├── running_stats.py            # Welford online stats
+│   ├── hand_features.py
+│   ├── fsp_pool.py
+│   ├── sl_pretrain.py              # P98: BCA two-stage SL (Belief Net + 349-dim Actor) → sl_base_bca.pt
 │   └── generate_subgame_data.py
-├── eval_paired.py              # P93: paired eval (same deals, paired Wilcoxon)
-├── eval_vs_sl.py               # OLD standalone eval (unpaired, deprecated)
-├── belief_diagnostic.py
-├── results/competitive/
-│   ├── agent_a_seed42.pt       # P88 Agent A (can be reused with --load_agent_a)
-│   └── agent_b_seed42.pt
-└── data/competitive_500k.npz
+├── subgames/
+│   ├── stayman_env.py
+│   ├── competitive_env.py          # P93: dealer fix
+│   ├── subgame_trainer.py          # P97c: replay mixing + partner_gain diagnostic
+│   ├── subgame_validation.py       # P97d: training entry + --eval-only paired eval mode
+│   └── action_mask.py
+├── experiments/
+│   └── train.py
+├── tests/
+│   └── test_all.py                 # 35 Phase 1 infrastructure tests
+├── results/
+└── data/
+    └── competitive_500k.npz
 ```
 
----
-
-## Pending / Next Steps
-
-1. **P93 experiment running**: P88 config + on-policy belief update. Only Agent B trains (Agent A loaded from P88 checkpoint). Watch belief_loss and length accuracy — should stay above 0.40.
-2. **If B > A confirmed with healthy belief**: Multi-seed validation (seeds 42, 123, 456).
-3. **If belief still degrades**: Consider lower belief_update_lr (1e-5) or fewer epochs.
-4. **Paper narrative**: P88 corrected results are the centerpiece — r_info produces +1.9 IMP generalization advantage (paired, p=0.000). KL anneal + FSP diversity are necessary enabling conditions.
+### Removed files (refactor)
+- `sl_pretrain_bca.py` → merged into `sl_pretrain.py`
+- `eval_paired.py` → absorbed into `subgame_validation.py --eval-only`
+- `diagnose_partner_gain.py` → diagnostic already inside `subgame_trainer.evaluate_partner_info_gain()`
+- `test_phase2.py` → superseded by Stage 3 eval in `subgame_validation.py`
 
 ---
 
@@ -345,14 +302,26 @@ bridge-coma/
 
 | Stage | Time |
 |-------|------|
-| SL pretrain (10 epochs) | ~20 min |
-| Belief pretrain (300 epochs) | ~15 min |
-| Agent A (20 rounds, if not loaded) | ~80 min |
-| Agent B (20 rounds + on-policy belief) | ~90 min |
+| SL pretrain — Stage A: Belief Net (200k deals, 30 epochs) | ~20 min |
+| SL pretrain — Stage B: 349-dim Actor (10 epochs) | ~25 min |
+| Belief pretrain (100k deals, 50 epochs) | ~30 min |
+| Agent A (10 rounds) | ~40 min |
+| Agent B (10 rounds, belief update) | ~45 min |
 | Stage 3 eval (3×1000 deals) | ~5 min |
-| eval_paired.py (5000 deals ×3) | ~10 min |
+| `--eval-only` paired eval (2000 deals ×3) | ~10 min |
+| `evaluate_partner_info_gain` (500 deals, inside Stage 3) | ~5 min |
 
 ---
 
-*README version: P93*
-*Last updated: 2026-03-22*
+## Pending / Next Steps
+
+1. **Thesis write-up**: Convention drift + communication-outcome disconnect as dual contributions
+2. **Optional**: Multi-seed validation of P97d (seeds 42, 123, 456) to confirm partner_gain finding
+3. **Optional**: Semantic Fidelity Score implementation for finer drift quantification
+4. **Optional**: Stayman re-run under P97c framework (expected: null result, confirming communication ceiling)
+5. **Preliminary Report**: LaTeX draft completed (Bristol template), needs revision based on P97d findings
+
+---
+
+*README version: P97d + refactor*
+*Last updated: 2026-03-23*

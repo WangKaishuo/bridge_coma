@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 from env import NUM_PLAYERS, NORTH, SOUTH
-from networks.policy_net import MLPPolicyNetwork, MLPValueNetwork, OBS_DIM
+from networks.policy_net import MLPPolicyNetwork, MLPValueNetwork, OBS_DIM, BELIEF_OBS_DIM
 from algorithms.ippo import PPOConfig, RolloutBuffer
 
 
