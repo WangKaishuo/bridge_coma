@@ -8,6 +8,8 @@ Subgame Trainer  (新架构版)
 1. collect_episodes 用 encode_obs_flat 生成 flat_obs (301,)，
    不再存 {'hand', 'history', 'position', 'vulnerability'} 字典。
    Buffer 只存 flat_obs + legal_actions + all_hands。
+   P101: belief_conditioned 模式下 flat_obs = 397 维
+   (301 base + 48 partner belief + 48 RHO belief)
 
 2. FSP pool 集成：每 fsp_add_interval 轮将 actor snapshot 存入 pool，
    rollout 时对手从 pool 中随机采样（anti-cycling）。
@@ -111,11 +113,15 @@ class SubgameConfig:
     ewc_lambda:           float = 100.0       # P97: EWC penalty strength (Fisher normalized, mean penalty)
     ewc_fisher_samples:   int   = 5000        # Samples for Fisher computation
 
-    # ── P98: Belief-Conditioned Actor ─────────────────────────────────
-    belief_conditioned:   bool  = False       # P98: Actor input includes belief features (349 dim)
-    # When True: obs_dim = 349 (301 base + 48 belief features)
+    # ── P98/P101: Belief-Conditioned Actor ─────────────────────────────
+    belief_conditioned:   bool  = False       # P101: Actor input includes belief features (397 dim)
+    # When True: obs_dim = 397 (301 base + 48 partner belief + 48 RHO belief)
     # Requires belief_net to be available (use_info_bonus=True or standalone belief)
     # Enables the Convention Card Protocol for Full Disclosure evaluation
+    belief_warmup_rounds: int   = 2           # P98b: rounds using prior features instead of belief net
+    # During warmup rounds, rollout uses make_belief_features_prior() for the 48-dim
+    # belief input. This prevents garbage belief features from destabilising the actor
+    # before the Belief Net has adapted to the RL trajectory distribution.
 
     # ── Critic Warmup ───────────────────────────────────────────────────────
     critic_prewarm_deals:  int   = 2048
@@ -323,7 +329,7 @@ class SubgameTrainer:
         self.active_players = config.active_players or list(range(NUM_PLAYERS))
 
         # ── HAPPO Agent ────────────────────────────────────────────────────
-        # P98: belief_conditioned mode uses 349-dim input for Actor & Critic
+        # P101: belief_conditioned mode uses 397-dim input for Actor & Critic
         _obs_dim = BELIEF_OBS_DIM if config.belief_conditioned else OBS_DIM
         mappo_cfg = MAPPOConfig(
             lr              = config.lr,
@@ -352,7 +358,7 @@ class SubgameTrainer:
         self.dual_info:      Optional[DualInfoComputer]  = None
         self.belief_optimizer = None
 
-        # P98: belief_conditioned mode always needs a belief net
+        # P101: belief_conditioned mode always needs a belief net
         _need_belief = config.use_info_bonus or config.belief_conditioned
         if _need_belief:
             self.belief_net  = BeliefNetwork(hidden_dim=config.hidden_dim).to(self.device)
@@ -410,13 +416,13 @@ class SubgameTrainer:
         actions_np  = np.array([d['action']   for d in data], dtype=np.int64)
         legal_np    = np.ones((len(data), NUM_BIDS), dtype=np.float32)  # BC 不限制
 
-        # P98: pad with belief prior (48-dim) when belief_conditioned
+        # P101: pad with belief prior (96-dim) when belief_conditioned
         # During BC warmup, no belief net is trained yet → use uniform prior.
-        # This ensures actor learns on 349-dim input from the start.
+        # This ensures actor learns on 397-dim input from the start.
         if self.config.belief_conditioned:
-            prior = make_belief_features_prior()  # (48,)
-            prior_batch = np.tile(prior, (len(data), 1))  # (N, 48)
-            flat_obs_np = np.concatenate([flat_obs_np, prior_batch], axis=1)  # (N, 349)
+            prior = make_belief_features_prior()  # (96,)
+            prior_batch = np.tile(prior, (len(data), 1))  # (N, 96)
+            flat_obs_np = np.concatenate([flat_obs_np, prior_batch], axis=1)  # (N, 397)
 
         flat_t   = torch.tensor(flat_obs_np, dtype=torch.float32)
         actions_t = torch.tensor(actions_np, dtype=torch.int64)
@@ -467,7 +473,9 @@ class SubgameTrainer:
         必须在 BC warmup 结束后、RL 训练开始前调用。
         """
         def _frozen_copy(state_dict):
-            net = MLPPolicyNetwork(hidden_dim=self.config.hidden_dim).to(self.device)
+            _obs_dim = BELIEF_OBS_DIM if self.config.belief_conditioned else OBS_DIM
+            net = MLPPolicyNetwork(obs_dim=_obs_dim,
+                                   hidden_dim=self.config.hidden_dim).to(self.device)
             net.load_state_dict(state_dict)
             net.eval()
             for p in net.parameters():
@@ -1106,6 +1114,7 @@ class SubgameTrainer:
         fsp_sd:           Optional[dict] = None,
         batch_size:       int = 32,
         skip_dual_table:  bool = False,   # P55: skip swapped-table rollout (critic warmup)
+        use_belief_prior: bool = False,   # P98b: use prior features instead of belief net
     ) -> List[List[dict]]:
         """
         批量 rollout：同时维护 batch_size 个 CompetitiveSubgameEnv 实例。
@@ -1205,14 +1214,18 @@ class SubgameTrainer:
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
 
-                # P98: append belief features if belief_conditioned
-                if self.config.belief_conditioned and self.belief_net is not None:
-                    _hands   = np.stack([envs[i]._current_hands[envs[i].current_player]
-                                         for i in slots])
-                    _hists   = [slot_hist[i] for i in slots]
-                    _players = [envs[i].current_player for i in slots]
-                    bf = self._get_belief_features_batch(
-                        _hands, _hists, _players, self.belief_net)
+                # P98/P98b: append belief features if belief_conditioned
+                if self.config.belief_conditioned:
+                    if use_belief_prior or self.belief_net is None:
+                        # P98b: warmup — use uninformative prior to avoid garbage input
+                        bf = np.tile(make_belief_features_prior(), (len(slots), 1))
+                    else:
+                        _hands   = np.stack([envs[i]._current_hands[envs[i].current_player]
+                                             for i in slots])
+                        _hists   = [slot_hist[i] for i in slots]
+                        _players = [envs[i].current_player for i in slots]
+                        bf = self._get_belief_features_batch(
+                            _hands, _hists, _players, self.belief_net)
                     flat_batch = np.concatenate([flat_batch, bf], axis=1)
 
                 flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
@@ -1499,9 +1512,13 @@ class SubgameTrainer:
         belief_net: Optional[BeliefNetwork] = None,
     ) -> np.ndarray:
         """
-        P98: 获取单步 belief features (48,) 用于 actor 输入.
+        P101: 获取单步 belief features (96,) 用于 actor 输入.
 
-        查询 belief_net: "给定我的手牌和叫牌历史, partner 的手牌分布是什么?"
+        查询 belief_net 两次:
+          1. partner: "给定我的手牌和叫牌历史, partner 的手牌分布是什么?"
+          2. RHO: "给定我的手牌和叫牌历史, 右手对手的手牌分布是什么?"
+
+        返回 partner (48) + RHO (48) = 96 维.
 
         Args:
             hand:         当前玩家手牌 (52,)
@@ -1510,23 +1527,30 @@ class SubgameTrainer:
             belief_net:   使用哪个 belief net (None=self.belief_net)
 
         Returns:
-            belief_feats: (48,) float32 — 16 honor + 32 length probs
+            belief_feats: (96,) float32 — [partner 48 | RHO 48]
         """
         bn = belief_net or self.belief_net
         if bn is None or not self.config.belief_conditioned:
             return make_belief_features_prior()
 
         partner = (player + 2) % 4
+        rho     = (player - 1) % 4    # right-hand opponent (bid just before you)
         hist_enc = self._encode_history(history_int)
 
         with torch.no_grad():
             oh_t = torch.tensor(hand, dtype=torch.float32).unsqueeze(0).to(self.device)
             h_t  = torch.tensor(hist_enc, dtype=torch.float32).unsqueeze(0).to(self.device)
             op_t = torch.tensor([player],  dtype=torch.long).to(self.device)
-            tp_t = torch.tensor([partner], dtype=torch.long).to(self.device)
-            probs = bn.get_probs(oh_t, h_t, op_t, tp_t)  # (1, 48)
 
-        return probs.squeeze(0).cpu().numpy()
+            # Query partner
+            tp_partner = torch.tensor([partner], dtype=torch.long).to(self.device)
+            partner_probs = bn.get_probs(oh_t, h_t, op_t, tp_partner)  # (1, 48)
+
+            # Query RHO
+            tp_rho = torch.tensor([rho], dtype=torch.long).to(self.device)
+            rho_probs = bn.get_probs(oh_t, h_t, op_t, tp_rho)          # (1, 48)
+
+        return torch.cat([partner_probs, rho_probs], dim=-1).squeeze(0).cpu().numpy()
 
     def _get_belief_features_batch(
         self,
@@ -1536,7 +1560,9 @@ class SubgameTrainer:
         belief_net: Optional[BeliefNetwork] = None,
     ) -> np.ndarray:
         """
-        P98: 批量获取 belief features (B, 48) 用于 actor 输入.
+        P101: 批量获取 belief features (B, 96) 用于 actor 输入.
+
+        对每个样本查询 belief_net 两次 (partner + RHO), 拼接返回 96 维.
 
         Args:
             hands:         (B, 52) 当前玩家手牌
@@ -1545,7 +1571,7 @@ class SubgameTrainer:
             belief_net:    使用哪个 belief net (None=self.belief_net)
 
         Returns:
-            belief_feats: (B, 48) float32
+            belief_feats: (B, 96) float32 — [partner 48 | RHO 48]
         """
         bn = belief_net or self.belief_net
         if bn is None or not self.config.belief_conditioned:
@@ -1553,16 +1579,23 @@ class SubgameTrainer:
 
         B = len(players)
         partners = [(p + 2) % 4 for p in players]
+        rhos     = [(p - 1) % 4 for p in players]
         hist_encs = np.stack([self._encode_history(h) for h in history_ints])
 
         with torch.no_grad():
             oh_t = torch.tensor(hands, dtype=torch.float32).to(self.device)
             h_t  = torch.tensor(hist_encs, dtype=torch.float32).to(self.device)
             op_t = torch.tensor(players,  dtype=torch.long).to(self.device)
-            tp_t = torch.tensor(partners, dtype=torch.long).to(self.device)
-            probs = bn.get_probs(oh_t, h_t, op_t, tp_t)  # (B, 48)
 
-        return probs.cpu().numpy()
+            # Query partner
+            tp_partner = torch.tensor(partners, dtype=torch.long).to(self.device)
+            partner_probs = bn.get_probs(oh_t, h_t, op_t, tp_partner)  # (B, 48)
+
+            # Query RHO
+            tp_rho = torch.tensor(rhos, dtype=torch.long).to(self.device)
+            rho_probs = bn.get_probs(oh_t, h_t, op_t, tp_rho)          # (B, 48)
+
+        return torch.cat([partner_probs, rho_probs], dim=-1).cpu().numpy()
 
     def _encode_for_actor(
         self,
@@ -1574,10 +1607,10 @@ class SubgameTrainer:
         belief_net: Optional[BeliefNetwork] = None,
     ) -> np.ndarray:
         """
-        P98: 统一的 actor 输入编码.
+        P101: 统一的 actor 输入编码.
 
         base mode (301-dim):         encode_obs_flat(obs, dealer, history_int)
-        belief-conditioned (349-dim): base + belief_features(48)
+        belief-conditioned (397-dim): base + partner_belief(48) + rho_belief(48)
 
         所有 policy closure 和 rollout 都应使用此方法。
         """
@@ -1838,6 +1871,13 @@ class SubgameTrainer:
 
         for rnd in range(num_rounds):
             print(f"\n══════ Round {rnd+1}/{num_rounds} ══════")
+
+            # P98b: during belief warmup rounds, use prior features instead of belief net
+            _bw = cfg.belief_conditioned and cfg.belief_warmup_rounds > 0 and rnd < cfg.belief_warmup_rounds
+            if _bw:
+                print(f"  [Belief] Warmup round {rnd+1}/{cfg.belief_warmup_rounds}: "
+                      f"using prior features (Belief Net not yet adapted to RL dist)")
+
             self._maybe_add_to_fsp(rnd)
             fsp_sd = self._apply_fsp_opponent()
             _ir_vals: list = []; _bl_vals: list = []
@@ -1848,7 +1888,8 @@ class SubgameTrainer:
             # ── 桌1: agent=NS, FSP=EW ──────────────────────────────────
             print(f"  [Table1/NS] Collecting {n_deals} deals (batch={batch_sz})...")
             ns_eps = self._collect_episodes_batch(
-                n_deals, train_side='NS', fsp_sd=fsp_sd, batch_size=batch_sz)
+                n_deals, train_side='NS', fsp_sd=fsp_sd, batch_size=batch_sz,
+                use_belief_prior=_bw)
 
             # 收集NS方的DDS regret用于reward_stats和日志（每局一个值）
             raw_ns_vals = []
@@ -1884,7 +1925,8 @@ class SubgameTrainer:
             # ── 桌2: agent=EW, FSP=NS ──────────────────────────────────
             print(f"  [Table2/EW] Collecting {n_deals} deals (batch={batch_sz})...")
             ew_eps = self._collect_episodes_batch(
-                n_deals, train_side='EW', fsp_sd=fsp_sd, batch_size=batch_sz)
+                n_deals, train_side='EW', fsp_sd=fsp_sd, batch_size=batch_sz,
+                use_belief_prior=_bw)
 
             # 收集EW方的DDS regret（每局一个值）
             raw_ew_vals = []

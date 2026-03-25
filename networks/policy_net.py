@@ -2,21 +2,30 @@
 Policy and Value Networks — MLP Architecture
 =====================================================
 
-P98: Belief-Conditioned Actor (BCA)
+P101: Belief-Conditioned Actor (BCA) — Partner + RHO
 
 支持两种输入模式:
   1. Base mode (301 维) — 向后兼容旧实验
-  2. Belief-conditioned mode (349 维) — P98 新框架
-     = base obs (301) + belief features (48)
-     belief features = BeliefNetwork.get_probs() 输出
+  2. Belief-conditioned mode (397 维) — P101 新框架
+     = base obs (301) + partner belief (48) + RHO belief (48)
+     每组 belief features = BeliefNetwork.get_probs() 输出
        [0:16]  honor probs (sigmoid)
        [16:48] length probs (softmax per suit)
 
 设计理由 (参考 PBL, Tian et al. AAAI 2020):
-  - Belief 输出作为 Actor 直接输入，使 partner 能"听懂"叫品含义
+  - Belief 输出作为 Actor 直接输入，使 agent 能"听懂"叫品含义
+  - Partner belief: "partner 大概有什么牌" → 配合叫牌
+  - RHO belief: "右手对手大概有什么牌" → 竞叫决策
   - r_info 的信息增益闭环: sender 传递更多信息 → receiver 的 belief
     更准确 → receiver 做出更好的决策 → 更好的 IMP
   - 去除对 KL 约束的依赖: Full Disclosure 由评估时交换 BeliefNet 实现
+
+为什么是 RHO 而不是 LHO:
+  - RHO 在你之前叫牌 → 信息相关性最高 (你需要理解 RHO 的叫品来决策)
+  - LHO 在你之后叫牌 → 预推断价值有限
+  - 信息论完备: 自己(13) + partner(48) + RHO(48) → LHO 可精确推算
+    P(card∈LHO) = 1 - P(self) - P(partner) - P(RHO)
+  - 自由度: 4人手牌只有2个自由度 (给定自己的牌), partner+RHO 恰好用尽
 
 原始 301 维输入向量:
     vulnerability             :   4 维 (one-hot，4 种局况组合)
@@ -26,11 +35,15 @@ P98: Belief-Conditioned Actor (BCA)
     ─────────────────────────────────
     合计                      : 301 维
 
-P98 额外 48 维 belief features:
-    honor probs (16 dim)      :  16 维 — partner 持有 AKQJ 各花色的概率
-    length probs (32 dim)     :  32 维 — partner 各花色套长的分布 (8 bins × 4)
+P101 额外 96 维 belief features:
+    [Partner belief — 48 维]
+      honor probs (16 dim)    :  16 维 — partner 持有 AKQJ 各花色的概率
+      length probs (32 dim)   :  32 维 — partner 各花色套长的分布 (8 bins × 4)
+    [RHO belief — 48 维]
+      honor probs (16 dim)    :  16 维 — RHO 持有 AKQJ 各花色的概率
+      length probs (32 dim)   :  32 维 — RHO 各花色套长的分布 (8 bins × 4)
     ─────────────────────────────────
-    合计                      : 349 维
+    合计                      : 397 维
 """
 
 import numpy as np
@@ -47,9 +60,9 @@ OBS_DIM        = 301     # 4 + 52 + 35×4 + 35×3
 BASE_INPUT_DIM = OBS_DIM  # 向后兼容别名
 
 # P98: Belief-conditioned Actor
-# Actor input = base obs (301) + belief features (48: 16 honor + 32 length)
-BELIEF_FEAT_DIM = 48     # BeliefNetwork output: 16 honor probs + 32 length probs
-BELIEF_OBS_DIM  = OBS_DIM + BELIEF_FEAT_DIM  # 301 + 48 = 349
+# P101: Actor input = base obs (301) + partner belief (48) + RHO belief (48)
+BELIEF_FEAT_DIM = 96     # 48 (partner) + 48 (RHO) — information-theoretically complete
+BELIEF_OBS_DIM  = OBS_DIM + BELIEF_FEAT_DIM  # 301 + 96 = 397
 
 
 # ==============================================================================
@@ -132,32 +145,36 @@ def batch_encode_obs(obs_list, dealers, history_ints):
 
 def make_belief_features_prior() -> np.ndarray:
     """
-    P98: 返回 belief 先验特征向量 (48,).
+    P101: 返回 belief 先验特征向量 (96,) = partner (48) + RHO (48).
 
     在没有叫牌信息时的 belief 输出:
-      - Honor (16 dim): 每张荣誉牌有 0.25 概率在 partner 手中
+      - Honor (16 dim): 每张荣誉牌有 0.25 概率在目标玩家手中
       - Length (32 dim): 均匀分布 [0.125] × 8 per suit
+
+    两组先验完全相同（partner 和 RHO 的先验分布一致）。
 
     用于:
       1. BC pretrain 时 actor 的 belief 输入（尚无 belief net）
       2. 开叫前第一步的 belief 输入（无历史信息）
+      3. FSP pool 对手的 belief 输入（不主动推断我方叫品）
     """
     honor_prior = np.full(16, 0.25, dtype=np.float32)
     length_prior = np.full(32, 0.125, dtype=np.float32)
-    return np.concatenate([honor_prior, length_prior])
+    single_prior = np.concatenate([honor_prior, length_prior])  # (48,)
+    return np.concatenate([single_prior, single_prior])          # (96,)
 
 
 def append_belief_features(flat_obs: np.ndarray,
                            belief_feats: np.ndarray) -> np.ndarray:
     """
-    P98: 拼接 base obs (301) + belief features (48) → (349,).
+    P101: 拼接 base obs (301) + belief features (96) → (397,).
 
     Args:
         flat_obs:      (301,) from encode_obs_flat
-        belief_feats:  (48,)  from belief_net.get_probs() or prior
+        belief_feats:  (96,)  = partner (48) + RHO (48) from belief queries or prior
 
     Returns:
-        combined: (349,) float32
+        combined: (397,) float32
     """
     return np.concatenate([flat_obs, belief_feats])
 

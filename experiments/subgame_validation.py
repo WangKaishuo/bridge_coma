@@ -1,24 +1,43 @@
 """
-Subgame Validation — Competitive Path
-======================================
+Subgame Validation — Competitive Path (P100/P101)
+==================================================
+
+P100 key change: BCA (Belief-Conditioned Actor) is now the STANDARD BASELINE
+for ALL agents. BCA is not an experimental treatment — it is the minimum
+capability that any bridge bidding agent should possess. An agent that cannot
+interpret bidding history is not "playing bridge" in any meaningful sense.
+
+P101 key change: Actor input expanded to 397-dim:
+  301 (base obs) + 48 (partner belief) + 48 (RHO belief) = 397
+  This enables agents to understand BOTH partner and opponent bids.
+
+Experiment design:
+  - Agent A: MAPPO + BCA (control)
+  - Agent B: MAPPO + BCA + r_info (treatment)
+  - SL baseline: BCA (no RL training)
+  - Only difference between A and B: r_info reward shaping
 
 Training mode (default):
     python experiments/subgame_validation.py \\
-        --type competitive \\
-        --data path/to/1h1s_100k.npz \\
-        --seed 42 --beta 0.05 --rounds 10 --quick
+        --data path/to/competitive_500k.npz \\
+        --sl_checkpoint results/sl_base_bca.pt \\
+        --seed 42 --rounds 10
 
 Eval-only mode (paired evaluation on saved checkpoints):
     python experiments/subgame_validation.py \\
         --eval-only \\
         --data data/competitive_500k.npz \\
-        --sl_checkpoint results/sl_base.pt \\
+        --sl_checkpoint results/sl_base_bca.pt \\
         --agent_a results/competitive/agent_a_seed42.pt \\
         --agent_b results/competitive/agent_b_seed42.pt \\
         --num_deals 2000 --seed 42
 
-Eval-only runs three paired matchups on identical deals (A vs SL, B vs SL, A vs B),
-reports per-deal Wilcoxon p-values, and prints a paired A_vs_SL − B_vs_SL diff test.
+Legacy 301-dim mode (backward compatible):
+    python experiments/subgame_validation.py \\
+        --no_belief_conditioned \\
+        --sl_checkpoint results/sl_base.pt \\
+        --data data/competitive_500k.npz \\
+        --seed 42
 
 Training diagnostics (README §Phase 1):
     ✅  ir > 0（info gain 有效）
@@ -59,24 +78,43 @@ def set_seed(seed: int):
 def run_competitive(args):
     set_seed(args.seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # ── 公共参数（先算，后打印）─────────────────────────────────────────
+    # P100: BCA is now the standard baseline for ALL agents.
+    # --belief_conditioned is always True; --no_belief_conditioned opts out.
+    _bc = not getattr(args, 'no_belief_conditioned', False)
+    if args.kl_lambda is not None:
+        _kl = args.kl_lambda
+    else:
+        _kl = 0.0 if _bc else 0.3
+
+    # P98b: BCA mode uses anneal schedule (0.3→0.0) instead of fixed 0.0
+    # This prevents policy collapse while belief net adapts to RL distribution
+    if _bc and args.kl_lambda is None:
+        _kl_start = 0.3
+        _kl_end   = 0.0
+        _kl_anneal = 0.5   # anneal over first 50% of rounds
+    else:
+        _kl_start = _kl
+        _kl_end   = _kl
+        _kl_anneal = 0.0
+
+    _ent_coef = getattr(args, 'entropy_coef', 0.01)
+
     print(f"\n[Competitive Subgame] seed={args.seed}  device={device}")
     print(f"  beta={args.beta}  info_weight={args.info_weight}  rounds={args.rounds}  quick={args.quick}")
-    print(f"  belief_conditioned={_bc}  kl_lambda={_kl}")
+    print(f"  belief_conditioned={_bc}  kl_lambda={_kl_start}→{_kl_end}  entropy_coef={_ent_coef}")
+    if _bc:
+        print(f"  [P101] BCA standard: ALL agents use 397-dim belief-conditioned actors (partner + RHO)")
 
     # ── 环境 ────────────────────────────────────────────────────────────────
     print("\n[1] Initializing environment...")
     env = CompetitiveSubgameEnv(data_path=args.data)
 
     # ── 公共参数 ───────────────────────────────────────────────────────
-    _bc = getattr(args, 'belief_conditioned', False)
-    # P98: with belief_conditioned, KL=0 (Full Disclosure via convention card, not KL proxy)
-    if args.kl_lambda is not None:
-        _kl = args.kl_lambda
-    else:
-        _kl = 0.0 if _bc else 0.3
 
-    # ── Agent A（控制组：纯 MAPPO，beta=0）──────────────────────────────────
-    print("\n[2] Building Agent A (MAPPO, β=0)...")
+    # ── Agent A（控制组：MAPPO + BCA，no r_info）──────────────────────────
+    print("\n[2] Building Agent A (MAPPO + BCA, no r_info)...")
     cfg_a = SubgameConfig(
         num_rounds       = args.rounds,
         steps_per_phase  = 10  if args.quick else 64,
@@ -85,29 +123,31 @@ def run_competitive(args):
         batch_size       = 256,
         use_info_bonus   = False,
         beta             = 0.0,
+        info_reward_weight = 0.0,
         fsp_pool_size    = 10,
         fsp_add_interval = 1,
-        kl_lambda_start  = _kl,
-        kl_lambda_end    = _kl,
-        kl_anneal_frac   = 0.0,
+        kl_lambda_start  = _kl_start,
+        kl_lambda_end    = _kl_end,
+        kl_anneal_frac   = _kl_anneal,
+        entropy_coef     = _ent_coef,
         bc_warmup_samples= 1000 if args.quick else 5000,
         bc_warmup_epochs = 5    if args.quick else 20,
         device           = device,
-        # P98: belief_conditioned — Actor uses belief features as input
+        # P100: BCA is standard for ALL agents — the only difference is r_info
         belief_conditioned = _bc,
-        # A also needs a belief net when belief_conditioned (for obs encoding)
-        # but does NOT use r_info
+        # P99/P100: Both A and B use identical belief settings for fair comparison.
         freeze_belief    = False if _bc else True,
         belief_update_epochs = 1,
         belief_update_lr  = 1e-5,
+        belief_warmup_rounds = 0,
     )
     reward_stats_a = RunningStats()
     trainer_a = SubgameTrainer(env, cfg_a, reward_stats=reward_stats_a)
 
-    # ── Agent B（实验组：MAPPO + r_info，beta=args.beta）────────────────────
-    print(f"\n[3] Building Agent B (MAPPO + r_info, β={args.beta}, w={args.info_weight})...")
+    # ── Agent B（实验组：MAPPO + BCA + r_info）────────────────────
+    print(f"\n[3] Building Agent B (MAPPO + BCA + r_info, β={args.beta}, w={args.info_weight})...")
     cfg_b = SubgameConfig(
-        # 与A完全对称，唯一区别是use_info_bonus、beta、info_reward_weight
+        # P100: identical to A except use_info_bonus, beta, info_reward_weight
         num_rounds       = args.rounds,
         steps_per_phase  = 10  if args.quick else 64,
         deals_per_step   = 32  if args.quick else 512,
@@ -118,28 +158,69 @@ def run_competitive(args):
         info_reward_weight = args.info_weight,
         fsp_pool_size    = 10,
         fsp_add_interval = 1,
-        kl_lambda_start  = _kl,
-        kl_lambda_end    = _kl,
-        kl_anneal_frac   = 0.0,
+        kl_lambda_start  = _kl_start,
+        kl_lambda_end    = _kl_end,
+        kl_anneal_frac   = _kl_anneal,
+        entropy_coef     = _ent_coef,
         bc_warmup_samples= 1000 if args.quick else 5000,
         bc_warmup_epochs = 5    if args.quick else 20,
         device           = device,
-        # P98: belief_conditioned — Actor uses belief features as input
+        # P100: BCA is standard for ALL agents
         belief_conditioned = _bc,
         freeze_belief    = False,
         use_ewc          = False,
         belief_update_epochs = 1,
         belief_update_lr  = 1e-5,
+        belief_warmup_rounds = 0,
     )
     reward_stats_b = RunningStats()
     trainer_b = SubgameTrainer(env, cfg_b, reward_stats=reward_stats_b)
+
+    # ── Agent C（实验组：MAPPO + BCA + r_info + β opponent penalty）──────
+    _beta_c = getattr(args, 'beta_c', 0.05)
+    _enable_c = not getattr(args, 'no_agent_c', False)
+    trainer_c = None
+    cfg_c = None
+    if _enable_c:
+        print(f"\n[4] Building Agent C (MAPPO + BCA + r_info, β={_beta_c}, w={args.info_weight})...")
+        cfg_c = SubgameConfig(
+            # P100: identical to B except beta > 0 (opponent penalty active)
+            num_rounds       = args.rounds,
+            steps_per_phase  = 10  if args.quick else 64,
+            deals_per_step   = 32  if args.quick else 512,
+            lr               = 3e-6,
+            batch_size       = 256,
+            use_info_bonus   = True,
+            beta             = _beta_c,
+            info_reward_weight = args.info_weight,
+            fsp_pool_size    = 10,
+            fsp_add_interval = 1,
+            kl_lambda_start  = _kl_start,
+            kl_lambda_end    = _kl_end,
+            kl_anneal_frac   = _kl_anneal,
+            entropy_coef     = _ent_coef,
+            bc_warmup_samples= 1000 if args.quick else 5000,
+            bc_warmup_epochs = 5    if args.quick else 20,
+            device           = device,
+            belief_conditioned = _bc,
+            freeze_belief    = False,
+            use_ewc          = False,
+            belief_update_epochs = 1,
+            belief_update_lr  = 1e-5,
+            belief_warmup_rounds = 0,
+        )
+        reward_stats_c = RunningStats()
+        trainer_c = SubgameTrainer(env, cfg_c, reward_stats=reward_stats_c)
 
     # ── Stage 1: 初始化（SL checkpoint 优先，否则 rule-based BC）──────────────
     from env import NORTH as _N, EAST as _E, SOUTH as _S, WEST as _W
     sl_path = getattr(args, 'sl_checkpoint', None)
 
     # 确定哪些trainer需要SL初始化
-    trainers_to_init = [trainer_b] if args.load_agent_a else [trainer_a, trainer_b]
+    _all_trainers = [trainer_a, trainer_b]
+    if trainer_c is not None:
+        _all_trainers.append(trainer_c)
+    trainers_to_init = [trainer_b] + ([trainer_c] if trainer_c else []) if args.load_agent_a else _all_trainers
     is_bca_ckpt = False  # default, updated below if BCA checkpoint detected
 
     if sl_path and os.path.exists(sl_path):
@@ -149,7 +230,7 @@ def run_competitive(args):
         player_key_map = [(_N, 'actor_n'), (_E, 'actor_e'),
                           (_S, 'actor_s'), (_W, 'actor_w')]
 
-        # P98: BCA checkpoint (sl_base_bca.pt) has 349-dim actors + belief_net
+        # P98: BCA checkpoint (sl_base_bca.pt) has 397-dim actors + belief_net
         is_bca_ckpt = (sl_obs_dim == BELIEF_OBS_DIM)
         if _bc and is_bca_ckpt:
             print(f"  [P98] BCA checkpoint detected (obs_dim={sl_obs_dim})")
@@ -169,10 +250,10 @@ def run_competitive(args):
                         continue
                     actor.load_state_dict(sl_sd)
                 elif is_bca_ckpt:
-                    # P98: BCA checkpoint → BCA agent (349→349, direct load)
+                    # P98: BCA checkpoint → BCA agent (397→397, direct load)
                     actor.load_state_dict(sl_sd)
                 else:
-                    # P98: Standard checkpoint → BCA agent (301→349, zero-init extra)
+                    # P98: Standard checkpoint → BCA agent (301→397, zero-init extra)
                     target_sd = actor.state_dict()
                     for param_name, sl_val in sl_sd.items():
                         if param_name in target_sd:
@@ -188,15 +269,50 @@ def run_competitive(args):
 
             # P98: Load belief_net from BCA checkpoint if available
             if _bc and 'belief_net' in ckpt and trainer.belief_net is not None:
-                trainer.belief_net.load_state_dict(
-                    {k: v.to(device) for k, v in ckpt['belief_net'].items()})
-                print(f"  [P98] Belief Net loaded from SL checkpoint for "
-                      f"{'A' if trainer is trainer_a else 'B'}")
+                # Read the hidden_dim the belief net was trained with.
+                # Older checkpoints may not have 'belief_hidden_dim' — fall back
+                # to inferring from the weight shape.
+                ckpt_belief_sd = {k: v.to(device) for k, v in ckpt['belief_net'].items()}
+                ckpt_hidden = ckpt.get(
+                    'belief_hidden_dim',
+                    ckpt_belief_sd['trunk.0.weight'].shape[0]  # infer from first layer
+                )
+                if ckpt_hidden != trainer.belief_net.trunk[0].out_features:
+                    # Rebuild belief_net with the checkpoint's hidden_dim
+                    from networks.belief_net import BeliefNetwork
+                    trainer.belief_net = BeliefNetwork(hidden_dim=ckpt_hidden).to(device)
+                    print(f"  [P98] Belief Net rebuilt with hidden_dim={ckpt_hidden} "
+                          f"to match checkpoint.")
+                trainer.belief_net.load_state_dict(ckpt_belief_sd)
+                _trainer_name = 'A' if trainer is trainer_a else ('B' if trainer is trainer_b else 'C')
+                print(f"  [P98] Belief Net loaded from SL checkpoint for {_trainer_name}")
 
-        init_names = "B only" if args.load_agent_a else "both agents"
+        _n_agents = len(trainers_to_init)
+        init_names = f"{_n_agents} agents" if _n_agents > 1 else "1 agent"
         dim_note = f" [BCA {sl_obs_dim}-dim]" if is_bca_ckpt else (
-            " [301→349 adapted]" if _bc else "")
+            " [301→397 adapted]" if _bc else "")
         print(f"  [SL Init] Weights loaded for N/E/S/W actors ({init_names}).{dim_note}")
+
+        # ── P99: Zero-init belief feature columns in first layer ────────────
+        # BCA SL pretrain trains all 397 input columns jointly, so the first
+        # layer weight[:, 301:397] encodes belief-feature dependencies learned
+        # on GLOBAL SAYC data. On the competitive subgame, belief features have
+        # a different distribution → extreme logit shifts → entropy collapse.
+        # Fix: zero out the 48 belief columns so the actor initially behaves
+        # identically to 301-dim SL. Belief influence enters gradually via RL.
+        # This preserves the BCA architecture while avoiding distribution shift.
+        if _bc and is_bca_ckpt:
+            _base_dim = OBS_DIM  # 301
+            for trainer in trainers_to_init:
+                for player, key in player_key_map:
+                    actor = trainer.agent.get_actor(player)
+                    with torch.no_grad():
+                        w = actor.net[0].weight  # (hidden_dim, 397)
+                        w[:, _base_dim:] = 0.0
+                        b = actor.net[0].bias    # not affected, but confirm
+                    # Also zero the corresponding columns in bc_anchor later
+            print(f"  [P99] Zeroed belief-feature columns in first layer "
+                  f"(all actors, both agents)")
     else:
         print("\n[Stage 1] BC Warmup (rule-based, SL checkpoint not found)...")
         for trainer in trainers_to_init:
@@ -205,22 +321,24 @@ def run_competitive(args):
     # Stage 1 结束：将当前 actor 设为 KL anchor
     for trainer in trainers_to_init:
         trainer.set_bc_anchor(trainer.agent)
-    anchor_names = "Agent B" if args.load_agent_a else "both agents"
-    print(f"  [KL Anchor] BC anchor set for {anchor_names}.")
+    print(f"  [KL Anchor] BC anchor set for {len(trainers_to_init)} agents.")
 
     # ── Stage 1.5: Belief Net 独立预训练 ──────────────────────────────
     belief_pretrain_rounds = getattr(args, 'belief_pretrain_rounds', 5)
     deals = 200 if args.quick else 2000
 
-    # P98: when belief_conditioned, BOTH agents need belief net pretrained
+    # P98: when belief_conditioned, ALL agents need belief net pretrained
     # But skip if already loaded from BCA checkpoint
     trainers_for_belief = []
     if belief_pretrain_rounds > 0:
         _bn_from_ckpt = _bc and is_bca_ckpt and 'belief_net' in (ckpt if sl_path and os.path.exists(sl_path) else {})
-        if trainer_b.belief_net is not None and not _bn_from_ckpt:
-            trainers_for_belief.append(('B', trainer_b))
-        if _bc and trainer_a.belief_net is not None and not args.load_agent_a and not _bn_from_ckpt:
-            trainers_for_belief.append(('A', trainer_a))
+        for name, trainer in [('B', trainer_b), ('C', trainer_c), ('A', trainer_a)]:
+            if trainer is None:
+                continue
+            if name == 'A' and args.load_agent_a:
+                continue
+            if trainer.belief_net is not None and not _bn_from_ckpt:
+                trainers_for_belief.append((name, trainer))
 
     for name, trainer in trainers_for_belief:
         print(f"\n[Stage 1.5] Belief Net Pretrain (Agent {name}, "
@@ -232,39 +350,134 @@ def run_competitive(args):
             max_epochs=getattr(args, 'belief_pretrain_max_epochs', 300),
         )
 
+    # ── P99: Seed belief replay buffer for BCA-loaded trainers ────────────
+    # When belief net is loaded from BCA checkpoint (skipping pretrain_belief),
+    # _pretrain_replay is never created. Without replay protection,
+    # update_belief_on_policy destroys the pretrained belief net
+    # (catastrophic forgetting: val_loss 1.9 → 7.26 in Round 1).
+    # Fix: collect SL-policy rollouts to seed the replay buffer.
+    # FAIRNESS: both agents get identical replay data (same deals, same policy)
+    # since their actors are identical at this point (both loaded from BCA ckpt).
+    if _bc and is_bca_ckpt and 'belief_net' in (ckpt if sl_path and os.path.exists(sl_path) else {}):
+        _all_named = [('A', trainer_a), ('B', trainer_b)]
+        if trainer_c is not None:
+            _all_named.append(('C', trainer_c))
+        _need_replay = [
+            (name, trainer) for name, trainer in _all_named
+            if (trainer.belief_net is not None
+                and not trainer.config.freeze_belief
+                and not hasattr(trainer, '_pretrain_replay'))
+        ]
+        if _need_replay:
+            _replay_deals = 100 if args.quick else 2000
+            # Collect once using trainer_a (identical policy to B at this point)
+            _ref_trainer = _need_replay[0][1]
+            print(f"\n  [P99] Seeding belief replay ({_replay_deals} SL-policy deals, "
+                  f"shared by {', '.join(n for n, _ in _need_replay)})...")
+            _replay_eps = _ref_trainer._collect_episodes_batch(
+                _replay_deals, train_side='NS', fsp_sd=None,
+                batch_size=min(512, _replay_deals), skip_dual_table=True)
+            _bd = []
+            for ep in _replay_eps:
+                for step in ep:
+                    if 'belief_target' in step and not step.get('ew_diagnostic'):
+                        _bd.append(step)
+            if _bd:
+                import torch as _t
+                _shared_replay = {
+                    'oh':  _t.tensor(np.stack([s['observer_hand'] for s in _bd]),
+                                     dtype=_t.float32),
+                    'h':   _t.tensor(np.stack([s['history']       for s in _bd]),
+                                     dtype=_t.float32),
+                    'op':  _t.tensor(np.array([s['observer_pos']  for s in _bd]),
+                                     dtype=_t.long),
+                    'tp':  _t.tensor(np.array([s['target_pos']    for s in _bd]),
+                                     dtype=_t.long),
+                    'tgt': _t.tensor(np.stack([s['belief_target'] for s in _bd]),
+                                     dtype=_t.float32),
+                }
+                for name, trainer in _need_replay:
+                    trainer._pretrain_replay = _shared_replay
+                print(f"  [P99] Saved {len(_bd)} belief replay samples "
+                      f"(shared by {', '.join(n for n, _ in _need_replay)})")
+            else:
+                print(f"  [P99] WARNING: No belief data collected for replay seeding")
+
     # ── Build SL baseline trainer for mini eval during training ──────────────
     from algorithms.mappo import MAPPOAgent, MAPPOConfig
     from networks.policy_net import BELIEF_OBS_DIM as _BOD
 
-    # P98: If BCA checkpoint, SL baseline also uses 349-dim with its own belief net
-    _sl_bc = _bc and is_bca_ckpt if (sl_path and os.path.exists(sl_path)) else False
+    # P99: When belief_conditioned, SL baseline MUST also use 397-dim + belief net
+    # for fair evaluation. Otherwise vs-SL comparisons are contaminated by
+    # architectural asymmetry (397-dim agent vs 301-dim SL).
+    _sl_bc = _bc  # SL gets belief net whenever agents do
     _sl_obs_dim = _BOD if _sl_bc else OBS_DIM
 
     cfg_sl = SubgameConfig(
         device=device, belief_conditioned=_sl_bc, use_info_bonus=False,
         kl_lambda_start=0.0, kl_lambda_end=0.0,
+        belief_warmup_rounds=0,
     )
     sl_agent_eval = MAPPOAgent(MAPPOConfig(device=device, obs_dim=_sl_obs_dim))
     if sl_path and os.path.exists(sl_path):
         ckpt_sl = torch.load(sl_path, map_location=device)
+        sl_obs_dim_ckpt = ckpt_sl.get('obs_dim', OBS_DIM)
         for player, key in [(_N, 'actor_n'), (_E, 'actor_e'),
                             (_S, 'actor_s'), (_W, 'actor_w')]:
-            if key in ckpt_sl:
-                sl_agent_eval.get_actor(player).load_state_dict(
-                    {k: v.to(device) for k, v in ckpt_sl[key].items()})
+            if key not in ckpt_sl:
+                continue
+            sl_sd = {k: v.to(device) for k, v in ckpt_sl[key].items()}
+            actor = sl_agent_eval.get_actor(player)
+            if _sl_bc and sl_obs_dim_ckpt == OBS_DIM:
+                # 301→397 zero-init (same as A/B)
+                target_sd = actor.state_dict()
+                for param_name, sl_val in sl_sd.items():
+                    if param_name in target_sd:
+                        tgt_shape = target_sd[param_name].shape
+                        if sl_val.shape == tgt_shape:
+                            target_sd[param_name] = sl_val
+                        elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
+                            target_sd[param_name][:, :sl_val.shape[1]] = sl_val
+                            target_sd[param_name][:, sl_val.shape[1]:] = 0.0
+                        else:
+                            target_sd[param_name] = sl_val
+                actor.load_state_dict(target_sd)
+            else:
+                actor.load_state_dict(sl_sd)
     sl_trainer = SubgameTrainer(env, cfg_sl, reward_stats=RunningStats())
     sl_trainer.agent = sl_agent_eval
 
-    # P98: Load SL's belief net for SL eval trainer
-    if _sl_bc and 'belief_net' in ckpt_sl and sl_trainer.belief_net is not None:
-        sl_trainer.belief_net.load_state_dict(
-            {k: v.to(device) for k, v in ckpt_sl['belief_net'].items()})
+    # P99: Pretrain SL's belief net (same procedure as A/B, independent instance)
+    if _sl_bc and sl_trainer.belief_net is not None:
+        print(f"\n  [SL Eval] Pretraining SL baseline belief net "
+              f"({belief_pretrain_rounds * deals} deals)...")
+        sl_trainer.pretrain_belief(
+            num_rounds=belief_pretrain_rounds,
+            deals_per_round=deals,
+            epochs_per_round=5,
+            max_epochs=getattr(args, 'belief_pretrain_max_epochs', 300),
+        )
         print(f"  [SL Eval] Belief-conditioned SL baseline ({_sl_obs_dim}-dim)")
 
     # ── Stage 2: RL 微调 ────────────────────────────────────────────────────
     print("\n[Stage 2] RL Fine-tuning...")
 
-    if args.load_agent_a:
+    if args.skip_training:
+        # Load saved checkpoints instead of training
+        a_path = os.path.join(args.save_dir, f'agent_a_seed{args.seed}.pt')
+        b_path = os.path.join(args.save_dir, f'agent_b_seed{args.seed}.pt')
+        print(f"  ── Skip training, loading checkpoints ──")
+        print(f"  Agent A: {a_path}")
+        trainer_a.agent.load(a_path)
+        print(f"  Agent B: {b_path}")
+        trainer_b.agent.load(b_path)
+        log_a, log_b = [], []
+        log_c = []
+        if trainer_c is not None:
+            c_path = os.path.join(args.save_dir, f'agent_c_seed{args.seed}.pt')
+            print(f"  Agent C: {c_path}")
+            trainer_c.agent.load(c_path)
+    elif args.load_agent_a:
         print(f"  ── Agent A (loading from {args.load_agent_a}) ──")
         trainer_a.agent.load(args.load_agent_a)
         log_a = []
@@ -276,9 +489,14 @@ def run_competitive(args):
     print("\n  ── Agent B ──")
     log_b = trainer_b.run(num_rounds=args.rounds, sl_trainer=sl_trainer)
 
+    log_c = []
+    if trainer_c is not None and not args.skip_training:
+        print("\n  ── Agent C ──")
+        log_c = trainer_c.run(num_rounds=args.rounds, sl_trainer=sl_trainer)
+
     # ── Stage 3: 评估 ───────────────────────────────────────────────────────
     print("\n[Stage 3] Evaluation...")
-    h2h_deals = 200 if args.quick else 1000
+    h2h_deals = 200 if args.quick else args.eval_deals
 
     # sl_trainer already built before Stage 2
 
@@ -294,51 +512,108 @@ def run_competitive(args):
 
     # ── A vs B ─────────────────────────────────────────────────────────────
     print("\n  → Agent A vs Agent B")
-    h2h = trainer_a.evaluate_head_to_head(
+    h2h_ab = trainer_a.evaluate_head_to_head(
         trainer_b, num_deals=h2h_deals, label_self="A", label_other="B")
 
-    # Belief Net 评估（Agent B only）
-    if cfg_b.use_info_bonus:
-        print("\n  → Belief Network Evaluation (Agent B):")
-        trainer_b.evaluate_belief(num_deals=50 if args.quick else 200)
+    # ── Agent C evaluations ───────────────────────────────────────────────
+    h2h_c_sl = h2h_ac = h2h_bc = None
+    if trainer_c is not None:
+        print("\n  → Agent C vs SL baseline")
+        h2h_c_sl = trainer_c.evaluate_head_to_head(
+            sl_trainer, num_deals=h2h_deals, label_self="C", label_other="SL")
 
-    # ── P97c: Partner Info Gain diagnostic (A vs B, same belief net) ──
+        print("\n  → Agent A vs Agent C")
+        h2h_ac = trainer_a.evaluate_head_to_head(
+            trainer_c, num_deals=h2h_deals, label_self="A", label_other="C")
+
+        print("\n  → Agent B vs Agent C")
+        h2h_bc = trainer_b.evaluate_head_to_head(
+            trainer_c, num_deals=h2h_deals, label_self="B", label_other="C")
+
+    # Belief Net 评估
+    for name, trainer, cfg in [('B', trainer_b, cfg_b), ('C', trainer_c, cfg_c)]:
+        if trainer is not None and cfg is not None and cfg.use_info_bonus:
+            print(f"\n  → Belief Network Evaluation (Agent {name}):")
+            trainer.evaluate_belief(num_deals=50 if args.quick else 200)
+
+    # ── P97c: Partner Info Gain diagnostic ──
+    # Use B's belief net as the shared judge (for A vs B comparison)
+    # Use C's belief net for C comparison if available
     if cfg_b.use_info_bonus and trainer_b.belief_net is not None:
         diag_deals = 100 if args.quick else 500
-        print(f"\n  → Partner Info Gain Diagnostic ({diag_deals} deals, B's belief net as judge)")
-        print("\n  Agent A (no r_info):")
+        print(f"\n  → Partner Info Gain Diagnostic ({diag_deals} deals)")
+
+        # Judge: B's belief net (for A vs B comparison)
+        print(f"\n  [Judge: B's belief net]")
+        print("  Agent A (no r_info):")
         pig_a = trainer_a.evaluate_partner_info_gain(
             trainer_b.belief_net, num_deals=diag_deals)
-        print("\n  Agent B (with r_info):")
+        print("  Agent B (r_info, β=0):")
         pig_b = trainer_b.evaluate_partner_info_gain(
             trainer_b.belief_net, num_deals=diag_deals)
-        diff = pig_b['mean_partner_gain'] - pig_a['mean_partner_gain']
-        print(f"\n  [Δ partner_gain] B - A = {diff:+.4f}"
-              f"  ({'B communicates more' if diff > 0 else 'A communicates more'})")
+        diff_ba = pig_b['mean_partner_gain'] - pig_a['mean_partner_gain']
+        print(f"\n  [Δ partner_gain] B - A = {diff_ba:+.4f}"
+              f"  ({'B communicates more' if diff_ba > 0 else 'A communicates more'})")
+
+        if trainer_c is not None and trainer_c.belief_net is not None:
+            print(f"\n  [Judge: C's belief net]")
+            print(f"  Agent C (r_info, β={_beta_c}):")
+            pig_c = trainer_c.evaluate_partner_info_gain(
+                trainer_c.belief_net, num_deals=diag_deals)
+            diff_ca = pig_c['mean_partner_gain'] - pig_a['mean_partner_gain']
+            diff_cb = pig_c['mean_partner_gain'] - pig_b['mean_partner_gain']
+            print(f"\n  [Δ partner_gain] C - A = {diff_ca:+.4f}")
+            print(f"  [Δ partner_gain] C - B = {diff_cb:+.4f}")
 
     # ── 排雷诊断 ────────────────────────────────────────────────────────────
     print("\n[Diagnostics]")
-    _print_diagnostics(log_a, log_b, cfg_b)
+    _print_diagnostics(log_a, log_b, cfg_b, log_c=log_c, cfg_c=cfg_c)
 
     # ── 最终摘要 ────────────────────────────────────────────────────────────
-    print("\n" + "═" * 60)
-    print("  FINAL SUMMARY")
-    print("═" * 60)
+    print("\n" + "═" * 72)
+    print("  FINAL SUMMARY (P100: BCA standard for all agents)")
+    print("═" * 72)
     print(f"  A vs SL:  {h2h_a_sl['mean_imp']:+.3f} ± {h2h_a_sl['std_imp']:.3f} IMP  "
           f"p={h2h_a_sl['p_value']:.3f} {'✅' if h2h_a_sl['significant'] else '(ns)'}")
     print(f"  B vs SL:  {h2h_b_sl['mean_imp']:+.3f} ± {h2h_b_sl['std_imp']:.3f} IMP  "
           f"p={h2h_b_sl['p_value']:.3f} {'✅' if h2h_b_sl['significant'] else '(ns)'}")
-    print(f"  A vs B:   {h2h['mean_imp']:+.3f} ± {h2h['std_imp']:.3f} IMP  "
-          f"p={h2h['p_value']:.3f} {'✅' if h2h['significant'] else '(ns)'}")
+    if h2h_c_sl:
+        print(f"  C vs SL:  {h2h_c_sl['mean_imp']:+.3f} ± {h2h_c_sl['std_imp']:.3f} IMP  "
+              f"p={h2h_c_sl['p_value']:.3f} {'✅' if h2h_c_sl['significant'] else '(ns)'}")
+    print(f"  ──────────────────────────────────────────────")
+    print(f"  A vs B:   {h2h_ab['mean_imp']:+.3f} ± {h2h_ab['std_imp']:.3f} IMP  "
+          f"p={h2h_ab['p_value']:.3f} {'✅' if h2h_ab['significant'] else '(ns)'}")
+    if h2h_ac:
+        print(f"  A vs C:   {h2h_ac['mean_imp']:+.3f} ± {h2h_ac['std_imp']:.3f} IMP  "
+              f"p={h2h_ac['p_value']:.3f} {'✅' if h2h_ac['significant'] else '(ns)'}")
+    if h2h_bc:
+        print(f"  B vs C:   {h2h_bc['mean_imp']:+.3f} ± {h2h_bc['std_imp']:.3f} IMP  "
+              f"p={h2h_bc['p_value']:.3f} {'✅' if h2h_bc['significant'] else '(ns)'}")
+
     # Conclusion
-    if h2h['mean_imp'] < 0 and h2h['significant']:
-        conclusion = "✅ B significantly better than A"
-    elif h2h['mean_imp'] > 0 and h2h['significant']:
-        conclusion = "⚠️  A outperforms B"
+    print(f"  ──────────────────────────────────────────────")
+    _results = [('A', h2h_a_sl), ('B', h2h_b_sl)]
+    if h2h_c_sl:
+        _results.append(('C', h2h_c_sl))
+    best_agent = max(_results, key=lambda x: x[1]['mean_imp'])
+    print(f"  Best vs SL: Agent {best_agent[0]} ({best_agent[1]['mean_imp']:+.3f} IMP)")
+
+    # Core hypothesis: B > A? C > B?
+    if h2h_ab['mean_imp'] < 0 and h2h_ab['significant']:
+        print(f"  ✅ B > A: r_info (partner-only) helps with BCA")
+    elif h2h_ab['mean_imp'] > 0 and h2h_ab['significant']:
+        print(f"  ⚠️  A > B: r_info hurts with BCA")
     else:
-        conclusion = "❌ No significant difference"
-    print(f"  Conclusion: {conclusion}")
-    print("═" * 60)
+        print(f"  — A ≈ B: r_info has no significant effect with BCA")
+
+    if h2h_bc:
+        if h2h_bc['mean_imp'] > 0 and h2h_bc['significant']:
+            print(f"  ✅ B > C: partner-only r_info better than dual (β hurts)")
+        elif h2h_bc['mean_imp'] < 0 and h2h_bc['significant']:
+            print(f"  ✅ C > B: β opponent penalty adds value")
+        else:
+            print(f"  — B ≈ C: β opponent penalty has no significant effect")
+    print("═" * 72)
 
     # ── 保存 checkpoint ─────────────────────────────────────────────────────
     if args.save_dir:
@@ -346,11 +621,17 @@ def run_competitive(args):
         os.makedirs(args.save_dir, exist_ok=True)
         trainer_a.agent.save(os.path.join(args.save_dir, f'agent_a_seed{args.seed}.pt'))
         trainer_b.agent.save(os.path.join(args.save_dir, f'agent_b_seed{args.seed}.pt'))
+        if trainer_c is not None:
+            trainer_c.agent.save(os.path.join(args.save_dir, f'agent_c_seed{args.seed}.pt'))
         report = {
-            'seed': args.seed, 'beta': args.beta, 'rounds': args.rounds,
+            'seed': args.seed, 'beta_b': 0.0, 'beta_c': _beta_c if trainer_c else None,
+            'rounds': args.rounds,
             'a_vs_sl': h2h_a_sl,
             'b_vs_sl': h2h_b_sl,
-            'a_vs_b': h2h,
+            'c_vs_sl': h2h_c_sl,
+            'a_vs_b': h2h_ab,
+            'a_vs_c': h2h_ac,
+            'b_vs_c': h2h_bc,
         }
         report_path = os.path.join(args.save_dir, f'report_seed{args.seed}.json')
         with open(report_path, 'w') as f:
@@ -358,7 +639,8 @@ def run_competitive(args):
         print(f"\n  Checkpoints + report saved → {args.save_dir}")
 
 
-def _print_diagnostics(log_a: list, log_b: list, cfg_b: SubgameConfig):
+def _print_diagnostics(log_a: list, log_b: list, cfg_b: SubgameConfig,
+                       log_c: list = None, cfg_c: SubgameConfig = None):
     """排雷判断：检查训练健康性指标."""
 
     def _last_metric(log: list, player_key: int, metric: str) -> float:
@@ -381,6 +663,7 @@ def _print_diagnostics(log_a: list, log_b: list, cfg_b: SubgameConfig):
     else:
         print(f"  Agent A: (loaded from checkpoint, no training log)")
 
+    # Agent B
     ent_b   = _last_metric(log_b, SOUTH, 'entropy')
     vl_b    = _last_metric(log_b, SOUTH, 'value_loss')
     kl_b    = _last_metric(log_b, SOUTH, 'kl_loss')
@@ -389,29 +672,41 @@ def _print_diagnostics(log_a: list, log_b: list, cfg_b: SubgameConfig):
     vl_b_e  = _last_metric(log_b, EAST, 'value_loss')
     print(f"  Agent B: NS entropy={ent_b:.3f} vl={vl_b:.4f} kl={kl_b:.5f}(λ={klam_b:.3f}) │ EW entropy={ent_b_e:.3f} vl={vl_b_e:.4f}")
 
-    ok = True
-    if ent_b < 0.5:
-        print("  ⚠️  Entropy collapse detected! Consider higher entropy_coef.")
-        ok = False
-    if vl_b > 10:
-        print("  ⚠️  Value loss too high! Consider more critic warmup.")
-        ok = False
-    if kl_b > 0.3:
-        print("  ⚠️  KL too high! Consider higher kl_lambda_start.")
-        ok = False
+    # Agent C
+    if log_c:
+        ent_c   = _last_metric(log_c, SOUTH, 'entropy')
+        vl_c    = _last_metric(log_c, SOUTH, 'value_loss')
+        kl_c    = _last_metric(log_c, SOUTH, 'kl_loss')
+        klam_c  = _last_metric(log_c, SOUTH, 'kl_lambda')
+        ent_c_e = _last_metric(log_c, EAST, 'entropy')
+        vl_c_e  = _last_metric(log_c, EAST, 'value_loss')
+        print(f"  Agent C: NS entropy={ent_c:.3f} vl={vl_c:.4f} kl={kl_c:.5f}(λ={klam_c:.3f}) │ EW entropy={ent_c_e:.3f} vl={vl_c_e:.4f}")
 
-    if cfg_b.use_info_bonus:
-        # ir 健康性: 从日志中找 info_ratio
-        ir_vals = []
-        for entry in log_b:
-            if 'info_ratio' in entry:
-                ir_vals.append(entry['info_ratio'])
-        if ir_vals:
-            mean_ir = np.mean(ir_vals)
-            print(f"  Agent B: mean ir={mean_ir:.4f}")
-            if mean_ir <= 0:
-                print("  ⚠️  ir ≤ 0! Check Belief Net and r_info wiring.")
-                ok = False
+    ok = True
+    for name, log, cfg in [('B', log_b, cfg_b), ('C', log_c, cfg_c)]:
+        if not log or cfg is None:
+            continue
+        _ent = _last_metric(log, SOUTH, 'entropy')
+        _vl  = _last_metric(log, SOUTH, 'value_loss')
+        _kl  = _last_metric(log, SOUTH, 'kl_loss')
+        if _ent < 0.5:
+            print(f"  ⚠️  Agent {name}: Entropy collapse detected! Consider higher entropy_coef.")
+            ok = False
+        if _vl > 10:
+            print(f"  ⚠️  Agent {name}: Value loss too high! Consider more critic warmup.")
+            ok = False
+        if _kl > 0.3:
+            print(f"  ⚠️  Agent {name}: KL too high! Consider higher kl_lambda_start.")
+            ok = False
+
+        if cfg.use_info_bonus:
+            ir_vals = [entry.get('info_ratio', None) for entry in log if 'info_ratio' in entry]
+            if ir_vals:
+                mean_ir = np.mean(ir_vals)
+                print(f"  Agent {name}: mean ir={mean_ir:.4f}")
+                if mean_ir <= 0:
+                    print(f"  ⚠️  Agent {name}: ir ≤ 0! Check Belief Net and r_info wiring.")
+                    ok = False
 
     if ok:
         print("  ✅ All diagnostics passed.")
@@ -592,8 +887,15 @@ def parse_args():
     parser.add_argument('--data', '--competitive_data', default='data/competitive_100k.npz',
                         help='Path to DDS data (npz)')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--beta', type=float, default=0.05,
-                        help='Internal β: r_info = I(partner) - β·I(opponent)')
+    parser.add_argument('--beta', type=float, default=0.0,
+                        help='P100: β for Agent B. Default 0.0 (partner-only r_info). '
+                             'Agent B tests: does partner information shaping alone help?')
+    parser.add_argument('--beta_c', type=float, default=0.05,
+                        help='P100: β for Agent C (dual-information with opponent penalty). '
+                             'Agent C tests: does the opponent leakage term add value?')
+    parser.add_argument('--no_agent_c', action='store_true',
+                        help='P100: Skip Agent C (only train A and B). '
+                             'Useful for quick debugging or when β ablation is not needed.')
     parser.add_argument('--info_weight', type=float, default=0.2,
                         help='r_info as fraction of IMP variance (P87b: 0.02→0.2, step_ir≈1.4)')
     parser.add_argument('--rounds', type=int, default=10,
@@ -604,9 +906,10 @@ def parse_args():
                         help='Rounds of data collection for Belief Net pretrain (P97b: 50, total=100k deals)')
     parser.add_argument('--belief_pretrain_max_epochs', type=int, default=50,
                         help='Max training epochs for Belief Net pretrain (P97b: 50, big data needs fewer epochs)')
-    parser.add_argument('--sl_checkpoint', default='results/sl_base.pt',
-                        help='SL pretrained checkpoint (4-actor format from sl_pretrain.py). '
-                             'Standard: sl_base.pt (301-dim); BCA: sl_base_bca.pt (349-dim).')
+    parser.add_argument('--sl_checkpoint', default='results/sl_base_bca.pt',
+                        help='SL pretrained checkpoint (4-actor format). '
+                             'P100 default: sl_base_bca.pt (397-dim BCA). '
+                             'Use sl_base.pt for legacy 301-dim experiments.')
     parser.add_argument('--save_dir', default='results/competitive',
                         help='Directory to save checkpoints')
     parser.add_argument('--load_agent_a', default=None,
@@ -614,12 +917,22 @@ def parse_args():
                         'If set, skip A training and load directly.')
     parser.add_argument('--ewc_lambda', type=float, default=100.0,
                         help='EWC penalty strength for Belief Net (P97, normalized Fisher, default: 100)')
+    parser.add_argument('--no_belief_conditioned', action='store_true',
+                        help='P100: Disable BCA (revert to 301-dim input). '
+                        'By default, ALL agents use belief-conditioned actors (397-dim). '
+                        'Use this flag for backward-compatible 301-dim experiments.')
     parser.add_argument('--belief_conditioned', action='store_true',
-                        help='P98: Belief-Conditioned Actor (349-dim input). '
-                        'Actor receives belief features as input, closing the '
-                        'sender→receiver→decision loop. Enables relaxed KL.')
+                        help='(Deprecated, now default) Kept for backward compatibility. '
+                        'BCA is always on unless --no_belief_conditioned is set.')
     parser.add_argument('--kl_lambda', type=float, default=None,
-                        help='KL anchor strength. Default: 0.0 if --belief_conditioned, 0.3 otherwise')
+                        help='KL anchor strength. Default: 0.3→0.0 anneal if --belief_conditioned, 0.3 fixed otherwise')
+    parser.add_argument('--entropy_coef', type=float, default=0.01,
+                        help='Entropy coefficient for PPO (P98b: 0.01, was 1e-3 in P97d)')
+    parser.add_argument('--eval_deals', type=int, default=1000,
+                        help='Number of deals for Stage 3 evaluation (default 1000, use 5000 for paper)')
+    parser.add_argument('--skip_training', action='store_true',
+                        help='Skip Stage 2 (RL training), load checkpoints from --save_dir, '
+                             'run Stage 3 evaluation only. Requires prior training run.')
 
     # ── Eval-only mode (absorbed from eval_paired.py) ────────────────
     parser.add_argument('--eval-only', action='store_true',
