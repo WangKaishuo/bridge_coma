@@ -13,7 +13,7 @@ OpenSpiel → 我们的环境 动作映射：
   89        → BID_REDOUBLE (2)
 
 SL预训练目标：
-  给定当前玩家的 flat_obs (301维)，预测该步叫品（交叉熵损失）。
+  给定当前玩家的 flat_obs (480维, P104 OpenSpiel标准)，预测该步叫品（交叉熵损失）。
   覆盖所有四方，dealer轮换。
 
 用法：
@@ -109,9 +109,11 @@ class SAYCDataset(Dataset):
                 # 发牌
                 deck  = np.array(nums[:52], dtype=np.uint8)
                 hands = np.zeros((4, 52), dtype=np.float32)
-                for card, player in enumerate(deck):
-                    if player < 4:
-                        hands[player, card] = 1.0
+                # SAYC format: deck[position] = card_id (0-51)
+                # positions 0-12 = player 0, 13-25 = player 1, etc.
+                for player in range(4):
+                    for card_id in deck[player * 13 : (player + 1) * 13]:
+                        hands[player, card_id] = 1.0
 
                 # dealer 轮换
                 dealer = line_idx % NUM_PLAYERS

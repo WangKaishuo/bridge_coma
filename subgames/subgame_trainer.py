@@ -2,14 +2,14 @@
 Subgame Trainer  (新架构版)
 ============================
 
-适配 301 维 MLP Actor（无 LSTM），HAPPO 独立 Critic，FSP pool，KL anchor。
+适配 480 维 MLP Actor (P104 OpenSpiel标准)（无 LSTM），HAPPO 独立 Critic，FSP pool，KL anchor。
 
 核心变化（vs 旧版）:
-1. collect_episodes 用 encode_obs_flat 生成 flat_obs (301,)，
+1. collect_episodes 用 encode_obs_flat 生成 flat_obs (480,)，
    不再存 {'hand', 'history', 'position', 'vulnerability'} 字典。
    Buffer 只存 flat_obs + legal_actions + all_hands。
-   P101: belief_conditioned 模式下 flat_obs = 397 维
-   (301 base + 48 partner belief + 48 RHO belief)
+   P101: belief_conditioned 模式下 flat_obs = 576 维
+   (480 base + 48 partner belief + 48 RHO belief)
 
 2. FSP pool 集成：每 fsp_add_interval 轮将 actor snapshot 存入 pool，
    rollout 时对手从 pool 中随机采样（anti-cycling）。
@@ -114,8 +114,8 @@ class SubgameConfig:
     ewc_fisher_samples:   int   = 5000        # Samples for Fisher computation
 
     # ── P98/P101: Belief-Conditioned Actor ─────────────────────────────
-    belief_conditioned:   bool  = False       # P101: Actor input includes belief features (397 dim)
-    # When True: obs_dim = 397 (301 base + 48 partner belief + 48 RHO belief)
+    belief_conditioned:   bool  = False       # P101: Actor input includes belief features (576 dim)
+    # When True: obs_dim = 576 (480 base + 48 partner belief + 48 RHO belief)
     # Requires belief_net to be available (use_info_bonus=True or standalone belief)
     # Enables the Convention Card Protocol for Full Disclosure evaluation
     belief_warmup_rounds: int   = 2           # P98b: rounds using prior features instead of belief net
@@ -223,7 +223,7 @@ class BeliefReplayBuffer:
 
 class FlatRolloutBuffer:
     """
-    存储 flat_obs (301,) + legal_actions (38,) + all_hands (4,52).
+    存储 flat_obs (480,) + legal_actions (38,) + all_hands (4,52).
 
     区别于旧版 RolloutBuffer（存字典 obs）:
         - flat_obs 已经是 tensor-ready 的一维向量，无需重新 encode
@@ -329,7 +329,7 @@ class SubgameTrainer:
         self.active_players = config.active_players or list(range(NUM_PLAYERS))
 
         # ── HAPPO Agent ────────────────────────────────────────────────────
-        # P101: belief_conditioned mode uses 397-dim input for Actor & Critic
+        # P101: belief_conditioned mode uses 576-dim input for Actor & Critic
         _obs_dim = BELIEF_OBS_DIM if config.belief_conditioned else OBS_DIM
         mappo_cfg = MAPPOConfig(
             lr              = config.lr,
@@ -412,17 +412,17 @@ class SubgameTrainer:
             print("[BC Warmup] No data generated, skipping.")
             return
 
-        flat_obs_np = np.stack([d['flat_obs'] for d in data])  # (N, 301)
+        flat_obs_np = np.stack([d['flat_obs'] for d in data])  # (N, 480)
         actions_np  = np.array([d['action']   for d in data], dtype=np.int64)
         legal_np    = np.ones((len(data), NUM_BIDS), dtype=np.float32)  # BC 不限制
 
         # P101: pad with belief prior (96-dim) when belief_conditioned
         # During BC warmup, no belief net is trained yet → use uniform prior.
-        # This ensures actor learns on 397-dim input from the start.
+        # This ensures actor learns on 576-dim input from the start.
         if self.config.belief_conditioned:
             prior = make_belief_features_prior()  # (96,)
             prior_batch = np.tile(prior, (len(data), 1))  # (N, 96)
-            flat_obs_np = np.concatenate([flat_obs_np, prior_batch], axis=1)  # (N, 397)
+            flat_obs_np = np.concatenate([flat_obs_np, prior_batch], axis=1)  # (N, 576)
 
         flat_t   = torch.tensor(flat_obs_np, dtype=torch.float32)
         actions_t = torch.tensor(actions_np, dtype=torch.int64)
@@ -1609,8 +1609,8 @@ class SubgameTrainer:
         """
         P101: 统一的 actor 输入编码.
 
-        base mode (301-dim):         encode_obs_flat(obs, dealer, history_int)
-        belief-conditioned (397-dim): base + partner_belief(48) + rho_belief(48)
+        base mode (480-dim):         encode_obs_flat(obs, dealer, history_int)
+        belief-conditioned (576-dim): base + partner_belief(48) + rho_belief(48)
 
         所有 policy closure 和 rollout 都应使用此方法。
         """

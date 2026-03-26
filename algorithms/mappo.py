@@ -2,13 +2,13 @@
 MAPPO (Multi-Agent PPO) — HAPPO: 独立 Actor + 独立 Centralized Critic
 ======================================================================
 
-新架构变更（对齐 301 维 MLP policy_net.py）:
+新架构变更（对齐 480 维 MLP (P104 OpenSpiel标准) policy_net.py）:
 
 1. MAPPOConfig 新增 hidden_dim=1024（旧的 hand_dim/history_dim/lstm_layers
    已废弃但保留，避免旧代码 dataclass 初始化报错）。
 
-2. _make_actor() 改用 MLPPolicyNetwork(obs_dim=301, hidden_dim)；
-   _make_critic() 改用 MLPValueNetwork(obs_dim=301, hidden_dim, centralized=True)。
+2. _make_actor() 改用 MLPPolicyNetwork(obs_dim=480, hidden_dim)；
+   _make_critic() 改用 MLPValueNetwork(obs_dim=480, hidden_dim, centralized=True)。
    两者接口从 (obs_dict, all_hands) 改为 (flat_obs, legal_actions, all_hands)。
 
 3. _HAPPOModel.get_action_and_value 签名对应更新，
@@ -62,7 +62,7 @@ class MAPPOConfig(PPOConfig):
     """
     # ── 网络 ────────────────────────────────────────────────────────────────
     hidden_dim:         int   = 1024      # 覆盖 PPOConfig.hidden_dim=256
-    obs_dim:            int   = OBS_DIM   # 301
+    obs_dim:            int   = OBS_DIM   # 480 (P104)
 
     # ── Critic ──────────────────────────────────────────────────────────────
     centralized_critic: bool  = True
@@ -262,7 +262,7 @@ class MAPPOAgent:
         deterministic: bool = False,
     ) -> Tuple[int, Dict]:
         """
-        给定 flat_obs (301,) 和 legal_actions (38,)，返回 (action_int, extras).
+        给定 flat_obs (480,) 和 legal_actions (38,)，返回 (action_int, extras).
 
         extras: {'log_prob': Tensor, 'value': Tensor}
         """

@@ -2,7 +2,7 @@
 SL Pretrain with Belief-Conditioned Actor (P98, P100, P101)
 =============================================================
 
-Two-stage SL pretraining for 397-dim belief-conditioned actors:
+Two-stage SL pretraining for 576-dim belief-conditioned actors:
 
 Stage A: Train Belief Net on SAYC data
   - Replay SAYC games, collect (observer_hand, history, observer_pos,
@@ -13,18 +13,18 @@ Stage A: Train Belief Net on SAYC data
     ~3× more samples than partner-only mode.
   - Train Belief Net to predict target hand features (48-dim)
 
-Stage B: Train 397-dim Actor on SAYC data with Belief Net features
+Stage B: Train 576-dim Actor on SAYC data with Belief Net features
   - Replay SAYC games, at each step:
-    1. Encode base obs (301-dim) via encode_obs_flat
+    1. Encode base obs (480-dim) via encode_obs_flat
     2. Query Belief Net for partner hand prediction (48-dim)
     3. Query Belief Net for RHO hand prediction (48-dim)
-    4. Concatenate → 397-dim input
+    4. Concatenate → 576-dim input
     5. Train Actor on cross-entropy loss
 
 Output: sl_base_bca.pt containing:
-  - actor_n/s/e/w: 397-dim MLPPolicyNetwork state_dicts
+  - actor_n/s/e/w: 576-dim MLPPolicyNetwork state_dicts
   - belief_net: BeliefNetwork state_dict
-  - obs_dim: 397
+  - obs_dim: 576
 
 Usage:
   python sl_pretrain_bca.py \
@@ -93,23 +93,20 @@ def collect_all_data_from_sayc(
 ) -> List[dict]:
     """
     Stage A data collection: replay SAYC games and return belief training samples.
-    Each sample: {observer_hand, history (60×NUM_BIDS), observer_pos,
-                  target_pos, target_features}.
+    Each sample: {observer_hand (52,), hist_presence (NUM_BIDS,) bool,
+                  observer_pos, target_pos, target_features (48,)}.
+
+    P101 memory fix: stores hist_presence (38 bool = 38 bytes) instead of
+    full hist_enc (60×38 float32 = 9120 bytes). 240× memory reduction.
+    BeliefNetwork.encode_history_flat does max-pool anyway, so a (1, 38)
+    fake history with bid-presence flags is equivalent.
 
     P100: When include_opponent_targets=True (default), also collect samples
     with target=LHO and target=RHO for each observer. This teaches the Belief
     Network to predict ANY player's hand from the bidding, not just partner's.
-    Needed for:
-      - r_info's opponent term: I(bid; hand | opponent)
-      - Future convention-sharing evaluation
-      - General-purpose belief inference
-
-    The BeliefNetwork architecture already supports arbitrary (observer, target)
-    via position embeddings — this change only affects training data.
     With opponent targets: ~3× more samples (partner + LHO + RHO per step).
     """
     env = BridgeBiddingEnv(max_history_len=60)
-    max_len = 60
     samples = []
 
     print(f"[Belief Data] Collecting from {filepath}..."
@@ -127,9 +124,11 @@ def collect_all_data_from_sayc(
 
             deck = np.array(nums[:52], dtype=np.uint8)
             hands = np.zeros((4, 52), dtype=np.float32)
-            for card, player in enumerate(deck):
-                if player < 4:
-                    hands[player, card] = 1.0
+            # SAYC format: deck[position] = card_id (0-51)
+            # positions 0-12 = player 0, 13-25 = player 1, etc.
+            for player in range(4):
+                for card_id in deck[player * 13 : (player + 1) * 13]:
+                    hands[player, card_id] = 1.0
 
             dealer = line_idx % NUM_PLAYERS
             obs = env.reset(hands, dealer=dealer)
@@ -147,9 +146,10 @@ def collect_all_data_from_sayc(
                 lho     = (player + 1) % 4   # left-hand opponent
                 rho     = (player + 3) % 4   # right-hand opponent
 
-                hist_enc = np.zeros((max_len, NUM_BIDS), dtype=np.float32)
-                for i, bid in enumerate(history_int[-max_len:]):
-                    hist_enc[i, bid] = 1.0
+                # Compact history: bool bitmap of which bids have appeared
+                hist_presence = np.zeros(NUM_BIDS, dtype=bool)
+                for bid in history_int:
+                    hist_presence[bid] = True
 
                 # P100: collect targets for partner + both opponents
                 targets = [partner]
@@ -159,7 +159,7 @@ def collect_all_data_from_sayc(
                 for target in targets:
                     samples.append({
                         'observer_hand':   hands[player].copy(),
-                        'history':         hist_enc,
+                        'hist_presence':   hist_presence,
                         'observer_pos':    player,
                         'target_pos':      target,
                         'target_features': hand_to_belief_target(hands[target]),
@@ -197,10 +197,10 @@ def collect_stage_b_data(
 ) -> dict:
     """
     Lightweight single-pass replay for Stage B only.
-    Collects base_obs (301), hist_presence (38 bool), actions, positions.
+    Collects base_obs (480), hist_presence (38 bool), actions, positions.
     Does NOT build hist_enc (60×38) — ~10× faster than collect_all_data_from_sayc.
 
-    P101: Also collects rho_pos for RHO belief query in 397-dim mode.
+    P101: Also collects rho_pos for RHO belief query in 576-dim mode.
 
     Returns dict with: base_obs, actions, observer_hands,
                        hist_presence, observer_pos, partner_pos, rho_pos
@@ -229,9 +229,11 @@ def collect_stage_b_data(
 
             deck = np.array(nums[:52], dtype=np.uint8)
             hands = np.zeros((4, 52), dtype=np.float32)
-            for card, player in enumerate(deck):
-                if player < 4:
-                    hands[player, card] = 1.0
+            # SAYC format: deck[position] = card_id (0-51)
+            # positions 0-12 = player 0, 13-25 = player 1, etc.
+            for player in range(4):
+                for card_id in deck[player * 13 : (player + 1) * 13]:
+                    hands[player, card_id] = 1.0
 
             dealer = line_idx % NUM_PLAYERS
             obs = env.reset(hands, dealer=dealer)
@@ -289,10 +291,10 @@ def build_belief_dataset_from_data(
 ) -> List[Tuple[np.ndarray, int]]:
     """
     P101: Batch-compute belief features from pre-collected data and return
-    (flat_obs_397, action) pairs for SAYCBeliefDataset.
+    (flat_obs_576, action) pairs for SAYCBeliefDataset.
 
     Queries belief net twice per sample: partner (48-dim) + RHO (48-dim) = 96-dim.
-    Concatenated with base_obs (301-dim) → 397-dim actor input.
+    Concatenated with base_obs (480-dim) → 576-dim actor input.
 
     Uses hist_presence (N, NUM_BIDS) bool bitmap — lossless compression of
     history for Belief Net input (encode_history_flat does max-pool anyway).
@@ -329,14 +331,14 @@ def build_belief_dataset_from_data(
                 print(f"  {end:,}/{N:,} ({end/N:.0%})")
 
     belief_feats = np.concatenate([partner_feats, rho_feats], axis=1)  # (N, 96)
-    combined = np.concatenate([data['base_obs'], belief_feats], axis=1)  # (N, 397)
+    combined = np.concatenate([data['base_obs'], belief_feats], axis=1)  # (N, 576)
     print(f"[Belief Inference] Done. obs_dim={combined.shape[1]}")
     return list(zip(combined, data['actions']))
 
 
 class SAYCBeliefDataset(Dataset):
     """
-    Thin Dataset wrapper around pre-computed (flat_obs_397, action) pairs.
+    Thin Dataset wrapper around pre-computed (flat_obs_576, action) pairs.
     Build via build_belief_dataset_from_data() before instantiating.
     """
 
@@ -360,20 +362,44 @@ def train_belief_net(
     lr: float = 1e-3,
     hidden_dim: int = 1024,
 ) -> BeliefNetwork:
-    """Train Belief Net on collected SAYC data."""
-    print(f"\n[Stage A] Training Belief Net: {len(samples):,} samples, {epochs} epochs")
+    """
+    Train Belief Net on collected SAYC data.
 
-    oh  = torch.tensor(np.stack([s['observer_hand']    for s in samples]), dtype=torch.float32)
-    h   = torch.tensor(np.stack([s['history']          for s in samples]), dtype=torch.float32)
-    op  = torch.tensor(np.array([s['observer_pos']     for s in samples]), dtype=torch.long)
-    tp  = torch.tensor(np.array([s['target_pos']       for s in samples]), dtype=torch.long)
-    tgt = torch.tensor(np.stack([s['target_features']  for s in samples]), dtype=torch.float32)
-
+    P101 memory fix: samples now use compact hist_presence (38 bool) instead
+    of full hist_enc (60×38 float32). We stack into numpy arrays (not tensors)
+    and convert to tensors only per-batch on GPU. This reduces peak memory
+    from ~50 GB to ~1.5 GB for 5M samples.
+    """
     N = len(samples)
+    print(f"\n[Stage A] Training Belief Net: {N:,} samples, {epochs} epochs")
+
+    # Stack into numpy arrays (compact, stays on CPU)
+    oh  = np.stack([s['observer_hand']    for s in samples])           # (N, 52) float32
+    hp  = np.stack([s['hist_presence']    for s in samples])           # (N, 38) bool
+    op  = np.array([s['observer_pos']     for s in samples], dtype=np.int64)  # (N,)
+    tp  = np.array([s['target_pos']       for s in samples], dtype=np.int64)  # (N,)
+    tgt = np.stack([s['target_features']  for s in samples])           # (N, 48) float32
+
+    # Free the list of dicts to reclaim memory
+    del samples
+
+    # Expand hist_presence to (N, 1, NUM_BIDS) float32 — lossless compression.
+    # BeliefNetwork.forward → encode_history_flat does max-pool over time axis,
+    # so a single-step history with bid-presence flags gives identical results.
+    hp_f = hp.astype(np.float32)[:, np.newaxis, :]   # (N, 1, 38)
+    del hp
+
     # 90/10 train/val split
     perm = np.random.permutation(N)
     n_val = max(1000, N // 10)
     val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+    # Pre-extract small val set to avoid repeated slicing
+    val_oh  = torch.tensor(oh[val_idx],  dtype=torch.float32)
+    val_h   = torch.tensor(hp_f[val_idx], dtype=torch.float32)
+    val_op  = torch.tensor(op[val_idx],  dtype=torch.long)
+    val_tp  = torch.tensor(tp[val_idx],  dtype=torch.long)
+    val_tgt = torch.tensor(tgt[val_idx], dtype=torch.float32)
 
     belief_net = BeliefNetwork(hidden_dim=hidden_dim).to(device)
     opt = torch.optim.Adam(belief_net.parameters(), lr=lr)
@@ -389,11 +415,14 @@ def train_belief_net(
 
         for start in range(0, len(train_idx), batch_size):
             idx = train_idx[start:start + batch_size]
-            loss = belief_net.compute_loss(
-                oh[idx].to(device), h[idx].to(device),
-                op[idx].to(device), tp[idx].to(device),
-                tgt[idx].to(device),
-            )
+            # Convert per-batch to tensor and move to GPU
+            b_oh  = torch.tensor(oh[idx],   dtype=torch.float32).to(device)
+            b_h   = torch.tensor(hp_f[idx], dtype=torch.float32).to(device)
+            b_op  = torch.tensor(op[idx],   dtype=torch.long).to(device)
+            b_tp  = torch.tensor(tp[idx],   dtype=torch.long).to(device)
+            b_tgt = torch.tensor(tgt[idx],  dtype=torch.float32).to(device)
+
+            loss = belief_net.compute_loss(b_oh, b_h, b_op, b_tp, b_tgt)
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(belief_net.parameters(), 0.5)
@@ -401,20 +430,31 @@ def train_belief_net(
             train_loss += loss.item()
             n_batches += 1
 
-        # Validation
+        # Validation (in chunks to avoid GPU OOM on large val sets)
         belief_net.eval()
         with torch.no_grad():
-            val_loss = belief_net.compute_loss(
-                oh[val_idx].to(device), h[val_idx].to(device),
-                op[val_idx].to(device), tp[val_idx].to(device),
-                tgt[val_idx].to(device),
-            ).item()
+            # Val loss on full val set (chunked)
+            val_loss_sum = 0.0
+            val_chunks = 0
+            VAL_CHUNK = 8192
+            for vs in range(0, len(val_idx), VAL_CHUNK):
+                ve = min(vs + VAL_CHUNK, len(val_idx))
+                vl = belief_net.compute_loss(
+                    val_oh[vs:ve].to(device), val_h[vs:ve].to(device),
+                    val_op[vs:ve].to(device), val_tp[vs:ve].to(device),
+                    val_tgt[vs:ve].to(device),
+                ).item()
+                val_loss_sum += vl * (ve - vs)
+                val_chunks += (ve - vs)
+            val_loss = val_loss_sum / max(1, val_chunks)
 
+            # Accuracy on first 2000 val samples
+            n_acc = min(2000, len(val_idx))
             val_probs = belief_net.get_probs(
-                oh[val_idx[:2000]].to(device), h[val_idx[:2000]].to(device),
-                op[val_idx[:2000]].to(device), tp[val_idx[:2000]].to(device),
+                val_oh[:n_acc].to(device), val_h[:n_acc].to(device),
+                val_op[:n_acc].to(device), val_tp[:n_acc].to(device),
             )
-            acc = belief_accuracy(val_probs, tgt[val_idx[:2000]].to(device))
+            acc = belief_accuracy(val_probs, val_tgt[:n_acc].to(device))
 
         avg_train = train_loss / max(1, n_batches)
         if epoch % 5 == 0 or epoch == 1:
@@ -432,7 +472,7 @@ def train_belief_net(
 
 
 # ==============================================================================
-# Stage B: SL Pretrain with Belief Features (397-dim)
+# Stage B: SL Pretrain with Belief Features (576-dim)
 # ==============================================================================
 
 def train_sl_bca(
@@ -451,21 +491,21 @@ def train_sl_bca(
     init_from:   str   = None,
 ):
     """
-    Stage B: Train 397-dim actors on SAYC data with belief features.
+    Stage B: Train 576-dim actors on SAYC data with belief features.
 
-    P101: Actor input = base obs (301) + partner belief (48) + RHO belief (48) = 397.
+    P101: Actor input = base obs (480) + partner belief (48) + RHO belief (48) = 576.
 
-    P99: When init_from is provided (path to sl_base.pt), load 301-dim weights
-    into the 397-dim model with belief columns zero-initialised. This ensures:
-    - Base obs (301-dim) weights start at sl_base.pt quality
+    P99: When init_from is provided (path to sl_base.pt), load 480-dim weights
+    into the 576-dim model with belief columns zero-initialised. This ensures:
+    - Base obs (480-dim) weights start at sl_base.pt quality
     - Belief features (96-dim) influence starts from zero
     - Finetune teaches the model to USE belief features gradually
     - Final model has high-quality base weights + learned belief utilisation
     """
-    print(f"\n[Stage B] SL Pretrain (397-dim BCA: partner + RHO)")
+    print(f"\n[Stage B] SL Pretrain (576-dim BCA: partner + RHO)")
     print(f"  device={device}  epochs={epochs}  batch={batch_size}")
     if init_from:
-        print(f"  init_from={init_from} (301→397 zero-init + finetune)")
+        print(f"  init_from={init_from} (480→576 zero-init + finetune)")
 
     class_weight = torch.ones(NUM_BIDS, device=device)
     class_weight[BID_PASS] = 0.1
@@ -474,7 +514,7 @@ def train_sl_bca(
     train_data = collect_stage_b_data(train_file, max_lines=max_lines)
     valid_data = collect_stage_b_data(valid_file, max_lines=50000)
 
-    # Batched GPU belief inference → (N, 397) combined obs
+    # Batched GPU belief inference → (N, 576) combined obs
     train_samples = build_belief_dataset_from_data(train_data, belief_net, device)
     valid_samples = build_belief_dataset_from_data(valid_data, belief_net, device)
     del train_data, valid_data  # free ~3 GB base arrays
@@ -489,17 +529,17 @@ def train_sl_bca(
 
     model = MLPPolicyNetwork(obs_dim=BELIEF_OBS_DIM, hidden_dim=hidden_dim).to(device)
 
-    # P99: Load 301-dim weights from sl_base.pt, zero-init belief columns
+    # P99: Load 480-dim weights from sl_base.pt, zero-init belief columns
     if init_from and os.path.exists(init_from):
-        ckpt_301 = torch.load(init_from, map_location=device)
+        ckpt_base = torch.load(init_from, map_location=device)
         # sl_base.pt stores actor_n/s/e/w — all identical, use any one
         sl_key = None
         for k in ['actor_s', 'actor_n', 'actor_e', 'actor_w']:
-            if k in ckpt_301:
+            if k in ckpt_base:
                 sl_key = k
                 break
         if sl_key:
-            sl_sd = {k: v.to(device) for k, v in ckpt_301[sl_key].items()}
+            sl_sd = {k: v.to(device) for k, v in ckpt_base[sl_key].items()}
             target_sd = model.state_dict()
             for param_name, sl_val in sl_sd.items():
                 if param_name in target_sd:
@@ -507,19 +547,19 @@ def train_sl_bca(
                     if sl_val.shape == tgt_shape:
                         target_sd[param_name] = sl_val
                     elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
-                        # First layer: (hidden, 397) ← (hidden, 301) + zeros
-                        # or (hidden, 397) ← (hidden, 349) + zeros for 349→397 upgrade
+                        # First layer: (hidden, 576) ← (hidden, 480) + zeros
+                        # or (hidden, 576) ← (hidden, 349) + zeros for 349→576 upgrade
                         target_sd[param_name][:, :sl_val.shape[1]] = sl_val
                         target_sd[param_name][:, sl_val.shape[1]:] = 0.0
                     else:
                         target_sd[param_name] = sl_val
             model.load_state_dict(target_sd)
-            print(f"  [P99] Loaded 301-dim weights from {init_from} ({sl_key}), "
+            print(f"  [P99] Loaded 480-dim weights from {init_from} ({sl_key}), "
                   f"belief columns zero-init")
 
             # P99/P101: Freeze all parameters, then unfreeze only what needs training.
-            # Strategy: only train net.0.weight[:, 301:397] (belief columns) and
-            # net.0.bias. All other layers are frozen — 301-dim quality preserved.
+            # Strategy: only train net.0.weight[:, 480:576] (belief columns) and
+            # net.0.bias. All other layers are frozen — 480-dim quality preserved.
             # This allows higher lr (3e-4) without destroying base weights.
             for param in model.parameters():
                 param.requires_grad_(False)
@@ -528,7 +568,7 @@ def train_sl_bca(
             model.net[0].bias.requires_grad_(True)
             # We'll mask gradients for the base columns in the training loop
             _freeze_base_cols = True
-            _base_dim = sl_val.shape[1]  # 301
+            _base_dim = sl_val.shape[1]  # 480 (base obs dim)
             print(f"  [P99] Frozen all layers except net.0 (belief columns + bias)")
         else:
             print(f"  ⚠️  No actor found in {init_from}, training from scratch")
@@ -566,7 +606,7 @@ def train_sl_bca(
 
             opt.zero_grad()
             loss.backward()
-            # P99: Zero out gradients on base columns ([:, :301]) to preserve them
+            # P99: Zero out gradients on base columns ([:, :480]) to preserve them
             if _freeze_base_cols:
                 with torch.no_grad():
                     model.net[0].weight.grad[:, :_base_dim] = 0.0
@@ -658,8 +698,8 @@ def main():
                    help='Lines for Belief Net training (default 200k ≈ 1.7M samples). '
                         'Independent of --max_lines.')
     p.add_argument('--init_from', type=str, default=None,
-                   help='P99/P101: Path to sl_base.pt (301-dim) or sl_base_bca.pt (349-dim). '
-                        'Stage B will load these weights into 397-dim model with belief '
+                   help='P99/P101: Path to sl_base.pt (480-dim) or sl_base_bca.pt (576-dim). '
+                        'Stage B will load these weights into 576-dim model with belief '
                         'columns zero-init, then finetune.')
     args = p.parse_args()
 
@@ -679,10 +719,10 @@ def main():
     )
     del belief_samples  # free ~15 GB before Stage B
 
-    # ── Stage B: Train 397-dim Actor ──────────────────────────────────
+    # ── Stage B: Train 576-dim Actor ──────────────────────────────────
     # collect_stage_b_data reads the full file (or --max_lines),
     # stores only lightweight fields (no 60×38 hist_enc).
-    print("\n[Stage B] Training 397-dim Actor (partner + RHO belief)...")
+    print("\n[Stage B] Training 576-dim Actor (partner + RHO belief)...")
     train_sl_bca(
         train_file  = args.train,
         valid_file  = args.valid,

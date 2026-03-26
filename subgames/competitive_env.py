@@ -197,7 +197,7 @@ def generate_rule_based_bc_data(
             if not inner_env._is_valid_action(action):
                 action = BID_PASS
 
-            # 编码当前状态为 301 维
+            # 编码当前状态为 480 维 (P104 OpenSpiel标准)
             flat = encode_obs_flat(obs, dealer, history)
             data.append({'flat_obs': flat, 'action': action})
 
@@ -317,11 +317,13 @@ class CompetitiveSubgameEnv:
         对于 prefetch 数据，dealer 已经在 _prefetch 时确定。
         """
         if self._is_constrained_data:
-            # Pre-generated data: N=opener, E=overcaller. Rotate to random dealer.
+            # Pre-generated data: N(pos0)=opener, E(pos1)=overcaller.
+            # To make dealer=rotation be the opener, we need opener(pos0) → pos(rotation).
+            # np.roll(+k) shifts pos0 → posk. (NOT -k, which was a bug!)
             hands, dd_table = self.loader.sample_one()
             rotation = np.random.randint(NUM_PLAYERS)
-            hands    = np.roll(hands, -rotation, axis=0)     # shift player seats
-            dd_table = np.roll(dd_table, -rotation, axis=1)  # shift declarer axis
+            hands    = np.roll(hands, rotation, axis=0)      # opener(0) → pos(rotation)
+            dd_table = np.roll(dd_table, rotation, axis=1)   # declarer axis matches
             self._sampled_dealer = rotation
             return hands, dd_table
 
