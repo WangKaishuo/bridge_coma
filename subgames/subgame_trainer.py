@@ -5,11 +5,9 @@ Subgame Trainer  (新架构版)
 适配 480 维 MLP Actor (P104 OpenSpiel标准)（无 LSTM），HAPPO 独立 Critic，FSP pool，KL anchor。
 
 核心变化（vs 旧版）:
-1. collect_episodes 用 encode_obs_flat 生成 flat_obs (480,)，
-   不再存 {'hand', 'history', 'position', 'vulnerability'} 字典。
-   Buffer 只存 flat_obs + legal_actions + all_hands。
-   P101: belief_conditioned 模式下 flat_obs = 576 维
-   (480 base + 48 partner belief + 48 RHO belief)
+1. collect_episodes 用 OpenSpiel state.observation_tensor() 生成 flat_obs (571,)。
+   P108: encode_obs_flat 已移除，统一使用 hands_to_openspiel_state + get_openspiel_obs。
+   belief_conditioned 模式下 flat_obs = 667 维 (571 base + 48 partner + 48 RHO belief)。
 
 2. FSP pool 集成：每 fsp_add_interval 轮将 actor snapshot 存入 pool，
    rollout 时对手从 pool 中随机采样（anti-cycling）。
@@ -39,15 +37,22 @@ from typing import Dict, List, Optional, Tuple
 from env import NUM_PLAYERS, NUM_BIDS, BID_PASS, NORTH, EAST, SOUTH, WEST
 from networks.belief_net import BeliefNetwork, DualInfoComputer
 from networks.policy_net import (
-    MLPPolicyNetwork, MLPValueNetwork, encode_obs_flat, OBS_DIM,
+    MLPPolicyNetwork, MLPValueNetwork, OBS_DIM,
     BELIEF_OBS_DIM, BELIEF_FEAT_DIM, make_belief_features_prior,
     append_belief_features,
+    convert_hands_suit_to_rank, hands_to_openspiel_state,
+    get_openspiel_obs, ours_to_openspiel_raw,
 )
 from algorithms.mappo import MAPPOAgent, MAPPOConfig
 from utils.running_stats import RunningStats
 from utils.hand_features import hand_to_belief_target, belief_accuracy, BELIEF_DIM
 from utils.fsp_pool import FSPPool
 from utils.imp import score_to_imp
+
+# P109: max entries for _encode_for_actor obs/state caches per trainer instance.
+# A rollout batch of 512 deals × ~8 steps × 4 players ≈ 16k unique (hands, hist) keys.
+# 32k gives comfortable headroom while staying well under 1 GB memory.
+_OBS_CACHE_MAX = 32_768
 
 
 # ==============================================================================
@@ -115,7 +120,7 @@ class SubgameConfig:
 
     # ── P98/P101: Belief-Conditioned Actor ─────────────────────────────
     belief_conditioned:   bool  = False       # P101: Actor input includes belief features (576 dim)
-    # When True: obs_dim = 576 (480 base + 48 partner belief + 48 RHO belief)
+    # When True: obs_dim = 667 (571 base + 48 partner belief + 48 RHO belief)
     # Requires belief_net to be available (use_info_bonus=True or standalone belief)
     # Enables the Convention Card Protocol for Full Disclosure evaluation
     belief_warmup_rounds: int   = 2           # P98b: rounds using prior features instead of belief net
@@ -223,10 +228,10 @@ class BeliefReplayBuffer:
 
 class FlatRolloutBuffer:
     """
-    存储 flat_obs (480,) + legal_actions (38,) + all_hands (4,52).
+    存储 flat_obs (571,) + legal_actions (38,) + all_hands (4,52).
 
     区别于旧版 RolloutBuffer（存字典 obs）:
-        - flat_obs 已经是 tensor-ready 的一维向量，无需重新 encode
+        - flat_obs 来自 OpenSpiel observation_tensor()，571-dim
         - 批量化更高效
     """
 
@@ -380,6 +385,12 @@ class SubgameTrainer:
         # ── FSP actor cache（避免每步 new 网络）──────────────────────────
         self._fsp_actor_cache: dict = {}  # role -> MLPPolicyNetwork
         self._fsp_cache_key: Optional[str] = None
+
+        # ── P109 obs cache（_encode_for_actor 增量复用）──────────────────
+        # Keyed on (hands_rm.tobytes(), dealer, history_tuple) → flat obs array
+        # Cleared at the start of each collect_episodes_batch call.
+        self._obs_cache:       dict = {}
+        self._obs_state_cache: dict = {}  # same key → pyspiel.State (for incremental extend)
 
         # ── 日志 ───────────────────────────────────────────────────────────
         self.log: List[dict] = []
@@ -694,19 +705,12 @@ class SubgameTrainer:
                     actor = getattr(self.agent.model, role)
 
                 flat_batch  = np.stack([
-                    encode_obs_flat(slot_obs[i], slot_dealer[i], slot_hist[i])
+                    self._encode_for_actor(
+                        slot_obs[i], slot_dealer[i], slot_hist[i],
+                        inner_envs[i].state.current_player,
+                        all_hands=inner_envs[i]._current_hands)
                     for i in slots])
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
-
-                # P98: append belief features
-                if self.config.belief_conditioned and self.belief_net is not None:
-                    _hands   = np.stack([inner_envs[i]._current_hands[inner_envs[i].current_player]
-                                         for i in slots])
-                    _hists   = [slot_hist[i] for i in slots]
-                    _players = [inner_envs[i].current_player for i in slots]
-                    bf = self._get_belief_features_batch(
-                        _hands, _hists, _players, self.belief_net)
-                    flat_batch = np.concatenate([flat_batch, bf], axis=1)
 
                 flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
                 legal_t = torch.tensor(legal_batch, dtype=torch.float32).to(self.device)
@@ -800,12 +804,9 @@ class SubgameTrainer:
             else:
                 actor = getattr(self.agent.model, role)
 
-            flat   = encode_obs_flat(obs, dealer, hist)
-            # P98: append belief features
-            if self.config.belief_conditioned and self.belief_net is not None:
-                bf = self._get_belief_features_single(
-                    inner._current_hands[player], hist, player, self.belief_net)
-                flat = append_belief_features(flat, bf)
+            flat   = self._encode_for_actor(
+                obs, dealer, hist, player,
+                all_hands=inner._current_hands)
             flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(self.device)
             legal_t = torch.tensor(obs['legal_actions'], dtype=torch.float32
                                    ).unsqueeze(0).to(self.device)
@@ -1128,6 +1129,10 @@ class SubgameTrainer:
         """
         from subgames.competitive_env import CompetitiveSubgameEnv
 
+        # P109: clear obs cache at start of each batch to bound memory usage
+        self._obs_cache.clear()
+        self._obs_state_cache.clear()
+
         # ── 初始化 batch_size 个独立环境 ────────────────────────────────
         envs = [CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
                 for _ in range(batch_size)]
@@ -1209,24 +1214,13 @@ class SubgameTrainer:
                                      role.replace('actor','critic'))
 
                 flat_batch  = np.stack([
-                    encode_obs_flat(slot_obs[i], slot_dealer[i], slot_hist[i])
+                    self._encode_for_actor(
+                        slot_obs[i], slot_dealer[i], slot_hist[i],
+                        envs[i].current_player,
+                        all_hands=envs[i]._current_hands)
                     for i in slots])
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
-
-                # P98/P98b: append belief features if belief_conditioned
-                if self.config.belief_conditioned:
-                    if use_belief_prior or self.belief_net is None:
-                        # P98b: warmup — use uninformative prior to avoid garbage input
-                        bf = np.tile(make_belief_features_prior(), (len(slots), 1))
-                    else:
-                        _hands   = np.stack([envs[i]._current_hands[envs[i].current_player]
-                                             for i in slots])
-                        _hists   = [slot_hist[i] for i in slots]
-                        _players = [envs[i].current_player for i in slots]
-                        bf = self._get_belief_features_batch(
-                            _hands, _hists, _players, self.belief_net)
-                    flat_batch = np.concatenate([flat_batch, bf], axis=1)
 
                 flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
                 legal_t = torch.tensor(legal_batch, dtype=torch.float32).to(self.device)
@@ -1370,14 +1364,10 @@ class SubgameTrainer:
                 all_hands = self.env._current_hands.copy()
 
                 # 编码 flat obs
-                flat_obs     = encode_obs_flat(obs, dealer, history_int)
+                flat_obs      = self._encode_for_actor(
+                    obs, dealer, history_int, player,
+                    all_hands=all_hands)
                 legal_actions = obs['legal_actions'].copy()
-
-                # P98: append belief features
-                if self.config.belief_conditioned and self.belief_net is not None:
-                    bf = self._get_belief_features_single(
-                        all_hands[player], history_int, player, self.belief_net)
-                    flat_obs = append_belief_features(flat_obs, bf)
 
                 # 选 actor: FSP 对手 or 当前 agent
                 flat_t  = torch.tensor(flat_obs,      dtype=torch.float32
@@ -1607,14 +1597,78 @@ class SubgameTrainer:
         belief_net: Optional[BeliefNetwork] = None,
     ) -> np.ndarray:
         """
-        P101: 统一的 actor 输入编码.
+        P108: 统一的 actor 输入编码，使用 OpenSpiel 571-dim observation。
 
-        base mode (480-dim):         encode_obs_flat(obs, dealer, history_int)
-        belief-conditioned (576-dim): base + partner_belief(48) + rho_belief(48)
+        base mode (571-dim):          OpenSpiel state.observation_tensor()
+        belief-conditioned (667-dim): base + partner_belief(48) + rho_belief(48)
 
-        所有 policy closure 和 rollout 都应使用此方法。
+        all_hands 是 suit-major (4,52)，dealer 是真实庄家座位（0-3）。
+        history_int 是我们编码的叫牌历史（0-37）。
+
+        P109 perf: incremental state reuse.
+        OpenSpiel obs is public-info only (no private cards). The obs at step t
+        depends only on (hands_key, dealer, history[0..t]). We cache the last
+        OpenSpiel state keyed on (hands_key, dealer, history_tuple) so that
+        consecutive calls for the same deal reuse the state instead of rebuilding
+        it from scratch each time. This removes O(t) replay cost from every step.
         """
-        flat = encode_obs_flat(obs, dealer, history_int)
+        hands_sm = all_hands
+        if hands_sm is not None:
+            hands_rm = convert_hands_suit_to_rank(hands_sm)
+
+            # Build cache key from (hands bytes, dealer, history)
+            hist_tuple = tuple(history_int)
+            cache_key  = (hands_rm.tobytes(), dealer, hist_tuple)
+            cached = self._obs_cache.get(cache_key)
+
+            if cached is not None:
+                flat = cached
+            else:
+                # Check if we can extend the previous state by 1 action
+                # rather than rebuilding from scratch.
+                prev_flat = None
+                if hist_tuple:
+                    prev_key = (hands_rm.tobytes(), dealer, hist_tuple[:-1])
+                    prev_state = self._obs_state_cache.get(prev_key)
+                    if prev_state is not None:
+                        os_state = prev_state
+                        last_a = hist_tuple[-1]
+                        if not os_state.is_terminal():
+                            legal = os_state.legal_actions()
+                            if len(legal) > 0 and legal[0] >= 52:
+                                os_action = ours_to_openspiel_raw(last_a)
+                                if os_action >= 0 and os_action in legal:
+                                    os_state.apply_action(os_action)
+                        flat = get_openspiel_obs(os_state)
+                        # Store new state for future extension
+                        if len(self._obs_state_cache) >= _OBS_CACHE_MAX:
+                            self._obs_state_cache.pop(next(iter(self._obs_state_cache)))
+                        self._obs_state_cache[cache_key] = os_state
+                        self._obs_cache[cache_key] = flat
+                        prev_flat = flat
+
+                if prev_flat is None:
+                    # Full rebuild (first step or cache miss)
+                    os_state = hands_to_openspiel_state(hands_rm, dealer)
+                    for a in history_int:
+                        if os_state.is_terminal():
+                            break
+                        legal = os_state.legal_actions()
+                        if len(legal) > 0 and legal[0] < 52:
+                            break
+                        os_action = ours_to_openspiel_raw(a)
+                        if os_action >= 0 and os_action in legal:
+                            os_state.apply_action(os_action)
+                    flat = get_openspiel_obs(os_state)
+                    if len(self._obs_cache) >= _OBS_CACHE_MAX:
+                        self._obs_cache.pop(next(iter(self._obs_cache)))
+                    if len(self._obs_state_cache) >= _OBS_CACHE_MAX:
+                        self._obs_state_cache.pop(next(iter(self._obs_state_cache)))
+                    self._obs_cache[cache_key]       = flat
+                    self._obs_state_cache[cache_key] = os_state
+        else:
+            flat = np.zeros(OBS_DIM, dtype=np.float32)
+
         if self.config.belief_conditioned:
             hand = all_hands[player] if all_hands is not None else obs['hand']
             bf = self._get_belief_features_single(

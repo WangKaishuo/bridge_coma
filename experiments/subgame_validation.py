@@ -7,8 +7,8 @@ for ALL agents. BCA is not an experimental treatment — it is the minimum
 capability that any bridge bidding agent should possess. An agent that cannot
 interpret bidding history is not "playing bridge" in any meaningful sense.
 
-P101 key change: Actor input expanded to 576-dim (P104):
-  480 (base obs) + 48 (partner belief) + 48 (RHO belief) = 576
+P101 key change: Actor input expanded to 397-dim:
+  301 (base obs) + 48 (partner belief) + 48 (RHO belief) = 397
   This enables agents to understand BOTH partner and opponent bids.
 
 Experiment design:
@@ -63,7 +63,7 @@ from subgames.competitive_env import CompetitiveSubgameEnv, make_agent_policy
 from subgames.subgame_trainer import SubgameTrainer, SubgameConfig
 from utils.running_stats import RunningStats
 from utils.imp import score_to_imp
-from networks.policy_net import OBS_DIM, BELIEF_OBS_DIM, encode_obs_flat
+from networks.policy_net import OBS_DIM, BELIEF_OBS_DIM, load_sl_into_mappo_agent
 from algorithms.mappo import MAPPOAgent, MAPPOConfig
 
 
@@ -105,7 +105,7 @@ def run_competitive(args):
     print(f"  beta={args.beta}  info_weight={args.info_weight}  rounds={args.rounds}  quick={args.quick}")
     print(f"  belief_conditioned={_bc}  kl_lambda={_kl_start}→{_kl_end}  entropy_coef={_ent_coef}")
     if _bc:
-        print(f"  [P101] BCA standard: ALL agents use 576-dim belief-conditioned actors (partner + RHO)")
+        print(f"  [P101] BCA standard: ALL agents use 397-dim belief-conditioned actors (partner + RHO)")
 
     # ── 环境 ────────────────────────────────────────────────────────────────
     print("\n[1] Initializing environment...")
@@ -220,7 +220,7 @@ def run_competitive(args):
         trainer_c = SubgameTrainer(env, cfg_c, reward_stats=reward_stats_c)
 
     # ── Stage 1: 初始化（SL checkpoint 优先，否则 rule-based BC）──────────────
-    from env import NORTH as _N, EAST as _E, SOUTH as _S, WEST as _W
+    from env import NORTH as _N, EAST as _E, SOUTH as _S, WEST as _W, NUM_PLAYERS
     sl_path = getattr(args, 'sl_checkpoint', None)
 
     # 确定哪些trainer需要SL初始化
@@ -236,89 +236,109 @@ def run_competitive(args):
 
     if sl_path and os.path.exists(sl_path):
         print(f"\n[Stage 1] Loading SL checkpoint: {sl_path}")
-        ckpt = torch.load(sl_path, map_location=device)
+        ckpt = torch.load(sl_path, map_location=device, weights_only=False)
         sl_obs_dim = ckpt.get('obs_dim', OBS_DIM)
-        player_key_map = [(_N, 'actor_n'), (_E, 'actor_e'),
-                          (_S, 'actor_s'), (_W, 'actor_w')]
-
-        # P98: BCA checkpoint has 576-dim actors + belief_net
+        sl_encoding = ckpt.get('encoding', 'legacy')
+        is_p105 = ('model_state' in ckpt)  # P105 format: single shared model_state
         is_bca_ckpt = (sl_obs_dim == BELIEF_OBS_DIM)
-        if _bc and is_bca_ckpt:
-            print(f"  [P98] BCA checkpoint detected (obs_dim={sl_obs_dim})")
 
-        for trainer in trainers_to_init:
-            for player, key in player_key_map:
-                if key not in ckpt:
-                    continue
-                sl_sd = {k: v.to(device) for k, v in ckpt[key].items()}
-                actor = trainer.agent.get_actor(player)
+        print(f"  SL format: {'P105' if is_p105 else 'legacy'}  "
+              f"obs_dim={sl_obs_dim}  encoding={sl_encoding}")
 
-                if not _bc:
-                    # Standard 480→480 load
-                    if is_bca_ckpt:
-                        # BCA checkpoint into non-BCA agent: skip (dimension mismatch)
-                        print(f"  ⚠️  Skipping {key}: BCA checkpoint incompatible with non-BCA agent")
+        if is_p105:
+            # ── P105 format: model_state → all 4 actors ─────────────────
+            sl_sd = {k: v.to(device) for k, v in ckpt['model_state'].items()}
+            for trainer in trainers_to_init:
+                for player in range(NUM_PLAYERS):
+                    actor = trainer.agent.get_actor(player)
+                    if _bc and sl_obs_dim < BELIEF_OBS_DIM:
+                        # 571→667: zero-init belief feature columns
+                        target_sd = actor.state_dict()
+                        for param_name, sl_val in sl_sd.items():
+                            if param_name in target_sd:
+                                tgt_shape = target_sd[param_name].shape
+                                if sl_val.shape == tgt_shape:
+                                    target_sd[param_name] = sl_val
+                                elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
+                                    target_sd[param_name][:, :sl_val.shape[1]] = sl_val
+                                    target_sd[param_name][:, sl_val.shape[1]:] = 0.0
+                                else:
+                                    target_sd[param_name] = sl_val
+                        actor.load_state_dict(target_sd)
+                    else:
+                        actor.load_state_dict(sl_sd)
+        else:
+            # ── Legacy format: actor_n, actor_s, actor_e, actor_w ────────
+            player_key_map = [(_N, 'actor_n'), (_E, 'actor_e'),
+                              (_S, 'actor_s'), (_W, 'actor_w')]
+
+            if _bc and is_bca_ckpt:
+                print(f"  [BCA] BCA checkpoint detected (obs_dim={sl_obs_dim})")
+
+            for trainer in trainers_to_init:
+                for player, key in player_key_map:
+                    if key not in ckpt:
                         continue
-                    actor.load_state_dict(sl_sd)
-                elif is_bca_ckpt:
-                    # P98: BCA checkpoint → BCA agent (576→576, direct load)
-                    actor.load_state_dict(sl_sd)
-                else:
-                    # P98: Standard checkpoint → BCA agent (480→576, zero-init extra)
-                    target_sd = actor.state_dict()
-                    for param_name, sl_val in sl_sd.items():
-                        if param_name in target_sd:
-                            tgt_shape = target_sd[param_name].shape
-                            if sl_val.shape == tgt_shape:
-                                target_sd[param_name] = sl_val
-                            elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
-                                target_sd[param_name][:, :sl_val.shape[1]] = sl_val
-                                target_sd[param_name][:, sl_val.shape[1]:] = 0.0
-                            else:
-                                target_sd[param_name] = sl_val
-                    actor.load_state_dict(target_sd)
+                    sl_sd = {k: v.to(device) for k, v in ckpt[key].items()}
+                    actor = trainer.agent.get_actor(player)
 
-            # P98: Load belief_net from BCA checkpoint if available
-            if _bc and 'belief_net' in ckpt and trainer.belief_net is not None:
-                # Read the hidden_dim the belief net was trained with.
-                # Older checkpoints may not have 'belief_hidden_dim' — fall back
-                # to inferring from the weight shape.
-                ckpt_belief_sd = {k: v.to(device) for k, v in ckpt['belief_net'].items()}
-                ckpt_hidden = ckpt.get(
-                    'belief_hidden_dim',
-                    ckpt_belief_sd['trunk.0.weight'].shape[0]  # infer from first layer
-                )
-                if ckpt_hidden != trainer.belief_net.trunk[0].out_features:
-                    # Rebuild belief_net with the checkpoint's hidden_dim
-                    from networks.belief_net import BeliefNetwork
-                    trainer.belief_net = BeliefNetwork(hidden_dim=ckpt_hidden).to(device)
-                    print(f"  [P98] Belief Net rebuilt with hidden_dim={ckpt_hidden} "
-                          f"to match checkpoint.")
-                trainer.belief_net.load_state_dict(ckpt_belief_sd)
-                _trainer_name = 'A' if trainer is trainer_a else ('B' if trainer is trainer_b else 'C')
-                print(f"  [P98] Belief Net loaded from SL checkpoint for {_trainer_name}")
+                    if not _bc:
+                        if is_bca_ckpt:
+                            print(f"  ⚠️  Skipping {key}: BCA checkpoint incompatible with non-BCA agent")
+                            continue
+                        actor.load_state_dict(sl_sd)
+                    elif is_bca_ckpt:
+                        actor.load_state_dict(sl_sd)
+                    else:
+                        target_sd = actor.state_dict()
+                        for param_name, sl_val in sl_sd.items():
+                            if param_name in target_sd:
+                                tgt_shape = target_sd[param_name].shape
+                                if sl_val.shape == tgt_shape:
+                                    target_sd[param_name] = sl_val
+                                elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
+                                    target_sd[param_name][:, :sl_val.shape[1]] = sl_val
+                                    target_sd[param_name][:, sl_val.shape[1]:] = 0.0
+                                else:
+                                    target_sd[param_name] = sl_val
+                        actor.load_state_dict(target_sd)
+
+                # Load belief_net from legacy BCA checkpoint if available
+                if _bc and 'belief_net' in ckpt and trainer.belief_net is not None:
+                    ckpt_belief_sd = {k: v.to(device) for k, v in ckpt['belief_net'].items()}
+                    ckpt_hidden = ckpt.get(
+                        'belief_hidden_dim',
+                        ckpt_belief_sd['trunk.0.weight'].shape[0]
+                    )
+                    if ckpt_hidden != trainer.belief_net.trunk[0].out_features:
+                        from networks.belief_net import BeliefNetwork
+                        trainer.belief_net = BeliefNetwork(hidden_dim=ckpt_hidden).to(device)
+                        print(f"  Belief Net rebuilt with hidden_dim={ckpt_hidden}")
+                    trainer.belief_net.load_state_dict(ckpt_belief_sd)
+                    _trainer_name = 'A' if trainer is trainer_a else ('B' if trainer is trainer_b else 'C')
+                    print(f"  Belief Net loaded for {_trainer_name}")
 
         _n_agents = len(trainers_to_init)
         init_names = f"{_n_agents} agents" if _n_agents > 1 else "1 agent"
-        dim_note = f" [BCA {sl_obs_dim}-dim]" if is_bca_ckpt else (
-            " [480→576 adapted]" if _bc else "")
-        print(f"  [SL Init] Weights loaded for N/E/S/W actors ({init_names}).{dim_note}")
+        dim_note = (f" [P105 {sl_obs_dim}-dim]" if is_p105 else
+                    f" [BCA {sl_obs_dim}-dim]" if is_bca_ckpt else "")
+        print(f"  [SL Init] Weights loaded for all actors ({init_names}).{dim_note}")
 
         # ── P99: Zero-init belief feature columns in first layer ────────────
-        # BCA SL pretrain trains all 576 input columns jointly, so the first
-        # layer weight[:, 480:576] encodes belief-feature dependencies learned
+        # BCA SL pretrain trains all 397 input columns jointly, so the first
+        # layer weight[:, 301:397] encodes belief-feature dependencies learned
         # on GLOBAL SAYC data. On the competitive subgame, belief features have
         # a different distribution → extreme logit shifts → entropy collapse.
         # Fix: zero out the 48 belief columns so the actor initially behaves
-        # identically to 480-dim SL. Belief influence enters gradually via RL.
+        # identically to 301-dim SL. Belief influence enters gradually via RL.
         # This preserves the BCA architecture while avoiding distribution shift.
         if _bc and is_bca_ckpt:
-            _base_dim = OBS_DIM  # 480
+            _base_dim = OBS_DIM  # 301
             for trainer in trainers_to_init:
                 for player, key in player_key_map:
                     actor = trainer.agent.get_actor(player)
                     with torch.no_grad():
-                        w = actor.net[0].weight  # (hidden_dim, 576)
+                        w = actor.net[0].weight  # (hidden_dim, 397)
                         w[:, _base_dim:] = 0.0
                         b = actor.net[0].bias    # not affected, but confirm
                     # Also zero the corresponding columns in bc_anchor later
@@ -420,9 +440,6 @@ def run_competitive(args):
     from algorithms.mappo import MAPPOAgent, MAPPOConfig
     from networks.policy_net import BELIEF_OBS_DIM as _BOD
 
-    # P99: When belief_conditioned, SL baseline MUST also use 576-dim + belief net
-    # for fair evaluation. Otherwise vs-SL comparisons are contaminated by
-    # architectural asymmetry (576-dim agent vs 480-dim SL).
     _sl_bc = _bc  # SL gets belief net whenever agents do
     _sl_obs_dim = _BOD if _sl_bc else OBS_DIM
 
@@ -433,30 +450,54 @@ def run_competitive(args):
     )
     sl_agent_eval = MAPPOAgent(MAPPOConfig(device=device, obs_dim=_sl_obs_dim))
     if sl_path and os.path.exists(sl_path):
-        ckpt_sl = torch.load(sl_path, map_location=device)
+        ckpt_sl = torch.load(sl_path, map_location=device, weights_only=False)
+        _is_p105_sl = ('model_state' in ckpt_sl)
         sl_obs_dim_ckpt = ckpt_sl.get('obs_dim', OBS_DIM)
-        for player, key in [(_N, 'actor_n'), (_E, 'actor_e'),
-                            (_S, 'actor_s'), (_W, 'actor_w')]:
-            if key not in ckpt_sl:
-                continue
-            sl_sd = {k: v.to(device) for k, v in ckpt_sl[key].items()}
-            actor = sl_agent_eval.get_actor(player)
-            if _sl_bc and sl_obs_dim_ckpt == OBS_DIM:
-                # 480→576 zero-init (same as A/B)
-                target_sd = actor.state_dict()
-                for param_name, sl_val in sl_sd.items():
-                    if param_name in target_sd:
-                        tgt_shape = target_sd[param_name].shape
-                        if sl_val.shape == tgt_shape:
-                            target_sd[param_name] = sl_val
-                        elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
-                            target_sd[param_name][:, :sl_val.shape[1]] = sl_val
-                            target_sd[param_name][:, sl_val.shape[1]:] = 0.0
-                        else:
-                            target_sd[param_name] = sl_val
-                actor.load_state_dict(target_sd)
-            else:
-                actor.load_state_dict(sl_sd)
+
+        if _is_p105_sl:
+            # P105 format: single model_state → all players
+            sl_sd = {k: v.to(device) for k, v in ckpt_sl['model_state'].items()}
+            for player in range(NUM_PLAYERS):
+                actor = sl_agent_eval.get_actor(player)
+                if _sl_bc and sl_obs_dim_ckpt < _BOD:
+                    # 571→667: zero-init belief columns
+                    target_sd = actor.state_dict()
+                    for param_name, sl_val in sl_sd.items():
+                        if param_name in target_sd:
+                            tgt_shape = target_sd[param_name].shape
+                            if sl_val.shape == tgt_shape:
+                                target_sd[param_name] = sl_val
+                            elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
+                                target_sd[param_name][:, :sl_val.shape[1]] = sl_val
+                                target_sd[param_name][:, sl_val.shape[1]:] = 0.0
+                            else:
+                                target_sd[param_name] = sl_val
+                    actor.load_state_dict(target_sd)
+                else:
+                    actor.load_state_dict(sl_sd)
+        else:
+            # Legacy format
+            for player, key in [(_N, 'actor_n'), (_E, 'actor_e'),
+                                (_S, 'actor_s'), (_W, 'actor_w')]:
+                if key not in ckpt_sl:
+                    continue
+                sl_sd = {k: v.to(device) for k, v in ckpt_sl[key].items()}
+                actor = sl_agent_eval.get_actor(player)
+                if _sl_bc and sl_obs_dim_ckpt != _BOD:
+                    target_sd = actor.state_dict()
+                    for param_name, sl_val in sl_sd.items():
+                        if param_name in target_sd:
+                            tgt_shape = target_sd[param_name].shape
+                            if sl_val.shape == tgt_shape:
+                                target_sd[param_name] = sl_val
+                            elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
+                                target_sd[param_name][:, :sl_val.shape[1]] = sl_val
+                                target_sd[param_name][:, sl_val.shape[1]:] = 0.0
+                            else:
+                                target_sd[param_name] = sl_val
+                    actor.load_state_dict(target_sd)
+                else:
+                    actor.load_state_dict(sl_sd)
     sl_trainer = SubgameTrainer(env, cfg_sl, reward_stats=RunningStats())
     sl_trainer.agent = sl_agent_eval
 
@@ -759,24 +800,33 @@ def _load_agent(path: str, device: str) -> MAPPOAgent:
 
 
 def _load_sl_as_agent(sl_path: str, device: str) -> MAPPOAgent:
-    """Load 4-actor SL checkpoint (sl_base.pt or sl_base_bca.pt) as a MAPPOAgent."""
-    agent = MAPPOAgent(MAPPOConfig(device=device))
-    ckpt = torch.load(sl_path, map_location=device)
-    for player, key in [(0, 'actor_n'), (1, 'actor_e'),
-                        (2, 'actor_s'), (3, 'actor_w')]:
-        if key in ckpt:
-            agent.get_actor(player).load_state_dict(
-                {k: v.to(device) for k, v in ckpt[key].items()})
+    """Load SL checkpoint (P105 or legacy) as a MAPPOAgent."""
+    agent = MAPPOAgent(MAPPOConfig(device=device, obs_dim=OBS_DIM))
+    load_sl_into_mappo_agent(agent, sl_path)
     return agent
 
 
 def _make_eval_policy(agent: MAPPOAgent, env: CompetitiveSubgameEnv, device: str):
     """
     Wrap a MAPPOAgent as a 3-arg policy(obs, player, history_int) → action_int.
-    Uses env.dealer for position encoding (set before each play_mixed call).
+
+    P105: Uses OpenSpiel state.observation_tensor() for 571-dim observations.
+    Reconstructs OpenSpiel state from (hands, dealer, history) each step.
+
+    env.dealer and env._eval_hands_rm must be set before each play_mixed call.
     """
+    from networks.policy_net import (
+        hands_to_openspiel_state, get_openspiel_obs, ours_to_openspiel_raw,
+    )
+
     def policy(obs, player, history_int):
-        flat = encode_obs_flat(obs, env.dealer, history_int)
+        os_state = hands_to_openspiel_state(env._eval_hands_rm, env.dealer)
+        for a in history_int:
+            os_a = ours_to_openspiel_raw(a)
+            if os_a >= 0:
+                os_state.apply_action(os_a)
+
+        flat = get_openspiel_obs(os_state)
         flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
         legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32
                               ).unsqueeze(0).to(device)
@@ -795,12 +845,15 @@ def _cross_eval_fixed_deals(env, deals, pol_a, pol_b):
     Table 2: B = opener (NS), A = overcaller (EW)
     IMP = score_to_imp(score_1 − score_2)  — positive means A wins.
 
-    env.dealer must be set before each play_mixed call so the policy
-    closures can encode position correctly.
+    P105: env._eval_hands_rm must be set for OpenSpiel observation generation.
+    env.dealer must be set before each play_mixed call.
     """
+    from networks.policy_net import convert_hands_suit_to_rank
+
     imps = []
     for hands, dd_table, dealer, vul in deals:
         env.dealer = dealer
+        env._eval_hands_rm = convert_hands_suit_to_rank(hands)
         _, score_1, _ = env.play_mixed(
             hands, dd_table,
             ns_policy=pol_a, ew_policy=pol_b,
@@ -944,8 +997,8 @@ def parse_args():
                         help='Max training epochs for Belief Net pretrain (P97b: 50, big data needs fewer epochs)')
     parser.add_argument('--sl_checkpoint', default='results/sl_base_bca.pt',
                         help='SL pretrained checkpoint (4-actor format). '
-                             'P100 default: sl_base_bca.pt (576-dim BCA). '
-                             'Use sl_base.pt for legacy 480-dim experiments.')
+                             'P100 default: sl_base_bca.pt (397-dim BCA). '
+                             'Use sl_base.pt for legacy 301-dim experiments.')
     parser.add_argument('--save_dir', default='results/competitive',
                         help='Directory to save checkpoints')
     parser.add_argument('--load_agent_a', default=None,
@@ -954,9 +1007,9 @@ def parse_args():
     parser.add_argument('--ewc_lambda', type=float, default=100.0,
                         help='EWC penalty strength for Belief Net (P97, normalized Fisher, default: 100)')
     parser.add_argument('--no_belief_conditioned', action='store_true',
-                        help='P100: Disable BCA (revert to 480-dim input). '
-                        'By default, ALL agents use belief-conditioned actors (576-dim). '
-                        'Use this flag for backward-compatible 480-dim experiments.')
+                        help='P100: Disable BCA (revert to 301-dim input). '
+                        'By default, ALL agents use belief-conditioned actors (397-dim). '
+                        'Use this flag for backward-compatible 301-dim experiments.')
     parser.add_argument('--belief_conditioned', action='store_true',
                         help='(Deprecated, now default) Kept for backward compatibility. '
                         'BCA is always on unless --no_belief_conditioned is set.')

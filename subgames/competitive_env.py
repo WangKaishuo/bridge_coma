@@ -156,9 +156,13 @@ def generate_rule_based_bc_data(
     """
     生成 rule-based BC 训练数据，用于 Phase 1 轻量预热.
 
+    P105: Uses OpenSpiel state.observation_tensor() for 571-dim observations.
     dealer 由 env.generate_deal() 动态决定（dealer rotation 已支持）.
     """
-    from networks.policy_net import encode_obs_flat
+    from networks.policy_net import (
+        convert_hands_suit_to_rank, hands_to_openspiel_state,
+        get_openspiel_obs, ours_to_openspiel_raw,
+    )
 
     data = []
     attempts = 0
@@ -169,10 +173,12 @@ def generate_rule_based_bc_data(
         hands, dd_table = env.generate_deal()
         dealer = env._sampled_dealer
         vul = (False, False)
+        hands_rm = convert_hands_suit_to_rank(hands)
 
         inner_env = BridgeBiddingEnv(max_history_len=60)
         obs = inner_env.reset(hands, dealer=dealer, vulnerability=vul)
         done = False
+        history_ours = []
 
         # 执行固定前缀 1H-1S
         prefix_ok = True
@@ -181,6 +187,7 @@ def generate_rule_based_bc_data(
             if not inner_env._is_valid_action(bid):
                 prefix_ok = False
                 break
+            history_ours.append(bid)
             obs, _, done, _ = inner_env.step(bid)
             if done:
                 break
@@ -197,10 +204,14 @@ def generate_rule_based_bc_data(
             if not inner_env._is_valid_action(action):
                 action = BID_PASS
 
-            # 编码当前状态为 480 维 (P104 OpenSpiel标准)
-            flat = encode_obs_flat(obs, dealer, history)
+            # P105: 用 OpenSpiel 获取 571 维 observation
+            os_state = hands_to_openspiel_state(hands_rm, dealer)
+            for a in history_ours:
+                os_state.apply_action(ours_to_openspiel_raw(a))
+            flat = get_openspiel_obs(os_state)
             data.append({'flat_obs': flat, 'action': action})
 
+            history_ours.append(action)
             obs, _, done, _ = inner_env.step(action)
 
     print(f"[BC Data] Generated {len(data)} samples "
@@ -607,8 +618,14 @@ def cross_evaluate(
 
     统计检验: Wilcoxon signed-rank（IMP 重尾非参）.
     dealer 轮换：每局 generate_deal() 后从 env._sampled_dealer 读取。
+
+    P109 fix: set env._current_hands and env._eval_hands_rm before play_mixed
+    so that policy closures in evaluate_head_to_head can call _encode_for_actor
+    with the correct hands (not None). Without this, all_hands=None → zero obs
+    → all IMPs are 0.000, win_rate=0.0%, Wilcoxon p=nan.
     """
     from scipy.stats import wilcoxon
+    from networks.policy_net import convert_hands_suit_to_rank
 
     imps = []
     for _ in range(num_deals):
@@ -616,6 +633,10 @@ def cross_evaluate(
         dealer = env._sampled_dealer
         vul = [(False, False), (True, False),
                (False, True),  (True, True)][np.random.randint(4)]
+
+        # P109: sync hands into env so policy closures can read env._current_hands
+        env._current_hands  = hands
+        env._eval_hands_rm  = convert_hands_suit_to_rank(hands)
 
         _, score_1, _ = env.play_mixed(
             hands, dd_table,
@@ -724,20 +745,44 @@ def make_agent_policy(
     agent,
     deterministic: bool = True,
     dealer: int = NORTH,
+    hands_sm: np.ndarray = None,
 ) -> Callable[[Dict, int, list], int]:
     """
     从 MAPPOAgent 创建 competitive policy 函数.
 
     policy 签名: (obs, player, history_int) → action_int
 
-    dealer: 当前局的 dealer seat（由 env.dealer 在 generate_deal() 后读取）。
-    encode_obs_flat 需要 dealer 来编码相对位置。
+    P105: Uses OpenSpiel state.observation_tensor() for 571-dim observations.
+    Reconstructs OpenSpiel state from (hands, dealer, history) each step.
+
+    Args:
+        agent: MAPPOAgent with loaded actors
+        deterministic: if True, use argmax
+        dealer: dealer seat for this deal
+        hands_sm: (4, 52) suit-major hands — REQUIRED for OpenSpiel obs.
     """
     import torch
-    from networks.policy_net import encode_obs_flat
+    from networks.policy_net import (
+        convert_hands_suit_to_rank, hands_to_openspiel_state,
+        get_openspiel_obs, ours_to_openspiel_raw,
+    )
+
+    if hands_sm is None:
+        raise ValueError(
+            "P105: make_agent_policy requires hands_sm for OpenSpiel observations.")
+
+    # Pre-convert hands (done once per deal)
+    hands_rm = convert_hands_suit_to_rank(hands_sm)
 
     def policy(obs: Dict, player: int, history_int: list) -> int:
-        flat = encode_obs_flat(obs, dealer, history_int)
+        # Reconstruct OpenSpiel state and replay history
+        os_state = hands_to_openspiel_state(hands_rm, dealer)
+        for our_action in history_int:
+            os_action = ours_to_openspiel_raw(our_action)
+            if os_action >= 0:
+                os_state.apply_action(os_action)
+
+        flat = get_openspiel_obs(os_state)
         flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(agent.device)
         legal  = torch.tensor(
             obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(agent.device)

@@ -11,8 +11,6 @@ from networks.policy_net import (
     MLPValueNetwork,
     PolicyNetwork,       # alias for MLPPolicyNetwork
     ValueNetwork,        # alias for MLPValueNetwork
-    encode_obs_flat,
-    encode_history_flat,
     BASE_INPUT_DIM,
     OBS_DIM,
 )

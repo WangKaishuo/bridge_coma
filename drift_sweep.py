@@ -6,31 +6,33 @@ Drift Sweep Runner
 Run convention drift quantification experiments across multiple λ_KL values
 and seeds. Wraps subgame_validation.py for batch execution.
 
-Experiment 1 (480-dim): Measures drift advantage without BCA.
+P108: All observations use OpenSpiel-native 571-dim encoding.
+
+Experiment 1 (571-dim): Measures drift advantage without BCA.
   → Prior work scenario (opponents can't interpret drifted bids)
 
-Experiment 2 (576-dim BCA): Measures drift advantage with BCA.
+Experiment 2 (667-dim BCA): Measures drift advantage with BCA.
   → Our framework (opponents use BeliefNet to interpret bids)
 
 Usage:
-  # Experiment 1: 301-dim drift sweep
+  # Experiment 1: 571-dim drift sweep
   python drift_sweep.py \
-      --mode 480 \
-      --sl_checkpoint results/sl_base.pt \
+      --mode 571 \
+      --sl_checkpoint results/sl_base_571.pt \
       --data data/competitive_500k.npz \
       --rounds 10 --eval_deals 2000
 
-  # Experiment 2: 397-dim BCA drift sweep
+  # Experiment 2: 667-dim BCA drift sweep
   python drift_sweep.py \
-      --mode 576 \
-      --sl_checkpoint results/sl_base_bca_v2.pt \
+      --mode 667 \
+      --sl_checkpoint results/sl_base_571.pt \
       --data data/competitive_500k.npz \
       --rounds 10 --eval_deals 2000
 
   # Quick smoke test (1 seed, 2 lambdas, 3 rounds)
   python drift_sweep.py \
-      --mode 480 \
-      --sl_checkpoint results/sl_base.pt \
+      --mode 571 \
+      --sl_checkpoint results/sl_base_571.pt \
       --data data/competitive_500k.npz \
       --lambdas 0.0 0.3 --seeds 42 --rounds 3 --quick
 
@@ -75,9 +77,9 @@ def run_single(mode: str, lam: float, seed: int, args) -> dict:
         "--agent_a_only",
     ]
     
-    if mode == "480":
+    if mode == "571":
         cmd.append("--no_belief_conditioned")
-    # else: 576-dim BCA is the default
+    # else: 667-dim BCA is the default
     
     if args.quick:
         cmd.append("--quick")
@@ -125,14 +127,13 @@ def run_single(mode: str, lam: float, seed: int, args) -> dict:
 def main():
     parser = argparse.ArgumentParser(
         description="Convention Drift Sweep (multi-λ × multi-seed)")
-    parser.add_argument("--mode", required=True, choices=["480", "576"],
-                        help="480 = no BCA (prior work scenario), "
-                             "576 = BCA (our framework)")
+    parser.add_argument("--mode", required=True, choices=["571", "667"],
+                        help="571 = no BCA (prior work scenario), "
+                             "667 = BCA (our framework)")
     parser.add_argument("--data", required=True,
                         help="Path to competitive data (npz)")
     parser.add_argument("--sl_checkpoint", required=True,
-                        help="SL checkpoint (sl_base.pt for 480, "
-                             "sl_base_bca_v2.pt for 576)")
+                        help="SL checkpoint (sl_base_571.pt for 571, sl_base_571.pt for 667)")
     parser.add_argument("--lambdas", type=float, nargs="+",
                         default=DEFAULT_LAMBDAS,
                         help=f"λ_KL values (default: {DEFAULT_LAMBDAS})")
@@ -156,6 +157,7 @@ def main():
     n_total = len(args.lambdas) * len(args.seeds)
     print(f"[Drift Sweep] mode={args.mode}  "
           f"lambdas={args.lambdas}  seeds={args.seeds}")
+    print(f"[Drift Sweep] P108 (OpenSpiel 571-dim obs)")
     print(f"[Drift Sweep] {n_total} runs total  → {args.out_dir}")
     
     # ── Run all experiments ─────────────────────────────────────────

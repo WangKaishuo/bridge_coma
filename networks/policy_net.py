@@ -1,42 +1,26 @@
 """
-Policy and Value Networks — MLP Architecture (P104: 480-dim OpenSpiel encoding)
-==================================================================================
+Policy and Value Networks — MLP Architecture (P105: OpenSpiel-native 571-dim)
+================================================================================
 
-P104: Observation encoding rewritten to match the OpenSpiel/Pgx/Lockhart+20
-standard (480-dim), replacing the previous 301-dim custom encoding.
+P105: Observation generation now uses pyspiel.State.observation_tensor() directly.
+All custom encode_obs_flat functions have been REMOVED — they accumulated three
+independent bugs (dealer assignment, encoding layout, hand encoding).
 
-The old 301-dim encoding had three fatal flaws:
-  1. Absolute player positions (N/E/S/W) instead of relative (self/LHO/partner/RHO)
-  2. Complete loss of Pass information (only substance bids were recorded)
-  3. No "pass before opening" indicator
+571-dim observation comes directly from:
+    pyspiel.load_game('bridge(use_double_dummy_result=false)')
+    state.observation_tensor()
 
-The new 480-dim encoding matches the standard used by:
-  - OpenSpiel (Lanctot et al., 2019)
-  - Pgx (Koyamada et al., 2023)
-  - JPS (Tian et al., NeurIPS 2020)
-  - Lockhart et al. (NeurIPS 2020 Workshop)
-  - Kita et al. (CoG 2024)
+BCA extension (667-dim):
+    571 (OpenSpiel base) + 48 (partner belief) + 48 (RHO belief) = 667
 
-480-dim layout (all binary):
-    obs[  0:  4]  Vulnerability (one-hot, 4 combos)
-    obs[  4:  8]  "Pass before opening" per relative player (4 bits)
-    obs[  8:428]  Bidding history: 35 bids × 12 bits each = 420
-                    Per bid b (12 bits):
-                      [self_bid, LHO_bid, partner_bid, RHO_bid,    ← who made this bid
-                       self_dbl, LHO_dbl, partner_dbl, RHO_dbl,    ← who doubled it
-                       self_rdbl, LHO_rdbl, partner_rdbl, RHO_rdbl] ← who redoubled it
-    obs[428:480]  My hand (52-dim, 13-hot)
-    ─────────────────────────────────────────────────
-    Total: 480 binary features
+Action mapping (our ordering ↔ OpenSpiel):
+    Our:      Pass=0, Dbl=1, Rdbl=2, 1C=3, 1D=4, ..., 7NT=37
+    OpenSpiel: Pass=52, 1C=53, ..., 7NT=87, Dbl=88, Rdbl=89
 
-P101 BCA extension (576-dim):
-    480 (base) + 48 (partner belief) + 48 (RHO belief) = 576
-
-Note on relative player mapping:
-    The current player is always player 0 (self).
-    Relative positions rotate based on who is currently acting:
-      rel_player = (absolute_player - current_player) % 4
-      0 = self, 1 = LHO, 2 = partner, 3 = RHO
+Card encoding:
+    OpenSpiel/SAYC data: rank-major (card_id = rank * 4 + suit)
+    competitive_env:     suit-major (card_id = suit * 13 + rank)
+    Use suit_major_to_rank_major() when crossing the boundary.
 """
 
 import numpy as np
@@ -45,172 +29,212 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 
+try:
+    import pyspiel
+    _GAME = pyspiel.load_game('bridge(use_double_dummy_result=false)')
+    OBS_DIM = _GAME.observation_tensor_shape()[0]  # 571
+except ImportError:
+    # Fallback if pyspiel not installed (e.g. for unit tests on networks only)
+    OBS_DIM = 571
+    _GAME = None
+
+# Game cache for different dealers (populated lazily by get_openspiel_game)
+_GAMES = {}  # will be populated in get_openspiel_game()
+
 from env import NUM_BIDS, NUM_PLAYERS, BID_PASS, BID_DOUBLE, BID_REDOUBLE, BID_1C
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-NUM_REAL_BIDS  = 35      # 1C–7NT (bid index 3–37)
-OBS_DIM        = 480     # P104: OpenSpiel/Pgx standard
 BASE_INPUT_DIM = OBS_DIM
 
 # P101: Belief-conditioned Actor
-BELIEF_FEAT_DIM = 96     # 48 (partner) + 48 (RHO)
-BELIEF_OBS_DIM  = OBS_DIM + BELIEF_FEAT_DIM  # 480 + 96 = 576
+BELIEF_FEAT_DIM = 96                            # 48 (partner) + 48 (RHO)
+BELIEF_OBS_DIM  = OBS_DIM + BELIEF_FEAT_DIM     # 571 + 96 = 667
 
-# Legacy alias
-OBS_DIM_OLD = 301
+# OpenSpiel action constants
+OS_MIN_ACTION = 52
+OS_PASS       = 52
+OS_DOUBLE     = 88
+OS_REDOUBLE   = 89
+OS_1C         = 53
+
+# Legacy aliases (for code that references old dims — will fail loudly if misused)
+OBS_DIM_OLD    = 301
+OBS_DIM_P104   = 480
 
 
 # ==============================================================================
-# Observation Encoding (P104: 480-dim OpenSpiel standard)
+# Action Mapping (our ordering ↔ OpenSpiel)
 # ==============================================================================
 
-def encode_obs_flat(obs: Dict[str, np.ndarray],
-                    dealer: int,
-                    history_int: list) -> np.ndarray:
+def openspiel_raw_to_ours(os_action: int) -> int:
+    """Convert OpenSpiel raw action (52-89) to our action (0-37)."""
+    if os_action == OS_PASS:      return BID_PASS        # 0
+    if os_action == OS_DOUBLE:    return BID_DOUBLE       # 1
+    if os_action == OS_REDOUBLE:  return BID_REDOUBLE     # 2
+    if OS_1C <= os_action <= 87:  return BID_1C + (os_action - OS_1C)  # 3..37
+    return -1
+
+
+def ours_to_openspiel_raw(our_action: int) -> int:
+    """Convert our action (0-37) to OpenSpiel raw action (52-89)."""
+    if our_action == BID_PASS:      return OS_PASS
+    if our_action == BID_DOUBLE:    return OS_DOUBLE
+    if our_action == BID_REDOUBLE:  return OS_REDOUBLE
+    if BID_1C <= our_action <= 37:  return OS_1C + (our_action - BID_1C)
+    return -1
+
+
+# ==============================================================================
+# Card Encoding Conversion
+# ==============================================================================
+
+def suit_major_to_rank_major(card_sm: int) -> int:
+    """Convert suit-major card_id to rank-major card_id.
+    suit-major: card = suit * 13 + rank  (used by competitive_env)
+    rank-major: card = rank * 4 + suit   (used by OpenSpiel/SAYC)
     """
-    Encode observation to 480-dim binary vector (OpenSpiel/Pgx standard).
+    suit = card_sm // 13
+    rank = card_sm % 13
+    return rank * 4 + suit
 
-    This matches the encoding used by Lockhart+20, Tian+20, Kita+24, and
-    the OpenSpiel/Pgx bridge_bidding environments.
+
+def rank_major_to_suit_major(card_rm: int) -> int:
+    """Convert rank-major card_id to suit-major card_id."""
+    rank = card_rm // 4
+    suit = card_rm % 4
+    return suit * 13 + rank
+
+
+def convert_hands_suit_to_rank(hands_sm: np.ndarray) -> np.ndarray:
+    """Convert (4, 52) hand matrix from suit-major to rank-major encoding.
+
+    Input:  hands_sm[p, suit*13+rank] = 1.0
+    Output: hands_rm[p, rank*4+suit]  = 1.0
+
+    Perf (P109): vectorized via precomputed permutation index — avoids
+    the O(4×52) Python loop that was a bottleneck in _encode_for_actor.
+    """
+    return hands_sm[:, _SM_TO_RM_IDX]
+
+
+# Precomputed permutation: hands_rm = hands_sm[:, _SM_TO_RM_IDX]
+# _SM_TO_RM_IDX[rm_idx] = sm_idx  such that hands_rm[p, rm_idx] = hands_sm[p, sm_idx]
+# i.e. for each rank-major index, what is the suit-major index of the same card?
+def _build_sm_to_rm_idx():
+    idx = np.zeros(52, dtype=np.intp)
+    for sm_idx in range(52):
+        suit = sm_idx // 13
+        rank = sm_idx % 13
+        rm_idx = rank * 4 + suit
+        idx[rm_idx] = sm_idx   # hands_rm[:, rm_idx] = hands_sm[:, sm_idx]
+    return idx
+
+_SM_TO_RM_IDX = _build_sm_to_rm_idx()
+
+
+# ==============================================================================
+# OpenSpiel State Helpers
+# ==============================================================================
+
+
+def get_openspiel_game(dealer: int = 0):
+    """Get a cached OpenSpiel bridge game instance for the given dealer."""
+    if dealer not in _GAMES:
+        import pyspiel
+        _GAMES[dealer] = pyspiel.load_game(
+            f'bridge(use_double_dummy_result=false,dealer={dealer})')
+    return _GAMES[dealer]
+
+
+def hands_to_openspiel_state(hands_rm: np.ndarray, dealer: int = 0):
+    """
+    Create an OpenSpiel state from a (4, 52) rank-major hand matrix.
 
     Args:
-        obs         : BridgeBiddingEnv._get_observation() dict
-        dealer      : dealer position (0=N, 1=E, 2=S, 3=W)
-        history_int : complete bidding history (int list, incl. Pass/X/XX/bids)
+        hands_rm: (4, 52) float32, rank-major encoding (card_id = rank*4+suit).
+                  If from competitive_env, convert first with convert_hands_suit_to_rank().
+        dealer:   dealer seat (0=N, 1=E, 2=S, 3=W).
 
-    Returns:
-        flat: (480,) float32 binary vector
+    Returns: pyspiel.State after dealing (ready for bidding)
+
+    P107 fix: SAYC training data always has dealer=North (dealer=0). The SL model
+    has only ever seen observations generated by GAME(dealer=0). Using a different
+    dealer game produces observations with different semantics, causing the model
+    to bid incoherently.
+
+    Fix: always use GAME(dealer=0). When dealer != 0, roll the hands so that
+    hands_rm[dealer] (the actual opener) is placed at index 0 before dealing.
+    This makes the observation identical in structure to training data.
+    The SL model is seat-agnostic: it only sees bidding history, not seat labels.
+
+    P109 perf: cache the interleaved deal-action sequence keyed on the bytes of
+    hands_to_deal. Building cards_per_player via np.where+sorted is O(4×52) and
+    was called once per rollout step — this reduces it to O(1) on cache hit.
     """
-    hand = obs['hand']                # (52,)
-    vul  = obs['vulnerability']       # (2,) → NS_vul, EW_vul
+    # Always use dealer=0 game (matches SL training distribution)
+    game = get_openspiel_game(0)
 
-    # ── Determine current player ─────────────────────────────────────────
-    # Current player = (dealer + len(history)) % 4
-    current_player = (dealer + len(history_int)) % NUM_PLAYERS
+    # Roll hands so the actual opener sits at index 0
+    if dealer == 0:
+        hands_to_deal = hands_rm
+    else:
+        hands_to_deal = np.roll(hands_rm, -dealer, axis=0)
 
-    # ── Vulnerability: 4-dim one-hot ─────────────────────────────────────
-    ns_vul = bool(vul[0] > 0.5)
-    ew_vul = bool(vul[1] > 0.5)
-    vul4 = np.zeros(4, dtype=np.float32)
-    vul4[int(ns_vul) * 2 + int(ew_vul)] = 1.0
+    # P109: cache the deal sequence — hands_to_deal is constant for a given deal
+    cache_key = hands_to_deal.tobytes()
+    deal_actions = _deal_action_cache.get(cache_key)
+    if deal_actions is None:
+        # P108 fix: OpenSpiel deals cards interleaved, not per-player consecutive.
+        # Order: p0[0], p1[0], p2[0], p3[0], p0[1], p1[1], ..., p3[12]
+        cards_per_player = [
+            sorted(np.where(hands_to_deal[p] > 0.5)[0]) for p in range(4)
+        ]
+        for p in range(4):
+            assert len(cards_per_player[p]) == 13, \
+                f"Player {p} has {len(cards_per_player[p])} cards, expected 13"
+        deal_actions = [
+            int(cards_per_player[p][i])
+            for i in range(13) for p in range(4)
+        ]
+        # Keep cache bounded to ~2000 unique deals
+        if len(_deal_action_cache) >= 2048:
+            # Evict oldest entry (insertion-ordered dict in Python 3.7+)
+            _deal_action_cache.pop(next(iter(_deal_action_cache)))
+        _deal_action_cache[cache_key] = deal_actions
 
-    # ── "Pass before opening" (4 bits, relative positions) ───────────────
-    # For each relative player, did they pass before the first substance bid?
-    pass_before_opening = np.zeros(4, dtype=np.float32)
-    for step_idx, bid in enumerate(history_int):
-        if bid >= BID_1C:
-            # First substance bid found — stop
-            break
-        if bid == BID_PASS:
-            abs_player = (dealer + step_idx) % NUM_PLAYERS
-            rel_player = (abs_player - current_player) % NUM_PLAYERS
-            pass_before_opening[rel_player] = 1.0
+    state = game.new_initial_state()
+    for card in deal_actions:
+        state.apply_action(card)
 
-    # ── Bidding history: 35 bids × 12 bits ──────────────────────────────
-    # For each real bid (1C..7NT), track who bid/doubled/redoubled it
-    # in relative positions.
-    #
-    # Layout per bid b (12 bits):
-    #   [self_bid, LHO_bid, partner_bid, RHO_bid,
-    #    self_dbl, LHO_dbl, partner_dbl, RHO_dbl,
-    #    self_rdbl, LHO_rdbl, partner_rdbl, RHO_rdbl]
-    bid_history = np.zeros((NUM_REAL_BIDS, 12), dtype=np.float32)
-
-    # Track what the last real bid was (for associating doubles)
-    last_real_bid_idx = -1  # index into 0..34
-
-    for step_idx, bid in enumerate(history_int):
-        abs_player = (dealer + step_idx) % NUM_PLAYERS
-        rel_player = (abs_player - current_player) % NUM_PLAYERS
-
-        if bid >= BID_1C:
-            # Substance bid: record who made it
-            real_idx = bid - BID_1C  # 0..34
-            bid_history[real_idx, 0 + rel_player] = 1.0  # bid slot
-            last_real_bid_idx = real_idx
-
-        elif bid == BID_DOUBLE and last_real_bid_idx >= 0:
-            # Double: record who doubled the last real bid
-            bid_history[last_real_bid_idx, 4 + rel_player] = 1.0
-
-        elif bid == BID_REDOUBLE and last_real_bid_idx >= 0:
-            # Redouble: record who redoubled the last real bid
-            bid_history[last_real_bid_idx, 8 + rel_player] = 1.0
-
-        # Pass: no explicit recording here (handled by pass_before_opening
-        # and implicitly by the absence of bid markers)
-
-    # ── Assemble 480-dim vector ──────────────────────────────────────────
-    flat = np.concatenate([
-        vul4,                           #   4
-        pass_before_opening,            #   4
-        bid_history.flatten(),          # 420  (35 × 12)
-        hand,                           #  52
-    ])
-    assert flat.shape == (OBS_DIM,), f"Expected {OBS_DIM}, got {flat.shape}"
-    return flat
+    assert not state.is_chance_node(), "Dealing not complete"
+    return state
 
 
-def batch_encode_obs(obs_list, dealers, history_ints):
-    """Batch encode: returns (B, 480) float32 ndarray."""
-    return np.stack([
-        encode_obs_flat(o, d, h)
-        for o, d, h in zip(obs_list, dealers, history_ints)
-    ])
+# LRU-style cache for deal action sequences (P109 perf)
+_deal_action_cache: dict = {}
+
+
+def get_openspiel_obs(state) -> np.ndarray:
+    """Get 571-dim observation from an OpenSpiel state."""
+    return np.array(state.observation_tensor(), dtype=np.float32)
+
+
+def advance_openspiel_state(state, our_action: int):
+    """Apply our action (0-37) to an OpenSpiel state."""
+    os_action = ours_to_openspiel_raw(our_action)
+    state.apply_action(os_action)
+    return state
 
 
 # ==============================================================================
-# Legacy 301-dim encoder (for backward compatibility during migration)
-# ==============================================================================
-
-def encode_obs_flat_legacy(obs: Dict[str, np.ndarray],
-                           dealer: int,
-                           history_int: list) -> np.ndarray:
-    """
-    Legacy 301-dim encoding (pre-P104). Kept for reference and migration testing.
-    DO NOT USE for new experiments.
-    """
-    vul  = obs['vulnerability']
-    hand = obs['hand']
-
-    ns_vul, ew_vul = bool(vul[0] > 0.5), bool(vul[1] > 0.5)
-    vul4 = np.zeros(4, dtype=np.float32)
-    vul4[int(ns_vul) * 2 + int(ew_vul)] = 1.0
-
-    who_called   = np.zeros((NUM_REAL_BIDS, 4), dtype=np.float32)
-    double_state = np.zeros((NUM_REAL_BIDS, 3), dtype=np.float32)
-    last_real_bid_real_idx = -1
-
-    for step_idx, bid in enumerate(history_int):
-        caller = (dealer + step_idx) % NUM_PLAYERS
-        if bid >= 3:
-            real_idx = bid - 3
-            who_called[real_idx, caller] = 1.0
-            double_state[real_idx, 0] = 1.0
-            last_real_bid_real_idx = real_idx
-        elif bid == 1 and last_real_bid_real_idx >= 0:
-            ri = last_real_bid_real_idx
-            double_state[ri, 0] = 0.0
-            double_state[ri, 1] = 1.0
-        elif bid == 2 and last_real_bid_real_idx >= 0:
-            ri = last_real_bid_real_idx
-            double_state[ri, 1] = 0.0
-            double_state[ri, 2] = 1.0
-
-    flat = np.concatenate([vul4, hand, who_called.flatten(), double_state.flatten()])
-    assert flat.shape == (OBS_DIM_OLD,), f"Expected {OBS_DIM_OLD}, got {flat.shape}"
-    return flat
-
-
-# ==============================================================================
-# Belief feature utilities (unchanged from P101)
+# Belief feature utilities (BCA extension)
 # ==============================================================================
 
 def make_belief_features_prior() -> np.ndarray:
     """
-    P101: Return belief prior feature vector (96,) = partner (48) + RHO (48).
+    Return belief prior feature vector (96,) = partner (48) + RHO (48).
     """
-    honor_prior = np.full(16, 0.25, dtype=np.float32)
+    honor_prior  = np.full(16, 0.25, dtype=np.float32)
     length_prior = np.full(32, 0.125, dtype=np.float32)
     single_prior = np.concatenate([honor_prior, length_prior])
     return np.concatenate([single_prior, single_prior])
@@ -219,18 +243,9 @@ def make_belief_features_prior() -> np.ndarray:
 def append_belief_features(flat_obs: np.ndarray,
                            belief_feats: np.ndarray) -> np.ndarray:
     """
-    P101: Concatenate base obs (480) + belief features (96) → (576,).
+    Concatenate base obs (571) + belief features (96) → (667,).
     """
     return np.concatenate([flat_obs, belief_feats])
-
-
-def encode_history_flat(history: torch.Tensor) -> torch.Tensor:
-    """
-    Compress bidding history to fixed-dim vector for BeliefNetwork.
-    (Unchanged — BeliefNetwork uses its own encoding.)
-    """
-    bid_presence = history.max(dim=1).values
-    return bid_presence.repeat(1, NUM_PLAYERS)
 
 
 # ==============================================================================
@@ -259,7 +274,12 @@ class AllHandsEncoder(nn.Module):
 class MLPPolicyNetwork(nn.Module):
     """
     Actor: 4 × 1024 MLP.
-    P104: Input is 480-dim (or 576-dim with belief features).
+    P105: Default input is 571-dim (OpenSpiel native).
+    BCA mode: 571 + 96 = 667-dim.
+
+    Compatible with SL checkpoint (sl_pretrain.py MLPPolicy):
+    Both use self.net = nn.Sequential(...) with identical layer structure,
+    so state_dict keys match ('net.0.weight', 'net.0.bias', etc.).
     """
 
     def __init__(self, obs_dim: int = OBS_DIM, hidden_dim: int = 1024,
@@ -365,3 +385,41 @@ class ActorCritic(nn.Module):
             flat_obs, legal_actions, deterministic)
         value = self.critic(flat_obs, all_hands)
         return action, log_prob, entropy, value
+
+
+# ==============================================================================
+# SL Checkpoint Loading Helper
+# ==============================================================================
+
+def load_sl_into_mappo_agent(agent, sl_checkpoint_path: str):
+    """
+    Load a P105 SL checkpoint into a MAPPOAgent.
+
+    P105 SL format: {'model_state': state_dict, 'obs_dim': 571, ...}
+    Old SL format:  {'actor_n': state_dict, 'actor_s': state_dict, ...}
+
+    The same weights are loaded into all 4 actor networks.
+    """
+    ckpt = torch.load(sl_checkpoint_path, map_location=agent.device,
+                      weights_only=False)
+
+    if 'model_state' in ckpt:
+        # P105 format
+        sd = {k: v.to(agent.device) for k, v in ckpt['model_state'].items()}
+        for player in range(NUM_PLAYERS):
+            agent.get_actor(player).load_state_dict(sd)
+    elif 'actor_n' in ckpt:
+        # Old format (actor_n, actor_s, actor_e, actor_w)
+        for player, key in [(0, 'actor_n'), (1, 'actor_e'),
+                            (2, 'actor_s'), (3, 'actor_w')]:
+            if key in ckpt:
+                sd = {k: v.to(agent.device) for k, v in ckpt[key].items()}
+                agent.get_actor(player).load_state_dict(sd)
+    else:
+        raise ValueError(f"Unknown SL checkpoint format. Keys: {list(ckpt.keys())}")
+
+    encoding = ckpt.get('encoding', 'unknown')
+    obs_dim  = ckpt.get('obs_dim', 'unknown')
+    acc      = ckpt.get('non_pass_acc', ckpt.get('val_acc', '?'))
+    print(f"[load_sl] Loaded SL checkpoint: encoding={encoding}, "
+          f"obs_dim={obs_dim}, acc={acc}")
