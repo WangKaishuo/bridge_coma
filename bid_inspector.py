@@ -3,24 +3,39 @@
 Bidding Inspector — P105 (OpenSpiel-native observations)
 ==========================================================
 
-Compare RL agent vs SL on specific deals, or run SL-only diagnostics.
+一个模型 → 自我对战（单桌展示叫牌过程）
+两个模型 → 双桌对战（model1视角IMP）
 
-Uses pyspiel.State.observation_tensor() for all observation generation.
-Handles card encoding conversion for competitive_env deals (suit-major → rank-major).
+支持 agent 和 sl 两种模型类型任意组合。
 
 Usage:
-  # SL-only mode (diagnose SL quality on competitive deals)
+  # SL 自我对战（单桌展示）
   python bid_inspector.py \
-      --sl results/sl_base.pt \
-      --data data/competitive_500k.npz \
-      --sl_only --num_deals 10
+      --model1 results/sl_base.pt --type1 sl \
+      --data data/competitive_500k.npz --num_deals 10
 
-  # Agent vs SL comparison
+  # Agent 自我对战
   python bid_inspector.py \
-      --agent results/agent_a.pt \
-      --sl results/sl_base.pt \
-      --data data/competitive_500k.npz \
-      --num_deals 10
+      --model1 results/agent_a.pt --type1 agent \
+      --data data/competitive_500k.npz --num_deals 10
+
+  # Agent vs SL（双桌对战，agent视角IMP）
+  python bid_inspector.py \
+      --model1 results/agent_a.pt --type1 agent \
+      --model2 results/sl_base.pt  --type2 sl \
+      --data data/competitive_500k.npz --num_deals 20
+
+  # Agent A vs Agent B（双桌对战）
+  python bid_inspector.py \
+      --model1 results/agent_a.pt --type1 agent \
+      --model2 results/agent_b.pt --type2 agent \
+      --data data/competitive_500k.npz --num_deals 20
+
+  # SL vs SL（双桌对战）
+  python bid_inspector.py \
+      --model1 results/sl_base.pt      --type1 sl \
+      --model2 results/sl_competitive.pt --type2 sl \
+      --data data/competitive_500k.npz --num_deals 20
 """
 
 from __future__ import annotations
@@ -231,6 +246,12 @@ def _make_play_mixed_policy(model, hands_sm, dealer, device):
     """
     Build a (obs, player, history_int) -> action closure for play_mixed.
     Uses OpenSpiel state for obs generation (same as RL inference).
+
+    IMPORTANT: play_mixed passes real seat numbers (0=N,1=E,2=S,3=W) as
+    `player`, but hands_to_openspiel_state always uses dealer=0 game with
+    hands rolled so opener→index 0. So the OpenSpiel-relative player index
+    is (real_player - dealer) % 4, which must be used to select the correct
+    actor (matching SL training, where dealer=0 always).
     """
     hands_rm = convert_hands_suit_to_rank(hands_sm)
 
@@ -247,9 +268,16 @@ def _make_play_mixed_policy(model, hands_sm, dealer, device):
                 os_state.apply_action(os_a)
         flat = get_openspiel_obs(os_state)
         flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
-        legal_mask = torch.tensor(
-            obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(device)
-        actor = model.get_actor(player)
+        # Use legal actions from OpenSpiel state (matches solo mode)
+        legal_os = os_state.legal_actions()
+        legal_mask = torch.zeros(1, NUM_BIDS, dtype=torch.float32, device=device)
+        for os_a in legal_os:
+            ours = openspiel_raw_to_ours(os_a)
+            if ours >= 0:
+                legal_mask[0, ours] = 1.0
+        # Convert real seat → OpenSpiel-relative seat (dealer=0 convention)
+        rel_player = (player - dealer) % 4
+        actor = model.get_actor(rel_player)
         with torch.no_grad():
             action, _, _ = actor.get_action(flat_t, legal_mask, deterministic=True)
         return action.item()
@@ -307,7 +335,82 @@ def play_deal(
 
     return results
 
+def play_deal_ab(
+    hands_sm,
+    dd_table,
+    dealer,
+    agent_a,
+    agent_b,
+    device,
+    env,
+    verbose=True,
+):
+    """
+    Agent A vs Agent B 双桌对战:
+      桌1: A=NS,  B=EW  -> score_1  (NS视角)
+      桌2: B=NS,  A=EW  -> score_2  (NS视角)
+      IMP_A = score_to_imp(score_1 - score_2)  (A 视角)
+      IMP_B = -IMP_A                             (B 视角)
 
+    与 evaluate_head_to_head 语义完全一致。
+    """
+    vul = (False, False)
+
+    policy_a = _make_play_mixed_policy(agent_a, hands_sm, dealer, device)
+    policy_b = _make_play_mixed_policy(agent_b, hands_sm, dealer, device)
+
+    # 桌1: A=NS, B=EW
+    contract_1, score_1, hist_1 = env.play_mixed(
+        hands_sm, dd_table,
+        ns_policy=policy_a, ew_policy=policy_b,
+        vulnerability=vul, dealer=dealer)
+
+    # 桌2: B=NS, A=EW
+    contract_2, score_2, hist_2 = env.play_mixed(
+        hands_sm, dd_table,
+        ns_policy=policy_b, ew_policy=policy_a,
+        vulnerability=vul, dealer=dealer)
+
+    imp_a = float(score_to_imp(score_1 - score_2))
+
+    results = {
+        'table1': {'label': 'A(NS) vs B(EW)',
+                   'contract': contract_1, 'score': score_1, 'history': hist_1},
+        'table2': {'label': 'B(NS) vs A(EW)',
+                   'contract': contract_2, 'score': score_2, 'history': hist_2},
+        'imp_a': imp_a,
+        'vul': vul,
+    }
+
+    if verbose:
+        _print_cross_table_ab(hands_sm, dealer, dd_table, results)
+
+    return results
+
+
+def _print_cross_table_ab(hands, dealer, dd_table, results):
+    """Print A vs B cross-table results."""
+    print(f"\n{'═' * 65}")
+    print(f"  AGENT A vs AGENT B (双桌对战)")
+    print(f"{'═' * 65}")
+    print(f"  Fixed prefix: {PLAYER_SHORT[dealer]}:1♥ → "
+          f"{PLAYER_SHORT[(dealer+1)%4]}:1♠")
+
+    t1 = results['table1']
+    t2 = results['table2']
+    vul = results['vul']
+
+    _print_table(t1['label'], t1['history'], dealer, dd_table,
+                 t1['contract'], t1['score'], vul)
+    _print_table(t2['label'], t2['history'], dealer, dd_table,
+                 t2['contract'], t2['score'], vul)
+
+    imp_a = results['imp_a']
+    verdict = ("✅ A wins" if imp_a > 0 else
+               "❌ B wins" if imp_a < 0 else "— tie")
+    print(f"\n  IMP (A perspective): {imp_a:+.0f}  "
+          f"(T1={t1['score']:+d}, T2={t2['score']:+d})  {verdict}")
+    print(f"{'═' * 65}")
 
 
 # ==============================================================================
@@ -357,6 +460,9 @@ def _print_sl_solo(hands, dealer, dd_table, result, vul):
         target = 6 + contract.level
         result_str = f"making {tricks}" if tricks >= target else f"down {target - tricks}"
         score = calculate_score(contract, tricks, vul)
+        # EW作庄时NS视角取负
+        if contract.declarer % 2 == 1:
+            score = -score
         print(f"  DDS {tricks} tricks ({result_str}), NS score: {score:+d}")
     else:
         print(f"  Contract: Passed out")
@@ -428,88 +534,116 @@ def _print_cross_table(hands, dealer, dd_table, results):
 # Main
 # ==============================================================================
 
+def _load_model(path: str, model_type: str, device: str):
+    """Load a model by type ('agent' or 'sl')."""
+    if model_type == 'sl':
+        print(f"[Bid Inspector] Loading SL: {path}")
+        return load_sl(path, device)
+    else:
+        print(f"[Bid Inspector] Loading agent: {path}")
+        return load_agent(path, device)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Bidding Inspector (P105)")
-    parser.add_argument('--agent', default=None, help='RL agent checkpoint')
-    parser.add_argument('--sl', required=True, help='SL checkpoint')
-    parser.add_argument('--data', required=True, help='Competitive data (npz)')
+    parser = argparse.ArgumentParser(
+        description="Bidding Inspector (P105)\n\n"
+                    "一个模型 → 自我对战（单桌展示）\n"
+                    "两个模型 → 双桌对战（model1视角IMP）",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    parser.add_argument('--model1', required=True,
+                        help='第一个模型路径（必填）')
+    parser.add_argument('--type1', default='agent', choices=['agent', 'sl'],
+                        help='model1类型: agent 或 sl（默认: agent）')
+    parser.add_argument('--model2', default=None,
+                        help='第二个模型路径（可选，不填则model1自我对战）')
+    parser.add_argument('--type2', default='agent', choices=['agent', 'sl'],
+                        help='model2类型: agent 或 sl（默认: agent）')
+    parser.add_argument('--data', required=True,
+                        help='Competitive data (npz)')
     parser.add_argument('--num_deals', type=int, default=10)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--sl_only', action='store_true',
-                        help='SL-only mode (no agent needed)')
+    parser.add_argument('--quiet', action='store_true',
+                        help='只打印最终汇总，不打印每局细节')
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
 
-    if not args.sl_only and args.agent is None:
-        parser.error("--agent is required unless --sl_only is specified")
+    model1 = _load_model(args.model1, args.type1, device)
 
-    print(f"[Bid Inspector] Loading SL: {args.sl}")
-    sl = load_sl(args.sl, device)
-
-    agent = None
-    if not args.sl_only:
-        print(f"[Bid Inspector] Loading agent: {args.agent}")
-        agent = load_agent(args.agent, device)
+    vs_self = args.model2 is None
+    if vs_self:
+        model2 = model1
+        mode_str = f"{args.type1.upper()}1 自我对战 (4×同一模型)"
+    else:
+        model2 = _load_model(args.model2, args.type2, device)
+        mode_str = (f"{args.type1.upper()}1 vs {args.type2.upper()}2 "
+                    f"(双桌对战, model1视角)")
 
     print(f"[Bid Inspector] Loading deals: {args.data}")
     env = CompetitiveSubgameEnv(args.data)
-
-    mode_str = "SL solo (4 × SL, single table)" if args.sl_only else "Agent vs SL"
     print(f"[Bid Inspector] Mode: {mode_str}\n")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     vul = (False, False)
-    scores = []
-    imps   = []
+    imps = []
 
     for deal_idx in range(args.num_deals):
         hands, dd_table = env.generate_deal()
         dealer = env._sampled_dealer
 
-        print(f"\n\n{'▓' * 65}")
-        print(f"  DEAL {deal_idx + 1}/{args.num_deals}")
-        print(f"{'▓' * 65}")
-        display_deal(hands, dealer)
+        if not args.quiet:
+            print(f"\n\n{'▓' * 65}")
+            print(f"  DEAL {deal_idx + 1}/{args.num_deals}")
+            print(f"{'▓' * 65}")
+            display_deal(hands, dealer)
+        elif (deal_idx + 1) % 500 == 0:
+            print(f"  ... {deal_idx + 1}/{args.num_deals} deals done")
 
-        if args.sl_only:
-            result = play_deal_sl_only(hands, dd_table, dealer, sl, device)
-            _print_sl_solo(hands, dealer, dd_table, result, vul)
-
+        if vs_self:
+            result = play_deal_sl_only(hands, dd_table, dealer, model1, device,
+                                       verbose=False)
+            if not args.quiet:
+                _print_sl_solo(hands, dealer, dd_table, result, vul)
             contract = result['contract']
             if contract:
                 tricks = int(dd_table[contract.suit, contract.declarer])
                 score = calculate_score(contract, tricks, vul)
-                scores.append(score)
+                if contract.declarer % 2 == 1:
+                    score = -score
+                imps.append(score)
         else:
-            result = play_deal(hands, dd_table, dealer, agent, sl, device, env)
-            imps.append(result['imp'])
+            result = play_deal_ab(hands, dd_table, dealer,
+                                  model1, model2, device, env,
+                                  verbose=not args.quiet)
+            imps.append(result['imp_a'])
 
-    # Summary
+    # ── Summary ──────────────────────────────────────────────────────────────
     print(f"\n\n{'█' * 65}")
-    if args.sl_only:
-        print(f"  SL SOLO SUMMARY ({args.num_deals} deals)")
-        print(f"{'█' * 65}")
-        if scores:
-            scores_arr = np.array(scores)
-            print(f"  NS score: mean={scores_arr.mean():+.1f}  "
-                  f"std={scores_arr.std():.1f}  "
-                  f"min={scores_arr.min():+.0f}  max={scores_arr.max():+.0f}")
-            made = sum(1 for s in scores if s >= 0)
-            print(f"  Contracts made: {made}/{len(scores)} "
-                  f"({made/len(scores):.0%})")
-    else:
-        print(f"  CROSS-TABLE SUMMARY ({args.num_deals} deals)")
+    if vs_self:
+        print(f"  自我对战 SUMMARY ({args.num_deals} deals)")
         print(f"{'█' * 65}")
         if imps:
-            import numpy as _np
-            arr = _np.array(imps)
-            wins = (arr > 0).sum()
-            print(f"  Agent mean IMP: {arr.mean():+.3f} ± {arr.std():.3f}")
-            print(f"  Win/Loss/Tie: {wins}/{(arr<0).sum()}/{(arr==0).sum()}")
+            arr = np.array(imps)
+            made = (arr >= 0).sum()
+            print(f"  NS score: mean={arr.mean():+.1f} ± {arr.std():.1f}  "
+                  f"min={arr.min():+.0f}  max={arr.max():+.0f}")
+            print(f"  NS正分局数: {made}/{len(imps)} ({made/len(imps):.0%})")
+    else:
+        label1 = f"{args.type1.upper()}1"
+        label2 = f"{args.type2.upper()}2"
+        print(f"  {label1} vs {label2} CROSS-TABLE SUMMARY ({args.num_deals} deals)")
+        print(f"{'█' * 65}")
+        if imps:
+            arr = np.array(imps)
+            wins  = (arr > 0).sum()
+            losses= (arr < 0).sum()
+            ties  = (arr == 0).sum()
+            print(f"  IMP ({label1} perspective): mean={arr.mean():+.3f} ± {arr.std():.3f}")
+            print(f"  {label1} wins / {label2} wins / Tie: {wins} / {losses} / {ties}")
     print(f"{'█' * 65}")
 
 

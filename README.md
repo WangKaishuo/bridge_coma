@@ -22,11 +22,24 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 11. **OpenSpiel `observation_tensor()` does NOT contain private hand cards.** It is a public-information tensor (bidding history only). The SL model learns to predict next bid from bidding history alone — this is correct and intentional (86.6% non_pass_acc confirms it works).
 12. **Dealing order for `hands_to_openspiel_state`:** interleaved `p0[0], p1[0], p2[0], p3[0], p0[1], ...` — NOT consecutive 13 cards per player. Wrong order produces different obs.
 13. **Colab 12-hour limit:** Use `drift_sweep.py` with `--lambdas` and `--seeds` to split work across sessions. It auto-skips completed runs.
-14. **Save results after every Colab session.** `zip -r results_partial.zip results/` and download. Upload + unzip at start of next session for auto-skip to work.
+14. **Save results after every Colab session.** Mount Google Drive BEFORE running experiments, then use `--gdrive_dest` for auto-upload. Do NOT write checkpoints directly to Google Drive during training — the write latency will slow training by ~10x.
 15. **Stage 3 eval_deals=5000, no per-round H2H.** Per-round H2H was removed (P110) — too noisy. All statistical evaluation deferred to Stage 3.
 16. **`_deal_action_cache` size is 8192** (was 2048). Stage 3 with 5000 deals requires larger cache to avoid 0.64s/deal rebuild overhead.
 17. **DDS regret IS opponent-dependent.** Do NOT claim it as an opponent-independent metric. actual_score depends on both sides' bidding. This is a known limitation documented in the experiment design.
 18. **`bid_inspector.py` now uses cross-table (双桌对战).** play_deal() calls play_mixed() twice, same semantics as cross_evaluate(). Old single-table comparison was scientifically incorrect.
+19. **`drift_sweep.py` now supports `--gdrive_dest`.** Mount Drive in a separate cell first (`from google.colab import drive; drive.mount('/content/drive')`), then pass `--gdrive_dest '/content/drive/MyDrive/...'`. The script will auto-upload after all runs complete.
+20. **Stage B of BCA SL pretrain can be skipped.** Stage B trains a 667-dim Actor on SAYC with frozen SL BeliefNet. Since BeliefNet is updated from round 1 of RL anyway, Stage B's learned "how to use belief features" is immediately obsolete. Skip Stage B; instead zero-init the 96 new belief columns in the Actor and let RL co-evolve Actor + BeliefNet together.
+21. **BCA RL training: freeze_belief=False + BeliefReplayBuffer.** BeliefNet must update during RL to track agent's drifting protocol. Use belief_warmup_rounds=5 (freeze_belief=True for first 5 rounds) to let Actor stabilize before co-evolution begins. Buffer capacity=50000 is sufficient.
+22. **Agent bidding differs against different opponents — this is correct.** The 571-dim obs encodes full bidding history. When opponent bids differently (e.g., SL vs another agent), the history diverges, so obs diverges, so agent's response legitimately differs. This is NOT a bug.
+23. **bid_inspector stochastic inference: RESOLVED (P115).** Both inference paths (`make_policy_with_probs_openspiel` and `_make_play_mixed_policy`) use deterministic inference (`logits.argmax` / `deterministic=True`). The observed difference between `--sl_only` and `--agent` modes was caused by `--sl_only` using `load_sl()` to load an RL checkpoint — `load_sl()` has a different weight-mapping path than `load_agent()`, producing incorrect actor weights. **Fix:** new `--agent_only` mode uses `load_agent()` for correct RL checkpoint loading.
+24. **`bid_inspector.py --agent_only` mode (P115).** Uses `load_agent` + cross-table `play_deal`, both sides use the same agent object. Replaces the broken pattern of `--sl agent_a.pt --sl_only` which silently loaded RL weights through the wrong path.
+25. **FSP is preferred over self-play for training.** Self-play without external anchor causes mutual escalation (7-level乱叫). FSP with `sl_competitive.pt` as permanent pool entry provides stable distribution anchor. Use `self_play=False` in SubgameConfig.
+26. **`sl_competitive.pt` trained on 1H-1S filtered SAYC data (17,401 games, non_pass_acc=84.6%).** Behaves normally in self-play (2-4 level contracts). Use as FSP anchor and RL init checkpoint for competitive subgame.
+27. **P116 (CRITICAL): `_make_play_mixed_policy` in `bid_inspector.py` had two bugs.** (1) `legal_mask` was taken from `obs['legal_actions']` (BridgeBiddingEnv) instead of OpenSpiel state — these can be inconsistent. (2) actor was selected by real seat number instead of OpenSpiel-relative seat `(player-dealer)%4`. Both bugs caused degenerate bidding (7NT chaos) in cross-table evaluation. **Fix:** legal_mask now reconstructed from `os_state.legal_actions()`; actor selection uses `(player-dealer)%4`. BridgeBiddingEnv and OpenSpiel legal actions are logically equivalent (verified), so training code is unaffected.
+28. **P116: All prior cross-table IMP results from bid_inspector are INVALID.** +7.406, +1.244, +8.777 IMP figures were artifacts of the legal_mask bug. Corrected evaluation: λ=0.5 agent (25 rounds, FSP, sl_competitive init) vs SL = **-0.117 ± 11.738 IMP** (statistically indistinguishable from zero). λ=0.0 agent (60 rounds) vs SL = **-1.680 ± 11.563 IMP** (SL wins marginally). RL training has not yet produced a measurable advantage over SL.
+29. **P116: `make_agent_policy` in `competitive_env.py` has the same bugs as bid_inspector.** H2H evaluation inside `subgame_validation.py` (cross_evaluate) is also invalid. All reported Stage 3 IMP numbers from prior runs must be discarded.
+30. **Training code (`_collect_episodes_batch` in `subgame_trainer.py`) is NOT affected by P116.** `BridgeBiddingEnv` and OpenSpiel legal actions are logically equivalent. Actor selection by role name (`actor_n/e/s/w`) matches obs correctly because all 4 actors have identical SL weights.
+31. **Open research question: why does RL not improve over SL?** vl converges (28→14), pl decreases slightly (-0.007→-0.003), entropy increases (0.330→0.364). Critic learns but actor may not receive effective gradient. Hypothesis: IMP reward signal has very high variance (std≈8-11 IMP) relative to signal, causing near-zero advantage estimates after GAE normalization. Needs investigation in next session.
 
 ---
 
@@ -50,122 +63,120 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 | P111: Fix `bridge_bidding_env.py` X/XX legal actions state machine | ✅ |
 | P112: Fix `bid_inspector.py` to use cross-table play_mixed | ✅ |
 | P113: Fix `sl_pretrain_bca.py` Stage B to use 571-dim OpenSpiel obs (was encode_obs_flat 301-dim) | ✅ |
-| **Drift Sweep Exp 1** (571-dim, λ=0.0 and λ=1.0, seed=100) | ✅ **Partial results** |
-| Full drift sweep (λ ∈ {0.0, 0.1, 0.3, 0.5, 1.0}, 5 seeds) | ⏳ Pending — experiment design under review |
-| BCA SL pretrain (`sl_base_bca.pt`, 667-dim) | ⏳ Pending |
-| BCA core experiment (A/B/C, 667-dim) | ⏳ Pending |
+| P114: Add `--gdrive_dest` to `drift_sweep.py` for auto Google Drive upload | ✅ |
+| **Drift Sweep Exp 1** (571-dim, λ=0.0, seed=100, 20 rounds) | ✅ +7.406 IMP |
+| **Drift Sweep Exp 2** (571-dim, λ=1.0, seed=100, 20 rounds) | ✅ +1.244 IMP |
+| **Drift Sweep Exp 3** (571-dim, λ=0.0, seed=100, 60 rounds) | ✅ +8.777 IMP |
+| P115: Fix `bid_inspector.py` — add `--agent_only` mode, resolve `load_sl` vs `load_agent` confusion | ✅ |
+| P115: Switch training from FSP to pure self-play (`self_play=True` in SubgameConfig) | ✅ |
+| BCA SL pretrain Stage A (`sl_base_bca.pt`, 667-dim) | ⏳ In progress |
+| BCA core experiment (Agent A/B, 667-dim, full env) | ⏳ Pending |
+| Drift advantage isolation experiment (fix agent, vary opponent understanding) | ⏳ Pending — requires BCA complete |
 
 ---
 
-## Drift Sweep Results (571-dim, seed=100, partial)
+## Drift Sweep Results (571-dim, seed=100)
 
-| λ | A vs SL IMP | std | win_rate | notes |
-|---|------------|-----|----------|-------|
-| 0.0 | +7.406 | 10.223 | 72.2% | unconstrained drift |
-| 1.0 | +1.244 | 5.692 | 20.0% | near-SL behavior; 9/10 bid inspector deals are tie |
+⚠️ **ALL PRIOR CROSS-TABLE RESULTS ARE INVALID — see P116 bug below.**
 
-**Key observations:**
-- λ=0.0 advantage is largely due to **better competitive judgment** (doubling decisions, sacrifice bids), NOT convention drift confusing opponents. Confirmed by bid inspector qualitative analysis.
-- λ=1.0 agent almost identical to SL (KL constraint too strong), confirming the constraint mechanism works.
-- The gap λ=0.0 vs λ=1.0 (+6.2 IMP) **cannot be cleanly attributed to drift** — KL constraint also limits policy improvement independently of drift. See "Experiment Design Issues" below.
+| λ | rounds | A vs SL IMP (corrected) | std | notes |
+|---|--------|------------------------|-----|-------|
+| 0.5 | 25 | -0.117 | 11.738 | FSP, sl_competitive init, corrected eval |
+| 0.0 | 60 | -0.117→TBD | — | needs re-eval with corrected bid_inspector |
+
+**All prior +7.406 / +1.244 / +8.777 IMP numbers are artifacts of P116 bug and must be discarded.**
 
 ---
 
-## ⚠️ Experiment Design Issues (Identified 2026-03-26)
+## ⚠️ Experiment Design Issues
 
 ### Issue 1: DDS regret is NOT opponent-independent
-`dds_oracle_evaluate` computes `regret = actual_score - dds_optimal_score`. But `actual_score` depends on BOTH sides' bidding. So regret is still opponent-dependent. The decomposition `drift_advantage = vs_SL_IMP - DDS_regret` does NOT cleanly isolate drift.
+`dds_oracle_evaluate` computes `regret = actual_score - dds_optimal_score`. But `actual_score` depends on BOTH sides' bidding. So regret is still opponent-dependent.
 
 ### Issue 2: λ sweep confounds drift and policy quality
-λ↓ simultaneously causes:
-1. More convention drift (D_KL increases)
-2. Less constrained policy optimization (agent can explore more)
+λ↓ simultaneously causes (1) more convention drift and (2) less constrained policy optimization. These are inseparable. The IMP gap between λ=0.0 and λ=1.0 cannot be attributed to drift alone.
 
-These two effects are inseparable in the current design. The +6.2 IMP gap between λ=0.0 and λ=1.0 could be entirely due to (2) with zero contribution from (1).
+**Salvageable framing:** Present λ sweep as "measuring the causal effect of protocol compliance constraint on vs-SL IMP" — analogous to KL-reward Pareto frontier in RLHF. Limitation must be explicitly acknowledged.
 
 ### Issue 3: Correct experiment to isolate drift advantage
-Fix the agent (use the trained λ=0.0 agent), vary the **opponent's understanding**:
+Fix the trained λ=0.0 agent. Vary opponent understanding:
 - Opponent A: plain SL (cannot interpret drifted bids)
-- Opponent B: SL + belief net (understands drifted bids via convention card)
+- Opponent B: SL policy + BeliefNet fine-tuned on agent's rollout data (understands drifted bids)
 
-If A_IMP > B_IMP, drift genuinely helps against unaware opponents. This is a clean causal test. Requires BCA infrastructure to be complete first.
+If A_IMP > B_IMP → drift genuinely helps against unaware opponents.
 
-### Issue 4: λ sweep framing is still salvageable
-Frame as: "we measure the causal effect of protocol compliance constraint on vs-SL IMP". The sweep is NOT claiming to isolate drift — it establishes that **relaxing the constraint increases vs-SL IMP**, which is a valid observation with correct framing (analogous to KL-reward Pareto frontier in RLHF). The limitation (confounding with policy quality) must be acknowledged explicitly.
+**Critical constraint:** Opponent B's BeliefNet must be fine-tuned on the drifted agent's rollout data AFTER training. The standard SL BCA BeliefNet is trained on SAYC and cannot understand drifted bids — it is equally blind to drift as plain SL. This experiment requires: (1) train λ=0.0 agent to convergence, (2) generate rollout data, (3) fine-tune BeliefNet on rollout data, (4) use fine-tuned BeliefNet as Opponent B's convention card.
+
+**This experiment is the only scientifically clean way to quantify drift advantage.**
+
+### Issue 4: FSP training produces anti-SL exploits, not general strategies (P115)
+The drift sweep (λ=0.0, 60 rounds) agent shows +8.777 IMP vs SL but performs catastrophically in self-play (mean score ≈ −450, 28% contracts made). The agent learns to exploit SL-specific weaknesses (e.g., SL never plays XX, doesn't counter aggressive high-level bidding) rather than learning genuinely better bridge.
+
+**Root cause:** FSP pool is seeded with SL baseline and only contains SL-derived snapshots. The agent never faces an opponent that adapts to its own strategy, so it has no incentive to develop robust play.
+
+**Fix (P115):** `self_play=True` in SubgameConfig disables FSP entirely. Opponent = current agent's own weights (pure self-play). This forces strategies toward Nash equilibrium: aggressive exploit tactics that backfire against a competent opponent are punished immediately.
+
+**Trade-off:** Self-play may converge slower and to a lower vs-SL IMP. But the resulting strategy will be sound bridge rather than a fragile anti-SL exploit. Vs-SL IMP remains a secondary metric; the primary metrics (I(bid;hand|partner), I(bid;hand|opponent)) are measured independently.
 
 ---
 
-## Research Narrative (confirmed 2026-03-26)
+## Research Narrative (confirmed 2026-03-27)
 
-**Core MARL question:** In dual-audience signaling (protocol-constrained, same bid interpreted by partner AND opponent), does information-theoretic reward shaping improve coordination?
+**Core MARL question:** In dual-audience signaling (same bid interpreted by partner AND opponent), does information-theoretic reward shaping improve coordination?
 
 **Story structure:**
 - Bridge is testbed, not the goal
-- BCA is infrastructure that closes the perception-action loop (fair test prerequisite)
+- BCA closes the perception-action loop (full disclosure prerequisite — all players must have equal access to bidding system interpretation)
 - r_info is the proposed method
-- Convention drift is a methodological bonus contribution discovered en route
+- Convention drift is a methodological bonus contribution
 
-**Experiment matrix (revised):**
-- A vs SL → sanity check (does RL + closed perception loop improve over SL?)
-- B vs A → **core RQ1**: does partner information incentive improve coordination?
-- C vs B → **core RQ2**: does opponent leakage penalty add value?
-- Drift sweep → independent methodological contribution (with honest framing of limitations)
+**Experiment matrix:**
+- Agent A vs SL → sanity check (does RL improve over SL baseline?)
+- Agent B vs Agent A → **core RQ1**: does r_info improve partner information transmission?
+- Drift isolation experiment → methodological contribution (requires BCA complete)
+- λ sweep → framing as KL-compliance Pareto frontier (with honest confounding acknowledgment)
+
+**Primary metric (MARL language):**
+- I(bid; hand | partner): does Agent B's bidding carry more information for partner?
+- I(bid; hand | opponent): does Agent B's bidding leak less to opponent?
+- These are computed via BeliefNet at evaluation time, independent of training objective
+
+**Secondary metric:** vs-SL IMP (ecological validity check)
 
 **Both result routes are publishable:**
-- r_info works → NeurIPS/ICML: wiretap-channel reward shaping improves coordination
-- r_info doesn't work → AAMAS/CoG: in constrained policy spaces, task reward already contains communication incentives (valuable negative result)
+- r_info works → NeurIPS/ICML/AAMAS: wiretap-channel reward shaping improves dual-audience coordination
+- r_info doesn't work → CoG/workshop: task reward subsumes information incentives in constrained protocol spaces (valuable negative result)
 
 ---
 
-## ⚠️ P106–P108: `hands_to_openspiel_state` Fix History (2026-03-26)
+## BCA Architecture (current design, 2026-03-27)
+
+**Actor input:** 571 (OpenSpiel obs) + 48 (partner belief) + 48 (RHO belief) = **667-dim**
+
+**Training flow:**
+1. Stage A: Train BeliefNet on SAYC data (honor BCE + length CE losses). Target: honor_acc > 0.76, length_acc > 0.40.
+2. **Skip Stage B.** Zero-init the 96 belief columns in Actor; load 571-dim weights from `sl_base.pt`.
+3. RL phase: Actor + BeliefNet co-evolve. Use `belief_warmup_rounds=5` (freeze BeliefNet for first 5 rounds). After round 5, `freeze_belief=False` with BeliefReplayBuffer (capacity=50000) to prevent catastrophic forgetting.
+
+**Full disclosure compliance:** All four players (including SL opponents) must use BCA. SL opponent policy remains `sl_base.pt` (571-dim), but receives belief features from the shared BeliefNet. This satisfies the bridge full disclosure rule.
+
+---
+
+## ⚠️ P106–P108: `hands_to_openspiel_state` Fix History
 
 ### P106: Wrong dealing start seat
-**Bug:** Loop always started at `player 0` (North), but OpenSpiel deals starting from the dealer seat.
 **Fix:** `for i in range(4): player = (dealer + i) % 4`
 
 ### P107: Wrong game instance for non-North dealers
-**Bug:** Used `game(dealer=X)` for each dealer. SAYC training data always has `dealer=North (0)`. A `game(dealer=2)` produces observations with different semantics.
 **Fix:** Always use `game(dealer=0)`. Roll hands by `-dealer` so the opener always sits at index 0.
 
 ### P108: Wrong dealing order (consecutive vs interleaved)
-**Fix:**
 ```python
 cards_per_player = [sorted(np.where(hands_to_deal[p] > 0.5)[0]) for p in range(4)]
 for i in range(13):
     for p in range(4):
         state.apply_action(int(cards_per_player[p][i]))
 ```
-
-### Key insight: OpenSpiel obs does NOT contain private hand cards
-`observation_tensor()` (571-dim) contains **only public information** (bidding history + game metadata). The 86.6% SL accuracy comes entirely from learning bidding history patterns.
-
----
-
-## ⚠️ P111: bridge_bidding_env.py X/XX Legal Actions Fix
-
-**Bug:** `_get_legal_actions()` used two independent boolean loops for Double/Redouble. After Redouble, `doubled=False` incorrectly re-allowed Double.
-
-**Fix:** Unified `double_state` state machine (0=undoubled, 1=doubled, 2=redoubled). After Redouble (state=2), neither X nor XX is legal.
-
----
-
-## ⚠️ P113: sl_pretrain_bca.py Stage B Fix
-
-**Bug:** Stage B `collect_stage_b_data()` called `encode_obs_flat()` (deleted in P108), producing 301-dim base obs instead of 571-dim OpenSpiel obs.
-
-**Fix:** Stage B now uses `hands_to_openspiel_state` + `get_openspiel_obs` → 571-dim base obs. Combined with belief features: 571 + 48 + 48 = **667-dim** actor input (was incorrectly 397-dim = 301 + 96).
-
----
-
-## Architecture: SL→RL Bridge (P108, resolved)
-
-**Decision: Option 3 (Map at RL time)** — implemented in P108.
-
-At each RL step, `subgame_trainer._encode_for_actor()` converts the current env state to an OpenSpiel obs:
-1. `convert_hands_suit_to_rank(hands_sm)` — suit-major → rank-major
-2. `hands_to_openspiel_state(hands_rm, dealer)` — build OpenSpiel state with P108 interleaved dealing
-3. Replay `history_int` via `ours_to_openspiel_raw(a)`
-4. `get_openspiel_obs(state)` → 571-dim obs
 
 ---
 
@@ -175,35 +186,49 @@ At each RL step, `subgame_trainer._encode_for_actor()` converts the current env 
 # Required every Colab session
 pip install open_spiel
 
+# Mount Google Drive BEFORE running experiments
+# (run in a separate cell)
+from google.colab import drive
+drive.mount('/content/drive')
+
 # SL training (already done — sl_base.pt exists)
 python sl_pretrain.py --iterations 400000 --batch_size 128 --device cuda
 
-# BCA SL training (667-dim, uses sl_base.pt as init)
+# BCA SL training — Stage A only (skip Stage B)
 python sl_pretrain_bca.py \
     --train data/sayc_train.txt \
     --valid data/sayc_valid.txt \
     --out results/sl_base_bca.pt \
     --init_from results/sl_base.pt \
-    --epochs 30 --device cuda
+    --epochs 50 --device cuda
 
-# Drift sweep (Exp 1, 571-dim, no BCA)
+# Drift sweep (571-dim diagnostic, no BCA)
 python drift_sweep.py \
     --mode 571 \
     --sl_checkpoint results/sl_base.pt \
     --data data/competitive_500k.npz \
-    --lambdas 0.0 0.1 0.3 0.5 1.0 \
-    --seeds 42 123 456 789 2024 \
-    --rounds 20 --eval_deals 3000
+    --lambdas 0.0 \
+    --seeds 42 \
+    --rounds 60 \
+    --eval_deals 5000 \
+    --gdrive_dest '/content/drive/MyDrive/bridge_coma/drift_sweep_60r'
 
-# Bid inspector (cross-table, agent vs SL)
+# Core experiment (BCA, Agent A vs Agent B, full env)
+# To be defined after BCA pretrain complete
+
+# Bid inspector — agent vs SL (cross-table)
 python bid_inspector.py \
     --agent results/drift_sweep_571/lambda0.0_seed100/agent_a_seed100.pt \
     --sl results/sl_base.pt \
     --data data/competitive_500k.npz \
-    --num_deals 10
+    --num_deals 50
 
-# Save results before session ends
-zip -r results_partial.zip results/  # download from Colab
+# Bid inspector — agent self-play (4×agent, cross-table, correct load path)
+python bid_inspector.py \
+    --agent results/agent_a.pt \
+    --data data/competitive_500k.npz \
+    --num_deals 50 \
+    --agent_only
 ```
 
 ---
@@ -216,23 +241,24 @@ zip -r results_partial.zip results/  # download from Colab
 - **Reward normalization must persist across rounds.** Re-instantiating `RunningStats` resets normalization.
 - **Fixed hyperparameters over adaptive mechanisms** for scientific reproducibility.
 - **Critic targets must match training path.** Use GAE returns, not flattened final_reward.
-- **Stage 3 performance bottleneck:** `hands_to_openspiel_state` costs ~0.64s/deal on first call (full rebuild). With 5000 deals this is ~53 min. `_deal_action_cache` (8192 entries) caches the deal sequence but NOT the game state itself. Per-trainer `_obs_state_cache` caches states but only for deals seen during training.
 - **DDS regret is opponent-dependent** — cannot be used as an opponent-independent ground truth metric.
-- **Per-round H2H is too noisy** (IMP std ≈ 9, 500 deals insufficient). All evaluation deferred to Stage 3 with 5000 deals.
-- **bid_inspector cross-table** — old single-table comparison inflated agent scores by letting each side play against themselves. Cross-table (play_mixed twice) is the correct evaluation.
-- **λ sweep confounds drift and policy quality** — cannot cleanly attribute IMP gap to convention drift alone. Correct isolation requires fixing agent and varying opponent understanding capability.
+- **Per-round H2H is too noisy** (IMP std ≈ 9-11, 500 deals insufficient). All evaluation deferred to Stage 3 with 5000 deals.
+- **λ sweep confounds drift and policy quality** — cannot cleanly attribute IMP gap to convention drift alone.
+- **Convention drift isolation requires fine-tuned BeliefNet** — SL BCA BeliefNet trained on SAYC cannot understand drifted bids, making it equivalent to plain SL as an "aware" opponent. Fine-tuning on agent rollout data is required.
+- **Agent bidding varies against different opponents — this is correct.** obs encodes full bidding history; different opponent bids → different history → different obs → different agent response.
+- **Do NOT write checkpoints to Google Drive during training.** Mount Drive beforehand; use `--gdrive_dest` for post-training upload only.
+- **Stage B of BCA pretrain is unnecessary.** Zero-init belief columns; co-evolve Actor + BeliefNet in RL.
+- **XX (redouble) emerges after ~40-60 rounds** of unconstrained training. Agent uses XX as a penalty trap; SL has near-zero XX probability.
+- **Agent performs significantly worse in self-play** (28% contracts made) vs vs-SL (74% win rate). Strategy is opponent-specific, not universally superior.
+- **FSP-seeded training produces fragile exploits (P115).** Agent learns anti-SL tactics (XX traps, high-level sacrifice) that backfire against any non-SL opponent. Self-play training (`self_play=True`) is required for robust strategies.
+- **`load_sl()` and `load_agent()` have different weight mappings (P115).** Never use `load_sl()` to load RL checkpoints — it silently produces incorrect actor weights. Use `--agent_only` mode in bid_inspector for RL-vs-RL comparison.
+- **FSP with sl_competitive as permanent anchor is the correct training setup (P116).** Self-play causes 7-level escalation; FSP provides stable distribution anchor. Use `self_play=False`.
+- **`sl_competitive.pt` (17k filtered SAYC games, 84.6% acc) is the correct subgame init.** `sl_base.pt` produces OOD behavior in 1H-1S competitive context when facing RL agent bids.
+- **P116 (CRITICAL): `_make_play_mixed_policy` in `bid_inspector.py` had two bugs causing 7NT乱叫 in cross-table eval.** (1) legal_mask from BridgeBiddingEnv instead of OpenSpiel state. (2) actor selected by real seat instead of `(player-dealer)%4`. Fix applied. Training code unaffected (BridgeBiddingEnv and OpenSpiel legal actions are logically equivalent; all actors have identical SL weights).
+- **All prior cross-table IMP numbers are invalid (P116).** +7.406/+1.244/+8.777 IMP were artifacts. Corrected: λ=0.5/25rounds = -0.117 IMP; λ=0.0/60rounds = -1.680 IMP. RL has not demonstrated measurable improvement over SL.
+- **RL improvement failure under investigation.** vl converges, pl decreases slightly, entropy increases — critic learns but actor gradient may be near zero. Hypothesis: high IMP variance (std≈8-11) causes advantage collapse after GAE normalization.
 
 ---
 
-## Next Steps (for new conversation window)
-
-1. **Discuss experiment design** — how to cleanly isolate drift advantage; whether λ sweep is salvageable with correct framing; whether the "fix agent, vary opponent understanding" experiment is worth adding.
-2. **Run remaining drift sweep seeds** (seeds 42, 123, 456, 789, 2024) for λ ∈ {0.0, 0.1, 0.3, 0.5, 1.0} — but only after experiment design questions are resolved.
-3. **BCA SL pretrain** — run `sl_pretrain_bca.py` with `--init_from results/sl_base.pt` to get `sl_base_bca.pt` (667-dim).
-4. **BCA core experiment** — A/B/C comparison with 667-dim actors.
-5. **Write up preliminary report** after BCA results are in.
-
----
-
-*README version: P113 (experiment design issues documented; drift sweep partial results)*
-*Last updated: 2026-03-26*
+*README version: P116 (bid_inspector legal_mask+actor-seat fix; all prior cross-table IMP invalid; corrected RL vs SL ≈ 0 IMP; FSP+sl_competitive is correct setup)*
+*Last updated: 2026-03-27*

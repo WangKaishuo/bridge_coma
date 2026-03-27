@@ -103,6 +103,7 @@ class SubgameConfig:
     # ── FSP ─────────────────────────────────────────────────────────────────
     fsp_pool_size:    int   = 10          # Kita et al. 2024
     fsp_add_interval: int   = 2           # 每 N 轮将 actor 存入 pool
+    self_play:        bool  = False       # P115: True = pure self-play (opponent = current agent, skip FSP)
 
     # ── Belief Net Update ────────────────────────────────────────────────
     # P93: on-policy update (epochs=8, lr=5e-5) — caused catastrophic
@@ -733,7 +734,7 @@ class SubgameTrainer:
                 if done:
                     contract   = inner_envs[i].state.final_contract
                     scores_sw[i] = self.env._compute_score_ns(
-                        contract, slot_dd[i], slot_vul[i])
+                        contract, slot_dd[i], slot_vul[i], dealer=slot_dealer[i])
 
         return scores_sw
 
@@ -820,7 +821,7 @@ class SubgameTrainer:
             obs, _, done, _ = inner.step(action_int)
 
         contract = inner.state.final_contract
-        score_sw = self.env._compute_score_ns(contract, sw_dd, vulnerability)
+        score_sw = self.env._compute_score_ns(contract, sw_dd, vulnerability, dealer=dealer)
         return score_sw
 
     # ======================================================================
@@ -1310,8 +1311,8 @@ class SubgameTrainer:
         # 修复：遍历episode找到每个player最后出现的step，标记done+赋reward。
         if not skip_dual_table and _pending_rewards:
             for (ep_idx, dd, dealer, vul, contract) in _pending_rewards:
-                score_ns    = self.env._compute_score_ns(contract, dd, vul)
-                score_opt   = self.env._compute_dds_optimal_score_ns(dd, vul)
+                score_ns    = self.env._compute_score_ns(contract, dd, vul, dealer=dealer)
+                score_opt   = self.env._compute_dds_optimal_score_ns(dd, vul, dealer=dealer)
                 imp_ns      = float(score_to_imp(score_ns  - score_opt))
                 imp_ew      = float(score_to_imp(score_opt - score_ns))
                 opener_seats = {dealer, (dealer + 2) % 4}
@@ -1918,10 +1919,12 @@ class SubgameTrainer:
         self.critic_warmup()
 
         # P74: FSP Pool用BC checkpoint作为pool[0]
-        if not self._fsp_seeded and self.config.fsp_pool_size > 0:
+        if not self.config.self_play and not self._fsp_seeded and self.config.fsp_pool_size > 0:
             self.fsp_pool.add_permanent(self.agent)  # P90: SL baseline永不淘汰
             self._fsp_seeded = True
             print(f"  [FSP] Seeded pool with BC checkpoint as permanent (pool size: {len(self.fsp_pool)})")
+        if self.config.self_play:
+            print("  [Self-Play] Pure self-play mode: opponent = current agent (FSP disabled)")
 
         for rnd in range(num_rounds):
             print(f"\n══════ Round {rnd+1}/{num_rounds} ══════")
@@ -1932,8 +1935,11 @@ class SubgameTrainer:
                 print(f"  [Belief] Warmup round {rnd+1}/{cfg.belief_warmup_rounds}: "
                       f"using prior features (Belief Net not yet adapted to RL dist)")
 
-            self._maybe_add_to_fsp(rnd)
-            fsp_sd = self._apply_fsp_opponent()
+            if self.config.self_play:
+                fsp_sd = None
+            else:
+                self._maybe_add_to_fsp(rnd)
+                fsp_sd = self._apply_fsp_opponent()
             _ir_vals: list = []; _bl_vals: list = []
             ns_metrics: dict = {}; ew_metrics: dict = {}
 
