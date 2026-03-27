@@ -227,65 +227,87 @@ def play_deal_sl_only(
     }
 
 
-def play_deal(
-    hands_sm: np.ndarray,
-    dd_table:  np.ndarray,
-    dealer:    int,
-    agent:     MAPPOAgent,
-    sl:        MAPPOAgent,
-    device:    str,
-    verbose:   bool = True,
-):
-    """Play deal with both agent and SL, compare results."""
-    vul = (False, False)
-    results = {}
+def _make_play_mixed_policy(model, hands_sm, dealer, device):
+    """
+    Build a (obs, player, history_int) -> action closure for play_mixed.
+    Uses OpenSpiel state for obs generation (same as RL inference).
+    """
+    hands_rm = convert_hands_suit_to_rank(hands_sm)
 
-    for label, model in [("Agent", agent), ("SL", sl)]:
-        hands_rm = convert_hands_suit_to_rank(hands_sm)
+    def policy(obs, player, history_int):
         os_state = hands_to_openspiel_state(hands_rm, dealer)
-        policy_fn = make_policy_with_probs_openspiel(model, device)
-
-        # Apply fixed prefix
-        prefix_bids = [string_to_bid(b) for b in FIXED_PREFIX]
-        for bid in prefix_bids:
-            os_action = ours_to_openspiel_raw(bid)
-            os_state.apply_action(os_action)
-
-        bid_log = []
-        while not os_state.is_terminal():
-            # --- ADDED: Check if bidding phase has ended and play phase has begun ---
+        for a in history_int:
+            if os_state.is_terminal():
+                break
             legal_os = os_state.legal_actions()
-            if len(legal_os) > 0 and legal_os[0] < 52:
+            if legal_os and legal_os[0] < 52:
                 break
-            # ------------------------------------------------------------------------
+            os_a = ours_to_openspiel_raw(a)
+            if os_a >= 0 and os_a in legal_os:
+                os_state.apply_action(os_a)
+        flat = get_openspiel_obs(os_state)
+        flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
+        legal_mask = torch.tensor(
+            obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(device)
+        actor = model.get_actor(player)
+        with torch.no_grad():
+            action, _, _ = actor.get_action(flat_t, legal_mask, deterministic=True)
+        return action.item()
+    return policy
 
-            player = os_state.current_player()
-            action, top3 = policy_fn(os_state, player)
-            bid_log.append((player, bid_to_string(action), top3))
-            os_action = ours_to_openspiel_raw(action)
-            os_state.apply_action(os_action)
 
-        # Extract contract via BridgeBiddingEnv
-        inner_env = BridgeBiddingEnv(max_history_len=60)
-        obs = inner_env.reset(hands_sm, dealer=dealer, vulnerability=vul)
-        all_bids_int = prefix_bids + [string_to_bid(b[1]) for b in bid_log]
-        for bid in all_bids_int:
-            if not inner_env._is_valid_action(bid):
-                bid = BID_PASS
-            obs, _, done, _ = inner_env.step(bid)
-            if done:
-                break
+def play_deal(
+    hands_sm,
+    dd_table,
+    dealer,
+    agent,
+    sl,
+    device,
+    env,
+    verbose=True,
+):
+    """
+    真正的双桌对战:
+      桌1: Agent=NS(开叫方), SL=EW(争叫方) -> score_1
+      桌2: SL=NS(开叫方),    Agent=EW(争叫方) -> score_2
+      IMP = score_to_imp(score_1 - score_2)  (Agent 视角)
 
-        results[label] = {
-            'bid_log': bid_log,
-            'history': all_bids_int,
-            'contract': inner_env.state.final_contract,
-        }
+    和 cross_evaluate / evaluate_head_to_head 语义完全一致。
+    """
+    vul = (False, False)
+
+    agent_policy = _make_play_mixed_policy(agent, hands_sm, dealer, device)
+    sl_policy    = _make_play_mixed_policy(sl,    hands_sm, dealer, device)
+
+    # 桌1: Agent NS vs SL EW
+    contract_1, score_1, hist_1 = env.play_mixed(
+        hands_sm, dd_table,
+        ns_policy=agent_policy, ew_policy=sl_policy,
+        vulnerability=vul, dealer=dealer)
+
+    # 桌2: SL NS vs Agent EW
+    contract_2, score_2, hist_2 = env.play_mixed(
+        hands_sm, dd_table,
+        ns_policy=sl_policy, ew_policy=agent_policy,
+        vulnerability=vul, dealer=dealer)
+
+    imp = float(score_to_imp(score_1 - score_2))
+
+    results = {
+        'table1': {'label': 'Agent(NS) vs SL(EW)',
+                   'contract': contract_1, 'score': score_1, 'history': hist_1},
+        'table2': {'label': 'SL(NS) vs Agent(EW)',
+                   'contract': contract_2, 'score': score_2, 'history': hist_2},
+        'imp': imp,
+        'vul': vul,
+    }
 
     if verbose:
-        _print_comparison(hands_sm, dealer, dd_table, results, vul)
+        _print_cross_table(hands_sm, dealer, dd_table, results)
 
     return results
+
+
 
 
 # ==============================================================================
@@ -348,81 +370,57 @@ def _print_sl_solo(hands, dealer, dd_table, result, vul):
     print(f"{'═' * 65}")
 
 
-def _print_comparison(hands, dealer, dd_table, results, vul):
-    """Print comparison between Agent and SL."""
-    print(f"\n{'═' * 65}")
-    print(f"  BIDDING COMPARISON")
-    print(f"{'═' * 65}")
+def _print_table(label, history, dealer, dd_table, contract, score, vul):
+    """Print one table's bidding sequence and result."""
+    suit_names = ['♣', '♦', '♥', '♠', 'NT']
+    print(f"\n  ── {label} ──")
+    header = "  "
+    for i in range(4):
+        p = (dealer + i) % 4
+        header += f"{PLAYER_SHORT[p]:>8s}"
+    print(header)
+    row = "  "
+    for i, bid in enumerate(history):
+        row += f"{bid_to_string(bid):>8s}"
+        if (i + 1) % 4 == 0:
+            print(row); row = "  "
+    if len(row.strip()) > 0:
+        print(row)
+    if contract:
+        suit_str    = suit_names[contract.suit]
+        declarer_str= PLAYER_NAMES[contract.declarer]
+        doubled_str = ['', ' X', ' XX'][contract.doubled]
+        tricks      = int(dd_table[contract.suit, contract.declarer])
+        target      = 6 + contract.level
+        result_str  = f"making {tricks}" if tricks >= target else f"down {target - tricks}"
+        print(f"  Contract: {contract.level}{suit_str}{doubled_str} by {declarer_str}")
+        print(f"  DDS: {tricks} tricks ({result_str}), Score: {score:+d}")
+    else:
+        print(f"  Contract: Passed out, Score: 0")
 
-    print(f"\n  Fixed prefix: {PLAYER_SHORT[dealer]}:1♥ → "
+
+def _print_cross_table(hands, dealer, dd_table, results):
+    """Print cross-table (双桌对战) results."""
+    print(f"\n{'═' * 65}")
+    print(f"  CROSS-TABLE (双桌对战)")
+    print(f"{'═' * 65}")
+    print(f"  Fixed prefix: {PLAYER_SHORT[dealer]}:1♥ → "
           f"{PLAYER_SHORT[(dealer+1)%4]}:1♠")
 
-    for label in ["Agent", "SL"]:
-        r = results[label]
-        bid_log = r['bid_log']
-        contract = r['contract']
+    t1 = results['table1']
+    t2 = results['table2']
+    vul = results['vul']
 
-        print(f"\n  ── {label} ──")
-        prefix_strs = [bid_to_string(string_to_bid(b)) for b in FIXED_PREFIX]
-        all_bids = prefix_strs + [b[1] for b in bid_log]
+    _print_table(t1['label'], t1['history'], dealer, dd_table,
+                 t1['contract'], t1['score'], vul)
+    _print_table(t2['label'], t2['history'], dealer, dd_table,
+                 t2['contract'], t2['score'], vul)
 
-        header = "  "
-        for i in range(4):
-            p = (dealer + i) % 4
-            header += f"{PLAYER_SHORT[p]:>8s}"
-        print(header)
-
-        row = "  "
-        for i, bid_str in enumerate(all_bids):
-            row += f"{bid_str:>8s}"
-            if (i + 1) % 4 == 0:
-                print(row)
-                row = "  "
-        if len(row.strip()) > 0:
-            print(row)
-
-        if contract:
-            suit_names = ['♣', '♦', '♥', '♠', 'NT']
-            suit_str = suit_names[contract.suit]
-            declarer_str = PLAYER_NAMES[contract.declarer]
-            doubled_str = ['', ' X', ' XX'][contract.doubled]
-            print(f"  Contract: {contract.level}{suit_str}{doubled_str} "
-                  f"by {declarer_str}")
-            tricks = int(dd_table[contract.suit, contract.declarer])
-            target = 6 + contract.level
-            result_str = (f"making {tricks}" if tricks >= target
-                          else f"down {target - tricks}")
-            score = calculate_score(contract, tricks, vul)
-            print(f"  DDS: {tricks} tricks ({result_str}), Score: {score:+d}")
-        else:
-            print(f"  Contract: Passed out")
-
-    # Divergence check
-    agent_log = results["Agent"]["bid_log"]
-    sl_log    = results["SL"]["bid_log"]
-    diverged = False
-    for i in range(max(len(agent_log), len(sl_log))):
-        a_bid = agent_log[i][1] if i < len(agent_log) else "—"
-        s_bid = sl_log[i][1]    if i < len(sl_log)    else "—"
-        if a_bid != s_bid and not diverged:
-            diverged = True
-            step = i + len(FIXED_PREFIX)
-            player = agent_log[i][0] if i < len(agent_log) else sl_log[i][0]
-            print(f"\n  ⚡ DIVERGENCE at step {step+1} ({PLAYER_NAMES[player]})")
-    if not diverged:
-        print("  ✅ Agent and SL made identical bids.")
-
-    # IMP
-    a_c = results["Agent"]["contract"]
-    s_c = results["SL"]["contract"]
-    if a_c and s_c:
-        a_t = int(dd_table[a_c.suit, a_c.declarer])
-        s_t = int(dd_table[s_c.suit, s_c.declarer])
-        a_s = calculate_score(a_c, a_t, vul)
-        s_s = calculate_score(s_c, s_t, vul)
-        imp = score_to_imp(a_s - s_s)
-        print(f"\n  IMP (Agent): {imp:+.0f}  "
-              f"(Agent={a_s:+d}, SL={s_s:+d})")
+    imp = results['imp']
+    verdict = ("✅ Agent wins" if imp > 0 else
+               "❌ SL wins"   if imp < 0 else "— tie")
+    print(f"\n  IMP (Agent): {imp:+.0f}  "
+          f"(T1={t1['score']:+d}, T2={t2['score']:+d})  {verdict}")
     print(f"{'═' * 65}")
 
 
@@ -466,6 +464,7 @@ def main():
 
     vul = (False, False)
     scores = []
+    imps   = []
 
     for deal_idx in range(args.num_deals):
         hands, dd_table = env.generate_deal()
@@ -486,7 +485,8 @@ def main():
                 score = calculate_score(contract, tricks, vul)
                 scores.append(score)
         else:
-            results = play_deal(hands, dd_table, dealer, agent, sl, device)
+            result = play_deal(hands, dd_table, dealer, agent, sl, device, env)
+            imps.append(result['imp'])
 
     # Summary
     print(f"\n\n{'█' * 65}")
@@ -502,7 +502,14 @@ def main():
             print(f"  Contracts made: {made}/{len(scores)} "
                   f"({made/len(scores):.0%})")
     else:
-        print(f"  SUMMARY ({args.num_deals} deals)")
+        print(f"  CROSS-TABLE SUMMARY ({args.num_deals} deals)")
+        print(f"{'█' * 65}")
+        if imps:
+            import numpy as _np
+            arr = _np.array(imps)
+            wins = (arr > 0).sum()
+            print(f"  Agent mean IMP: {arr.mean():+.3f} ± {arr.std():.3f}")
+            print(f"  Win/Loss/Tie: {wins}/{(arr<0).sum()}/{(arr==0).sum()}")
     print(f"{'█' * 65}")
 
 

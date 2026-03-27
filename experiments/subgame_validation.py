@@ -539,19 +539,19 @@ def run_competitive(args):
         print(f"  [Agent A] Loaded from checkpoint. Training skipped.")
     else:
         print("  ── Agent A ──")
-        log_a = trainer_a.run(num_rounds=args.rounds, sl_trainer=sl_trainer)
+        log_a = trainer_a.run(num_rounds=args.rounds, sl_trainer=None)
 
     print("\n  ── Agent B ──")
     log_b = []
     if trainer_b is not None:
-        log_b = trainer_b.run(num_rounds=args.rounds, sl_trainer=sl_trainer)
+        log_b = trainer_b.run(num_rounds=args.rounds, sl_trainer=None)
     else:
         print("  [Skipped — agent_a_only mode]")
 
     log_c = []
     if trainer_c is not None and not args.skip_training:
         print("\n  ── Agent C ──")
-        log_c = trainer_c.run(num_rounds=args.rounds, sl_trainer=sl_trainer)
+        log_c = trainer_c.run(num_rounds=args.rounds, sl_trainer=None)
 
     # ── Stage 3: 评估 ───────────────────────────────────────────────────────
     print("\n[Stage 3] Evaluation...")
@@ -1017,8 +1017,8 @@ def parse_args():
                         help='KL anchor strength. Default: 0.3→0.0 anneal if --belief_conditioned, 0.3 fixed otherwise')
     parser.add_argument('--entropy_coef', type=float, default=0.01,
                         help='Entropy coefficient for PPO (P98b: 0.01, was 1e-3 in P97d)')
-    parser.add_argument('--eval_deals', type=int, default=1000,
-                        help='Number of deals for Stage 3 evaluation (default 1000, use 5000 for paper)')
+    parser.add_argument('--eval_deals', type=int, default=5000,
+                        help='Number of deals for Stage 3 evaluation (default 5000)')
     parser.add_argument('--skip_training', action='store_true',
                         help='Skip Stage 2 (RL training), load checkpoints from --save_dir, '
                              'run Stage 3 evaluation only. Requires prior training run.')

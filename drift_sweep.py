@@ -141,7 +141,7 @@ def main():
                         default=DEFAULT_SEEDS,
                         help=f"Seeds (default: {DEFAULT_SEEDS})")
     parser.add_argument("--rounds", type=int, default=10)
-    parser.add_argument("--eval_deals", type=int, default=2000)
+    parser.add_argument("--eval_deals", type=int, default=3000)
     parser.add_argument("--out_dir", default=None,
                         help="Output directory (default: results/drift_sweep_{mode})")
     parser.add_argument("--quick", action="store_true",

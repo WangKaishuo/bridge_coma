@@ -171,67 +171,60 @@ class BridgeBiddingEnv:
         }
     
     def _get_legal_actions(self) -> np.ndarray:
-        """获取合法动作 mask"""
+        """获取合法动作 mask
+
+        Double/Redouble 状态机（桥牌规则）:
+          每个实质叫品之后，后缀的加倍状态只有三种：
+            UNDOUBLED  → 对手可以 Double
+            DOUBLED    → 我方可以 Redouble；对手不能再 Double
+            REDOUBLED  → 双方均不能再 X 或 XX
+
+          任何新的实质叫品都重置状态为 UNDOUBLED。
+          用单一变量 double_state 遍历后缀，避免两个独立 boolean 逻辑割裂的 bug。
+        """
         legal = np.zeros(NUM_BIDS, dtype=np.float32)
         legal[BID_PASS] = 1.0  # Pass 总是合法
-        
+
         history = self.state.history
-        
-        # 找到最高实质叫品
+
+        # 找到最高实质叫品及其位置
         highest_bid = None
         last_real_bid_idx = -1
         for i, bid in enumerate(history):
             if bid >= BID_1C:
                 highest_bid = bid
                 last_real_bid_idx = i
-        
-        # 新叫品必须更高
+
+        # 新叫品必须高于当前最高叫品
         min_bid = BID_1C if highest_bid is None else highest_bid + 1
         for bid in range(min_bid, NUM_BIDS):
             legal[bid] = 1.0
-        
-        # Double: 对手最后叫了实质叫品，且未被加倍
-        if last_real_bid_idx >= 0:
-            # 检查最后的实质叫品是谁叫的
-            bidder = (self.state.dealer + last_real_bid_idx) % 4
-            current = self.state.current_player
-            
-            # 对手叫的（不同阵营）
-            if bidder % 2 != current % 2:
-                # 检查是否已被加倍
-                doubled = False
-                for bid in history[last_real_bid_idx + 1:]:
-                    if bid == BID_DOUBLE:
-                        doubled = True
-                    elif bid == BID_REDOUBLE:
-                        doubled = False  # 再加倍后不能再加倍
-                    elif bid >= BID_1C:
-                        doubled = False
-                
-                if not doubled:
-                    legal[BID_DOUBLE] = 1.0
-        
-        # Redouble: 对手加倍了我方的叫品
-        if last_real_bid_idx >= 0:
-            bidder = (self.state.dealer + last_real_bid_idx) % 4
-            current = self.state.current_player
-            
-            # 我方叫的
-            if bidder % 2 == current % 2:
-                # 检查是否被对手加倍
-                doubled_by_opp = False
-                for i, bid in enumerate(history[last_real_bid_idx + 1:]):
-                    bid_player = (self.state.dealer + last_real_bid_idx + 1 + i) % 4
-                    if bid == BID_DOUBLE and bid_player % 2 != current % 2:
-                        doubled_by_opp = True
-                    elif bid == BID_REDOUBLE:
-                        doubled_by_opp = False
-                    elif bid >= BID_1C:
-                        doubled_by_opp = False
-                
-                if doubled_by_opp:
-                    legal[BID_REDOUBLE] = 1.0
-        
+
+        if last_real_bid_idx < 0:
+            return legal  # 尚无实质叫品，X/XX 均不合法
+
+        # 统一状态机：扫描最后实质叫品之后的后缀
+        # double_state: 0=undoubled, 1=doubled, 2=redoubled
+        double_state = 0
+        last_real_bidder = (self.state.dealer + last_real_bid_idx) % 4
+
+        for i, bid in enumerate(history[last_real_bid_idx + 1:]):
+            if bid == BID_DOUBLE:
+                double_state = 1
+            elif bid == BID_REDOUBLE:
+                double_state = 2
+            # 新实质叫品不会出现在这里（last_real_bid_idx 已是最后一个）
+
+        current = self.state.current_player
+
+        # Double 合法条件：undoubled + 最后实质叫品是对手叫的
+        if double_state == 0 and last_real_bidder % 2 != current % 2:
+            legal[BID_DOUBLE] = 1.0
+
+        # Redouble 合法条件：doubled + 最后实质叫品是我方叫的
+        if double_state == 1 and last_real_bidder % 2 == current % 2:
+            legal[BID_REDOUBLE] = 1.0
+
         return legal
     
     def _is_valid_action(self, action: int) -> bool:

@@ -2037,13 +2037,8 @@ class SubgameTrainer:
             self.log.append(log_entry)
             self._print_log(log_entry)
 
-            # ── P91: Mini vs SL eval (every round, 500 deals) ────────
-            if sl_trainer is not None:
-                h2h_result = self.evaluate_head_to_head(
-                    sl_trainer, num_deals=h2h_deals,
-                    label_self="agent", label_other="SL")
-                log_entry['vs_sl_imp'] = h2h_result['mean_imp']
-                log_entry['vs_sl_p'] = h2h_result['p_value']
+            # P110: Per-round H2H removed — too noisy (500-deal IMP std≈9).
+            # All statistical evaluation is deferred to Stage 3 (5000 deals).
 
             # P74: 早停——基于value_loss平稳性
             if self.config.early_stop_enabled:

@@ -196,8 +196,9 @@ def hands_to_openspiel_state(hands_rm: np.ndarray, dealer: int = 0):
             int(cards_per_player[p][i])
             for i in range(13) for p in range(4)
         ]
-        # Keep cache bounded to ~2000 unique deals
-        if len(_deal_action_cache) >= 2048:
+        # Keep cache bounded to ~8000 unique deals
+        # (covers Stage 2 training deals + Stage 3 eval 3000 deals)
+        if len(_deal_action_cache) >= 8192:
             # Evict oldest entry (insertion-ordered dict in Python 3.7+)
             _deal_action_cache.pop(next(iter(_deal_action_cache)))
         _deal_action_cache[cache_key] = deal_actions
