@@ -734,7 +734,7 @@ class SubgameTrainer:
                 if done:
                     contract   = inner_envs[i].state.final_contract
                     scores_sw[i] = self.env._compute_score_ns(
-                        contract, slot_dd[i], slot_vul[i], dealer=slot_dealer[i])
+                        contract, slot_dd[i], slot_vul[i])
 
         return scores_sw
 
@@ -821,7 +821,7 @@ class SubgameTrainer:
             obs, _, done, _ = inner.step(action_int)
 
         contract = inner.state.final_contract
-        score_sw = self.env._compute_score_ns(contract, sw_dd, vulnerability, dealer=dealer)
+        score_sw = self.env._compute_score_ns(contract, sw_dd, vulnerability)
         return score_sw
 
     # ======================================================================
@@ -852,7 +852,7 @@ class SubgameTrainer:
         all_episodes = self._collect_episodes_batch(
             total_deals, train_side='NS',
             fsp_sd=None, batch_size=self.config.deals_per_step,
-            skip_dual_table=True)
+            skip_dual_table=True, use_belief_prior=True)
 
         belief_data = []
         for ep in all_episodes:
@@ -867,13 +867,10 @@ class SubgameTrainer:
         N = len(belief_data)
         print(f"[Belief Pretrain] Dataset: {N} samples. Training to convergence...")
 
-        oh_all  = torch.tensor(np.stack([s['observer_hand']  for s in belief_data]),
+        obs_all = torch.tensor(np.stack([s['obs_571']       for s in belief_data]),
                                dtype=torch.float32)
-        h_all   = torch.tensor(np.stack([s['history']        for s in belief_data]),
-                               dtype=torch.float32)
-        op_all  = torch.tensor([s['observer_pos'] for s in belief_data], dtype=torch.long)
-        tp_all  = torch.tensor([s['target_pos']   for s in belief_data], dtype=torch.long)
-        tgt_all = torch.tensor(np.stack([s['belief_target']  for s in belief_data]),
+        tp_all  = torch.tensor([s['target_pos']  for s in belief_data], dtype=torch.long)
+        tgt_all = torch.tensor(np.stack([s['belief_target'] for s in belief_data]),
                                dtype=torch.float32)
 
         # 90/10 train/val split
@@ -902,8 +899,8 @@ class SubgameTrainer:
             for s in range(0, split, bs):
                 idx    = tr_idx[perm[s:s+bs]]
                 loss   = self.belief_net.compute_loss(
-                    oh_all[idx].to(self.device), h_all[idx].to(self.device),
-                    op_all[idx].to(self.device), tp_all[idx].to(self.device),
+                    obs_all[idx].to(self.device),
+                    tp_all[idx].to(self.device),
                     tgt_all[idx].to(self.device))
                 optimizer.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(
@@ -916,12 +913,12 @@ class SubgameTrainer:
             self.belief_net.eval()
             with torch.no_grad():
                 val_loss = self.belief_net.compute_loss(
-                    oh_all[va_idx].to(self.device), h_all[va_idx].to(self.device),
-                    op_all[va_idx].to(self.device), tp_all[va_idx].to(self.device),
+                    obs_all[va_idx].to(self.device),
+                    tp_all[va_idx].to(self.device),
                     tgt_all[va_idx].to(self.device)).item()
                 probs    = self.belief_net.get_probs(
-                    oh_all[va_idx].to(self.device), h_all[va_idx].to(self.device),
-                    op_all[va_idx].to(self.device), tp_all[va_idx].to(self.device))
+                    obs_all[va_idx].to(self.device),
+                    tp_all[va_idx].to(self.device))
                 acc      = belief_accuracy(probs, tgt_all[va_idx].to(self.device))
             self.belief_net.train()
 
@@ -962,9 +959,7 @@ class SubgameTrainer:
         replay_n = min(10000, N)
         replay_idx = np.random.permutation(N)[:replay_n]
         self._pretrain_replay = {
-            'oh':  oh_all[replay_idx].clone(),
-            'h':   h_all[replay_idx].clone(),
-            'op':  op_all[replay_idx].clone(),
+            'obs': obs_all[replay_idx].clone(),
             'tp':  tp_all[replay_idx].clone(),
             'tgt': tgt_all[replay_idx].clone(),
         }
@@ -1004,11 +999,9 @@ class SubgameTrainer:
         if len(belief_data) < 100:
             return None
 
-        oh  = torch.tensor(np.stack([s['observer_hand']  for s in belief_data]), dtype=torch.float32)
-        h   = torch.tensor(np.stack([s['history']        for s in belief_data]), dtype=torch.float32)
-        op  = torch.tensor(np.array([s['observer_pos']   for s in belief_data]), dtype=torch.long)
-        tp  = torch.tensor(np.array([s['target_pos']     for s in belief_data]), dtype=torch.long)
-        tgt = torch.tensor(np.stack([s['belief_target']  for s in belief_data]), dtype=torch.float32)
+        obs = torch.tensor(np.stack([s['obs_571']       for s in belief_data]), dtype=torch.float32)
+        tp  = torch.tensor(np.array([s['target_pos']   for s in belief_data]), dtype=torch.long)
+        tgt = torch.tensor(np.stack([s['belief_target'] for s in belief_data]), dtype=torch.float32)
 
         N = len(belief_data)
         split = int(N * 0.9)
@@ -1040,8 +1033,8 @@ class SubgameTrainer:
 
                 # ── On-policy loss ──
                 loss_op = self.belief_net.compute_loss(
-                    oh[idx].to(self.device), h[idx].to(self.device),
-                    op[idx].to(self.device), tp[idx].to(self.device),
+                    obs[idx].to(self.device),
+                    tp[idx].to(self.device),
                     tgt[idx].to(self.device))
 
                 # ── Pretrain replay loss (P97b) ──
@@ -1056,9 +1049,7 @@ class SubgameTrainer:
                     rp_ptr += rp_size
 
                     loss_rp = self.belief_net.compute_loss(
-                        rp['oh'][rp_idx].to(self.device),
-                        rp['h'][rp_idx].to(self.device),
-                        rp['op'][rp_idx].to(self.device),
+                        rp['obs'][rp_idx].to(self.device),
                         rp['tp'][rp_idx].to(self.device),
                         rp['tgt'][rp_idx].to(self.device))
 
@@ -1085,8 +1076,8 @@ class SubgameTrainer:
             self.belief_net.eval()
             with torch.no_grad():
                 val_loss = self.belief_net.compute_loss(
-                    oh[va_idx].to(self.device), h[va_idx].to(self.device),
-                    op[va_idx].to(self.device), tp[va_idx].to(self.device),
+                    obs[va_idx].to(self.device),
+                    tp[va_idx].to(self.device),
                     tgt[va_idx].to(self.device)).item()
             self.belief_net.train()
 
@@ -1214,14 +1205,30 @@ class SubgameTrainer:
                     critic = getattr(self.agent.model,
                                      role.replace('actor','critic'))
 
-                flat_batch  = np.stack([
+                # Step 1: 批量构造 571-dim base obs（无 BeliefNet，O(N) 纯 numpy）
+                obs571_batch = np.stack([
                     self._encode_for_actor(
                         slot_obs[i], slot_dealer[i], slot_hist[i],
                         envs[i].current_player,
-                        all_hands=envs[i]._current_hands)
+                        all_hands=envs[i]._current_hands,
+                        use_prior=True)[:OBS_DIM]   # always prior here; BCA appended below
                     for i in slots])
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
+
+                # Step 2: 一次批量 BeliefNet forward（BCA 模式且非 prior）
+                if self.config.belief_conditioned and not use_belief_prior:
+                    players_batch = [envs[i].current_player for i in slots]
+                    bf_batch = self._get_belief_features_batch(
+                        obs571_batch, players_batch)   # (B, 96)
+                    flat_batch = np.concatenate([obs571_batch, bf_batch], axis=1)  # (B, 667)
+                elif self.config.belief_conditioned:
+                    prior = make_belief_features_prior()  # (96,)
+                    flat_batch = np.concatenate(
+                        [obs571_batch,
+                         np.tile(prior, (len(slots), 1))], axis=1)   # (B, 667)
+                else:
+                    flat_batch = obs571_batch  # (B, 571)
 
                 flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
                 legal_t = torch.tensor(legal_batch, dtype=torch.float32).to(self.device)
@@ -1240,46 +1247,58 @@ class SubgameTrainer:
             for i in active:
                 action, log_prob, value, flat_obs, legal_actions, is_train = actions_map[i]
                 player    = envs[i].current_player
-                all_hands = envs[i]._current_hands.copy()
+                # Defer copy to avoid repeated allocation; use view when possible
+                all_hands = envs[i]._current_hands
 
                 opener_seats_i = {slot_dealer[i], (slot_dealer[i] + 2) % 4}
+                # obs_571: pure OpenSpiel obs (first OBS_DIM dims, strips belief features if BCA)
+                obs_571 = flat_obs[:OBS_DIM]
                 step = {
                     'flat_obs': flat_obs, 'legal_actions': legal_actions,
                     'action': action, 'log_prob': log_prob, 'value': value,
                     'reward': 0.0, 'done': False,
-                    'all_hands': all_hands, 'player': player,
+                    'all_hands': all_hands.copy(), 'player': player,
                     'is_training_side': is_train,
                     'is_opener': player in opener_seats_i,
+                    'obs_571': obs_571,  # for BeliefNet training (new API)
                 }
 
-                # Belief 数据记录
+                # Belief 数据记录：只在需要时计算（避免无效开销）
+                # 需要 belief data 的条件：BeliefNet 存在且（训练中 or r_info 计算）
                 _dealer_i      = slot_dealer[i]
                 opener_seats_i = {_dealer_i, (_dealer_i + 2) % 4}
-                if self.belief_net is not None:
+                _need_belief = (self.belief_net is not None and
+                                (self.config.use_info_bonus or
+                                 not self.config.freeze_belief))
+                if _need_belief:
                     if player in opener_seats_i:
                         partner = (player + 2) % 4
                         step.update({
-                            'observer_hand': all_hands[player],
-                            'history':       self._encode_history(slot_hist[i]),
-                            'observer_pos':  player, 'target_pos': partner,
+                            'target_pos':    partner,
                             'belief_target': hand_to_belief_target(all_hands[partner]),
                             'history_int_before': slot_hist[i][:],
                         })
                     else:
-                        observer = _dealer_i
                         step.update({
                             'ew_diagnostic': True,
-                            'observer_hand': all_hands[observer],
-                            'history':       self._encode_history(slot_hist[i]),
-                            'observer_pos':  observer, 'target_pos': player,
+                            'target_pos':    player,
                             'belief_target': hand_to_belief_target(all_hands[player]),
                             'history_int_before': slot_hist[i][:],
                         })
 
                 slot_hist[i].append(action)
-                if self.belief_net is not None:
+                if _need_belief:
                     if player in opener_seats_i or step.get('ew_diagnostic'):
                         step['history_int_after'] = slot_hist[i][:]
+                        # obs_571_after only needed for r_info (Agent B)
+                        # Skip for Agent A to avoid expensive OpenSpiel rebuild
+                        if self.config.use_info_bonus:
+                            obs_after = self._encode_for_actor(
+                                None, slot_dealer[i], slot_hist[i], player,
+                                all_hands=all_hands)
+                            step['obs_571_after'] = obs_after[:OBS_DIM]
+                        else:
+                            step['obs_571_after'] = None
 
                 # env.step() gives oracle reward; we overwrite with dual-table IMP after batch
                 obs_next, reward, done, info = envs[i].step(action)
@@ -1311,8 +1330,8 @@ class SubgameTrainer:
         # 修复：遍历episode找到每个player最后出现的step，标记done+赋reward。
         if not skip_dual_table and _pending_rewards:
             for (ep_idx, dd, dealer, vul, contract) in _pending_rewards:
-                score_ns    = self.env._compute_score_ns(contract, dd, vul, dealer=dealer)
-                score_opt   = self.env._compute_dds_optimal_score_ns(dd, vul, dealer=dealer)
+                score_ns    = self.env._compute_score_ns(contract, dd, vul)
+                score_opt   = self.env._compute_dds_optimal_score_ns(dd, vul)
                 imp_ns      = float(score_to_imp(score_ns  - score_opt))
                 imp_ew      = float(score_to_imp(score_opt - score_ns))
                 opener_seats = {dealer, (dealer + 2) % 4}
@@ -1497,25 +1516,26 @@ class SubgameTrainer:
 
     def _get_belief_features_single(
         self,
-        hand: np.ndarray,
-        history_int: list,
+        obs_571: np.ndarray,
         player: int,
         belief_net: Optional[BeliefNetwork] = None,
     ) -> np.ndarray:
         """
         P101: 获取单步 belief features (96,) 用于 actor 输入.
 
+        使用新版 BeliefNet API: get_probs(obs_571, target_pos).
+        obs_571 是 OpenSpiel observation_tensor()（公开叫牌历史）。
+
         查询 belief_net 两次:
-          1. partner: "给定我的手牌和叫牌历史, partner 的手牌分布是什么?"
-          2. RHO: "给定我的手牌和叫牌历史, 右手对手的手牌分布是什么?"
+          1. partner: target_pos = (player+2)%4
+          2. RHO:     target_pos = (player-1)%4
 
         返回 partner (48) + RHO (48) = 96 维.
 
         Args:
-            hand:         当前玩家手牌 (52,)
-            history_int:  叫牌历史 (整数列表)
-            player:       当前玩家 seat (0-3)
-            belief_net:   使用哪个 belief net (None=self.belief_net)
+            obs_571:    当前步的 571-dim OpenSpiel obs (np.ndarray)
+            player:     当前玩家 seat (0-3)
+            belief_net: 使用哪个 belief net (None=self.belief_net)
 
         Returns:
             belief_feats: (96,) float32 — [partner 48 | RHO 48]
@@ -1525,39 +1545,31 @@ class SubgameTrainer:
             return make_belief_features_prior()
 
         partner = (player + 2) % 4
-        rho     = (player - 1) % 4    # right-hand opponent (bid just before you)
-        hist_enc = self._encode_history(history_int)
+        rho     = (player - 1) % 4    # right-hand opponent
 
         with torch.no_grad():
-            oh_t = torch.tensor(hand, dtype=torch.float32).unsqueeze(0).to(self.device)
-            h_t  = torch.tensor(hist_enc, dtype=torch.float32).unsqueeze(0).to(self.device)
-            op_t = torch.tensor([player],  dtype=torch.long).to(self.device)
-
-            # Query partner
+            obs_t      = torch.tensor(obs_571, dtype=torch.float32).unsqueeze(0).to(self.device)
             tp_partner = torch.tensor([partner], dtype=torch.long).to(self.device)
-            partner_probs = bn.get_probs(oh_t, h_t, op_t, tp_partner)  # (1, 48)
+            tp_rho     = torch.tensor([rho],     dtype=torch.long).to(self.device)
 
-            # Query RHO
-            tp_rho = torch.tensor([rho], dtype=torch.long).to(self.device)
-            rho_probs = bn.get_probs(oh_t, h_t, op_t, tp_rho)          # (1, 48)
+            partner_probs = bn.get_probs(obs_t, tp_partner)  # (1, 48)
+            rho_probs     = bn.get_probs(obs_t, tp_rho)      # (1, 48)
 
         return torch.cat([partner_probs, rho_probs], dim=-1).squeeze(0).cpu().numpy()
 
     def _get_belief_features_batch(
         self,
-        hands: np.ndarray,
-        history_ints: List[list],
+        obs_571_batch: np.ndarray,
         players: List[int],
         belief_net: Optional[BeliefNetwork] = None,
     ) -> np.ndarray:
         """
         P101: 批量获取 belief features (B, 96) 用于 actor 输入.
 
-        对每个样本查询 belief_net 两次 (partner + RHO), 拼接返回 96 维.
+        使用新版 BeliefNet API: get_probs(obs_571, target_pos).
 
         Args:
-            hands:         (B, 52) 当前玩家手牌
-            history_ints:  长度 B 的列表, 每个元素是叫牌历史
+            obs_571_batch: (B, 571) OpenSpiel obs batch
             players:       长度 B 的列表, 每个元素是当前玩家 seat
             belief_net:    使用哪个 belief net (None=self.belief_net)
 
@@ -1568,23 +1580,16 @@ class SubgameTrainer:
         if bn is None or not self.config.belief_conditioned:
             return np.tile(make_belief_features_prior(), (len(players), 1))
 
-        B = len(players)
         partners = [(p + 2) % 4 for p in players]
         rhos     = [(p - 1) % 4 for p in players]
-        hist_encs = np.stack([self._encode_history(h) for h in history_ints])
 
         with torch.no_grad():
-            oh_t = torch.tensor(hands, dtype=torch.float32).to(self.device)
-            h_t  = torch.tensor(hist_encs, dtype=torch.float32).to(self.device)
-            op_t = torch.tensor(players,  dtype=torch.long).to(self.device)
-
-            # Query partner
+            obs_t      = torch.tensor(obs_571_batch, dtype=torch.float32).to(self.device)
             tp_partner = torch.tensor(partners, dtype=torch.long).to(self.device)
-            partner_probs = bn.get_probs(oh_t, h_t, op_t, tp_partner)  # (B, 48)
+            tp_rho     = torch.tensor(rhos,     dtype=torch.long).to(self.device)
 
-            # Query RHO
-            tp_rho = torch.tensor(rhos, dtype=torch.long).to(self.device)
-            rho_probs = bn.get_probs(oh_t, h_t, op_t, tp_rho)          # (B, 48)
+            partner_probs = bn.get_probs(obs_t, tp_partner)  # (B, 48)
+            rho_probs     = bn.get_probs(obs_t, tp_rho)      # (B, 48)
 
         return torch.cat([partner_probs, rho_probs], dim=-1).cpu().numpy()
 
@@ -1596,6 +1601,7 @@ class SubgameTrainer:
         player: int,
         all_hands: Optional[np.ndarray] = None,
         belief_net: Optional[BeliefNetwork] = None,
+        use_prior: bool = False,
     ) -> np.ndarray:
         """
         P108: 统一的 actor 输入编码，使用 OpenSpiel 571-dim observation。
@@ -1671,9 +1677,12 @@ class SubgameTrainer:
             flat = np.zeros(OBS_DIM, dtype=np.float32)
 
         if self.config.belief_conditioned:
-            hand = all_hands[player] if all_hands is not None else obs['hand']
-            bf = self._get_belief_features_single(
-                hand, history_int, player, belief_net or self.belief_net)
+            if use_prior:
+                bf = make_belief_features_prior()
+            else:
+                # Pass the already-constructed 571-dim obs to BeliefNet (new API)
+                bf = self._get_belief_features_single(
+                    flat, player, belief_net or self.belief_net)
             flat = append_belief_features(flat, bf)
         return flat
 
@@ -1709,20 +1718,18 @@ class SubgameTrainer:
             return raw_ep_bonuses
 
         n = len(valid_steps)
-        oh_arr   = np.stack([s['observer_hand'] for s in valid_steps])
-        hb_arr   = np.stack([self._encode_history(s.get('history_int_before', [])) for s in valid_steps])
-        ha_arr   = np.stack([self._encode_history(s.get('history_int_after',  [])) for s in valid_steps])
-        tgt_arr  = np.stack([s['belief_target']  for s in valid_steps])
-        op_arr   = np.array([s['player']          for s in valid_steps])
-        pp_arr   = np.array([(s['player']+2)%4    for s in valid_steps])
-        oo_arr   = np.array([(s['player']+1)%4    for s in valid_steps])
+        # New BeliefNet API: get_probs(obs_571, target_pos)
+        # obs_571 / obs_571_after stored in step dict by _collect_episodes_batch
+        obs_b_arr   = np.stack([s['obs_571']       for s in valid_steps])   # before bid
+        obs_a_arr   = np.stack([s['obs_571_after']  for s in valid_steps])   # after bid
+        tgt_arr     = np.stack([s['belief_target']  for s in valid_steps])
+        pp_arr      = np.array([(s['player']+2)%4   for s in valid_steps])   # partner
+        oo_arr      = np.array([(s['player']+1)%4   for s in valid_steps])   # LHO (opponent)
         opp_tgt_arr = np.stack([hand_to_belief_target(s['all_hands'][(s['player']+1)%4]) for s in valid_steps])
 
-        oh_t      = torch.tensor(oh_arr,      dtype=torch.float32).to(self.device)
-        hb_t      = torch.tensor(hb_arr,      dtype=torch.float32).to(self.device)
-        ha_t      = torch.tensor(ha_arr,      dtype=torch.float32).to(self.device)
+        obs_b_t   = torch.tensor(obs_b_arr,   dtype=torch.float32).to(self.device)
+        obs_a_t   = torch.tensor(obs_a_arr,   dtype=torch.float32).to(self.device)
         tgt_t     = torch.tensor(tgt_arr,     dtype=torch.float32).to(self.device)
-        op_t      = torch.tensor(op_arr,      dtype=torch.long).to(self.device)
         pp_t      = torch.tensor(pp_arr,      dtype=torch.long).to(self.device)
         oo_t      = torch.tensor(oo_arr,      dtype=torch.long).to(self.device)
         opp_tgt_t = torch.tensor(opp_tgt_arr, dtype=torch.float32).to(self.device)
@@ -1732,11 +1739,11 @@ class SubgameTrainer:
         with torch.no_grad():
             for start in range(0, n, CHUNK):
                 sl = slice(start, start + CHUNK)
-                b_before_p   = self.belief_net.get_probs(oh_t[sl], hb_t[sl], op_t[sl], pp_t[sl])
-                b_after_p    = self.belief_net.get_probs(oh_t[sl], ha_t[sl], op_t[sl], pp_t[sl])
+                b_before_p   = self.belief_net.get_probs(obs_b_t[sl], pp_t[sl])
+                b_after_p    = self.belief_net.get_probs(obs_a_t[sl], pp_t[sl])
                 partner_gain = self.dual_info.compute_info_gain(b_before_p, b_after_p, tgt_t[sl])
-                b_before_o   = self.belief_net.get_probs(oh_t[sl], hb_t[sl], op_t[sl], oo_t[sl])
-                b_after_o    = self.belief_net.get_probs(oh_t[sl], ha_t[sl], op_t[sl], oo_t[sl])
+                b_before_o   = self.belief_net.get_probs(obs_b_t[sl], oo_t[sl])
+                b_after_o    = self.belief_net.get_probs(obs_a_t[sl], oo_t[sl])
                 opp_leak     = self.dual_info.compute_info_gain(b_before_o, b_after_o, opp_tgt_t[sl])
                 bonus, _     = self.dual_info.compute_dual_info_bonus(partner_gain, opp_leak)
                 bonuses_flat[start:start + CHUNK] = bonus.cpu().numpy()
@@ -2248,14 +2255,37 @@ class SubgameTrainer:
             """
             bn = belief_net_for_opponents or trainer_.belief_net
             def _policy(obs, player, history_int):
+                _dealer = env.dealer
                 flat = trainer_._encode_for_actor(
-                    obs, env.dealer, history_int, player,
+                    obs, _dealer, history_int, player,
                     env._current_hands, bn)
                 flat_t = torch.tensor(flat, dtype=torch.float32
                                       ).unsqueeze(0).to(device)
-                legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32
+                # P117: legal_mask from OpenSpiel state, actor by relative seat
+                from networks.policy_net import (
+                    convert_hands_suit_to_rank, hands_to_openspiel_state,
+                    ours_to_openspiel_raw, openspiel_raw_to_ours,
+                )
+                hands_rm = convert_hands_suit_to_rank(env._current_hands)
+                os_state = hands_to_openspiel_state(hands_rm, _dealer)
+                for a in history_int:
+                    os_a = ours_to_openspiel_raw(a)
+                    if not os_state.is_terminal():
+                        legal_os = os_state.legal_actions()
+                        if legal_os and legal_os[0] >= 52 and os_a in legal_os:
+                            os_state.apply_action(os_a)
+                os_legal = os_state.legal_actions()
+                import numpy as _np
+                legal_mask = _np.zeros(38, dtype=_np.float32)
+                for a in os_legal:
+                    if a >= 52:
+                        our_a = openspiel_raw_to_ours(a)
+                        if 0 <= our_a < 38:
+                            legal_mask[our_a] = 1.0
+                legal  = torch.tensor(legal_mask, dtype=torch.float32
                                       ).unsqueeze(0).to(device)
-                actor  = trainer_.agent.get_actor(player)
+                rel_seat = (player - _dealer) % 4
+                actor  = trainer_.agent.get_actor(rel_seat)
                 with torch.no_grad():
                     action, _, _ = actor.get_action(flat_t, legal, deterministic=True)
                 return action.item()
@@ -2321,15 +2351,14 @@ class SubgameTrainer:
                     hist.append(action.item())
                     obs, _, done, _ = self.env.step(action.item())
 
-                h_enc = self._encode_history(hist)
-                oh    = torch.tensor(hands[opener], dtype=torch.float32
+                # Use final obs (after full auction) for belief evaluation
+                final_obs_571 = self._encode_for_actor(
+                    obs, dealer, hist, opener, self.env._current_hands)[:OBS_DIM]
+                obs_t = torch.tensor(final_obs_571, dtype=torch.float32
                                      ).unsqueeze(0).to(self.device)
-                h_t   = torch.tensor(h_enc, dtype=torch.float32
-                                     ).unsqueeze(0).to(self.device)
-                op    = torch.tensor([opener],            dtype=torch.long).to(self.device)
                 tp    = torch.tensor([partner_of_opener], dtype=torch.long).to(self.device)
 
-                probs  = self.belief_net.get_probs(oh, h_t, op, tp)
+                probs  = self.belief_net.get_probs(obs_t, tp)
                 target = torch.tensor(
                     hand_to_belief_target(hands[partner_of_opener]), dtype=torch.float32
                 ).unsqueeze(0).to(self.device)
@@ -2402,24 +2431,24 @@ class SubgameTrainer:
                     # Compute partner gain for opener-side bids
                     if player in opener_seats:
                         partner = (player + 2) % 4
-                        h_before = self._encode_history(hist)
+                        # obs before bid (already computed as flat_obs)
+                        obs_b_571 = flat_obs[:OBS_DIM]
                         hist_after = hist + [action_int]
-                        h_after  = self._encode_history(hist_after)
+                        obs_a_571 = self._encode_for_actor(
+                            None, dealer, hist_after, player,
+                            all_hands=self.env._current_hands)[:OBS_DIM]
 
-                        oh  = torch.tensor(hands[player], dtype=torch.float32
-                                           ).unsqueeze(0).to(self.device)
-                        hb  = torch.tensor(h_before, dtype=torch.float32
-                                           ).unsqueeze(0).to(self.device)
-                        ha  = torch.tensor(h_after, dtype=torch.float32
-                                           ).unsqueeze(0).to(self.device)
-                        op  = torch.tensor([player],  dtype=torch.long).to(self.device)
+                        obs_b_t = torch.tensor(obs_b_571, dtype=torch.float32
+                                               ).unsqueeze(0).to(self.device)
+                        obs_a_t = torch.tensor(obs_a_571, dtype=torch.float32
+                                               ).unsqueeze(0).to(self.device)
                         tp  = torch.tensor([partner], dtype=torch.long).to(self.device)
                         tgt = torch.tensor(
                             hand_to_belief_target(hands[partner]),
                             dtype=torch.float32).unsqueeze(0).to(self.device)
 
-                        b_before = belief_net.get_probs(oh, hb, op, tp)
-                        b_after  = belief_net.get_probs(oh, ha, op, tp)
+                        b_before = belief_net.get_probs(obs_b_t, tp)
+                        b_after  = belief_net.get_probs(obs_a_t, tp)
                         gain = dual_info.compute_info_gain(b_before, b_after, tgt).item()
 
                         gains_all.append(gain)
@@ -2510,24 +2539,23 @@ class SubgameTrainer:
 
                     # 只在争叫方（EW）步骤计算诊断
                     if player in overcaller_seats:
-                        h_before = self._encode_history(hist)
+                        obs_b_571 = flat_t.squeeze(0).cpu().numpy()[:OBS_DIM]
                         hist_after = hist + [action_int]
-                        h_after  = self._encode_history(hist_after)
+                        obs_a_571 = self._encode_for_actor(
+                            None, dealer, hist_after, player,
+                            all_hands=self.env._current_hands)[:OBS_DIM]
 
-                        oh  = torch.tensor(hands[opener], dtype=torch.float32
-                                           ).unsqueeze(0).to(self.device)
-                        hb  = torch.tensor(h_before, dtype=torch.float32
-                                           ).unsqueeze(0).to(self.device)
-                        ha  = torch.tensor(h_after,  dtype=torch.float32
-                                           ).unsqueeze(0).to(self.device)
-                        op  = torch.tensor([opener], dtype=torch.long).to(self.device)
+                        obs_b_t = torch.tensor(obs_b_571, dtype=torch.float32
+                                               ).unsqueeze(0).to(self.device)
+                        obs_a_t = torch.tensor(obs_a_571, dtype=torch.float32
+                                               ).unsqueeze(0).to(self.device)
                         tp  = torch.tensor([player], dtype=torch.long).to(self.device)
                         tgt = torch.tensor(
                             hand_to_belief_target(hands[player]),
                             dtype=torch.float32).unsqueeze(0).to(self.device)
 
-                        b_before = self.belief_net.get_probs(oh, hb, op, tp)
-                        b_after  = self.belief_net.get_probs(oh, ha, op, tp)
+                        b_before = self.belief_net.get_probs(obs_b_t, tp)
+                        b_after  = self.belief_net.get_probs(obs_a_t, tp)
                         gain = self.dual_info.compute_info_gain(
                             b_before, b_after, tgt).item()
 

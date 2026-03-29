@@ -126,7 +126,7 @@ def run_competitive(args):
         info_reward_weight = 0.0,
         fsp_pool_size    = 10,
         fsp_add_interval = 1,
-        self_play        = True,
+        self_play        = False,
         kl_lambda_start  = _kl_start,
         kl_lambda_end    = _kl_end,
         kl_anneal_frac   = _kl_anneal,
@@ -164,7 +164,7 @@ def run_competitive(args):
             info_reward_weight = args.info_weight,
             fsp_pool_size    = 10,
             fsp_add_interval = 1,
-            self_play        = True,
+            self_play        = False,
             kl_lambda_start  = _kl_start,
             kl_lambda_end    = _kl_end,
             kl_anneal_frac   = _kl_anneal,
@@ -204,7 +204,7 @@ def run_competitive(args):
             info_reward_weight = args.info_weight,
             fsp_pool_size    = 10,
             fsp_add_interval = 1,
-            self_play        = True,
+            self_play        = False,
             kl_lambda_start  = _kl_start,
             kl_lambda_end    = _kl_end,
             kl_anneal_frac   = _kl_anneal,
@@ -357,6 +357,27 @@ def run_competitive(args):
         trainer.set_bc_anchor(trainer.agent)
     print(f"  [KL Anchor] BC anchor set for {len(trainers_to_init)} agents.")
 
+    # ── 独立 BeliefNet checkpoint（--belief_checkpoint）────────────────────
+    # 用于 sl_checkpoint 是纯 actor 文件（如 sl_base.pt）而 BeliefNet 单独训练的情况。
+    _belief_ckpt_path = getattr(args, 'belief_checkpoint', None)
+    if _belief_ckpt_path and os.path.exists(_belief_ckpt_path) and _bc:
+        print(f"[Stage 1b] Loading BeliefNet from: {_belief_ckpt_path}")
+        _bn_ckpt = torch.load(_belief_ckpt_path, map_location=device, weights_only=False)
+        _bn_sd   = _bn_ckpt.get('belief_net', _bn_ckpt)
+        _first_v = next(iter(_bn_sd.values()))
+        _bn_hidden = _bn_ckpt.get('belief_hidden_dim', _first_v.shape[0])
+        for trainer in trainers_to_init:
+            if trainer.belief_net is None:
+                continue
+            if _bn_hidden != trainer.belief_net.trunk[0].out_features:
+                from networks.belief_net import BeliefNetwork
+                trainer.belief_net = BeliefNetwork(hidden_dim=_bn_hidden).to(device)
+                print(f"  Belief Net rebuilt with hidden_dim={_bn_hidden}")
+            trainer.belief_net.load_state_dict(
+                {k: v.to(device) for k, v in _bn_sd.items()})
+            _tname = 'A' if trainer is trainer_a else ('B' if trainer is trainer_b else 'C')
+            print(f"  [Stage 1b] BeliefNet loaded for Agent {_tname} (hidden_dim={_bn_hidden})")
+
     # ── Stage 1.5: Belief Net 独立预训练 ──────────────────────────────
     belief_pretrain_rounds = getattr(args, 'belief_pretrain_rounds', 5)
     deals = 200 if args.quick else 2000
@@ -365,7 +386,10 @@ def run_competitive(args):
     # But skip if already loaded from BCA checkpoint
     trainers_for_belief = []
     if belief_pretrain_rounds > 0:
-        _bn_from_ckpt = _bc and is_bca_ckpt and 'belief_net' in (ckpt if sl_path and os.path.exists(sl_path) else {})
+        _bn_from_ckpt = (
+            (_bc and is_bca_ckpt and 'belief_net' in (ckpt if sl_path and os.path.exists(sl_path) else {}))
+            or bool(getattr(args, 'belief_checkpoint', None))  # loaded via --belief_checkpoint
+        )
         for name, trainer in [('A', trainer_a), ('B', trainer_b), ('C', trainer_c)]:
             if trainer is None:
                 continue
@@ -439,73 +463,97 @@ def run_competitive(args):
             else:
                 print(f"  [P99] WARNING: No belief data collected for replay seeding")
 
-    # ── Build SL baseline trainer for mini eval during training ──────────────
+    # ── Build SL baseline trainer for Stage 3 evaluation ─────────────────────
+    # P121: In BCA mode, auto-load sl_base_bca_stageB.pt (667-dim, Stage B trained)
+    # as the SL opponent so it can actually utilise belief features — equivalent to
+    # an opponent who has read the convention card.  Falls back to plain SL with a
+    # warning if the file is missing (e.g. Stage B not yet run).
     from algorithms.mappo import MAPPOAgent, MAPPOConfig
     from networks.policy_net import BELIEF_OBS_DIM as _BOD
 
-    _sl_bc = _bc  # SL gets belief net whenever agents do
-    _sl_obs_dim = _BOD if _sl_bc else OBS_DIM
+    _SL_BCA_STAGEB_PATH = 'results/sl_base_bca_stageB.pt'
+    _use_stageb = _bc and os.path.exists(_SL_BCA_STAGEB_PATH)
 
+    if _bc and not _use_stageb:
+        print(f"\n  ⚠️  [SL Eval] BCA mode but {_SL_BCA_STAGEB_PATH} not found. "
+              f"Falling back to plain SL (belief cols zero — run Stage B first).")
+
+    _sl_obs_dim = _BOD if _bc else OBS_DIM
     cfg_sl = SubgameConfig(
-        device=device, belief_conditioned=_sl_bc, use_info_bonus=False,
+        device=device, belief_conditioned=_bc, use_info_bonus=False,
         kl_lambda_start=0.0, kl_lambda_end=0.0,
         belief_warmup_rounds=0,
     )
     sl_agent_eval = MAPPOAgent(MAPPOConfig(device=device, obs_dim=_sl_obs_dim))
-    if sl_path and os.path.exists(sl_path):
-        ckpt_sl = torch.load(sl_path, map_location=device, weights_only=False)
-        _is_p105_sl = ('model_state' in ckpt_sl)
-        sl_obs_dim_ckpt = ckpt_sl.get('obs_dim', OBS_DIM)
 
-        if _is_p105_sl:
-            # P105 format: single model_state → all players
-            sl_sd = {k: v.to(device) for k, v in ckpt_sl['model_state'].items()}
-            for player in range(NUM_PLAYERS):
-                actor = sl_agent_eval.get_actor(player)
-                if _sl_bc and sl_obs_dim_ckpt < _BOD:
-                    # 571→667: zero-init belief columns
-                    target_sd = actor.state_dict()
-                    for param_name, sl_val in sl_sd.items():
-                        if param_name in target_sd:
-                            tgt_shape = target_sd[param_name].shape
-                            if sl_val.shape == tgt_shape:
-                                target_sd[param_name] = sl_val
-                            elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
-                                target_sd[param_name][:, :sl_val.shape[1]] = sl_val
-                                target_sd[param_name][:, sl_val.shape[1]:] = 0.0
-                            else:
-                                target_sd[param_name] = sl_val
-                    actor.load_state_dict(target_sd)
-                else:
-                    actor.load_state_dict(sl_sd)
-        else:
-            # Legacy format
-            for player, key in [(_N, 'actor_n'), (_E, 'actor_e'),
-                                (_S, 'actor_s'), (_W, 'actor_w')]:
-                if key not in ckpt_sl:
-                    continue
-                sl_sd = {k: v.to(device) for k, v in ckpt_sl[key].items()}
-                actor = sl_agent_eval.get_actor(player)
-                if _sl_bc and sl_obs_dim_ckpt != _BOD:
-                    target_sd = actor.state_dict()
-                    for param_name, sl_val in sl_sd.items():
-                        if param_name in target_sd:
-                            tgt_shape = target_sd[param_name].shape
-                            if sl_val.shape == tgt_shape:
-                                target_sd[param_name] = sl_val
-                            elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
-                                target_sd[param_name][:, :sl_val.shape[1]] = sl_val
-                                target_sd[param_name][:, sl_val.shape[1]:] = 0.0
-                            else:
-                                target_sd[param_name] = sl_val
-                    actor.load_state_dict(target_sd)
-                else:
-                    actor.load_state_dict(sl_sd)
+    if _use_stageb:
+        # ── Stage B SL: 667-dim actor + BeliefNet, fully trained on SAYC ──────
+        print(f"\n  [SL Eval] Loading Stage B SL: {_SL_BCA_STAGEB_PATH}")
+        _sb_ckpt = torch.load(_SL_BCA_STAGEB_PATH, map_location=device, weights_only=False)
+        _sb_sd   = {k: v.to(device) for k, v in _sb_ckpt['model_state'].items()}
+        for player in range(NUM_PLAYERS):
+            sl_agent_eval.get_actor(player).load_state_dict(_sb_sd)
+        # Also load BeliefNet into sl_trainer's belief_net below
+        _stageb_belief_sd = _sb_ckpt.get('belief_net', None)
+        print(f"  [SL Eval] Stage B SL loaded (667-dim, SAYC-trained belief cols)")
+    else:
+        # ── Plain SL fallback (571-dim or 667-dim with zero belief cols) ──────
+        if sl_path and os.path.exists(sl_path):
+            ckpt_sl = torch.load(sl_path, map_location=device, weights_only=False)
+            _is_p105_sl = ('model_state' in ckpt_sl)
+            sl_obs_dim_ckpt = ckpt_sl.get('obs_dim', OBS_DIM)
+
+            if _is_p105_sl:
+                sl_sd = {k: v.to(device) for k, v in ckpt_sl['model_state'].items()}
+                for player in range(NUM_PLAYERS):
+                    actor = sl_agent_eval.get_actor(player)
+                    if _bc and sl_obs_dim_ckpt < _BOD:
+                        target_sd = actor.state_dict()
+                        for param_name, sl_val in sl_sd.items():
+                            if param_name in target_sd:
+                                if sl_val.shape == target_sd[param_name].shape:
+                                    target_sd[param_name] = sl_val
+                                elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
+                                    target_sd[param_name][:, :sl_val.shape[1]] = sl_val
+                                    target_sd[param_name][:, sl_val.shape[1]:] = 0.0
+                                else:
+                                    target_sd[param_name] = sl_val
+                        actor.load_state_dict(target_sd)
+                    else:
+                        actor.load_state_dict(sl_sd)
+            else:
+                for player, key in [(_N, 'actor_n'), (_E, 'actor_e'),
+                                    (_S, 'actor_s'), (_W, 'actor_w')]:
+                    if key not in ckpt_sl:
+                        continue
+                    sl_sd = {k: v.to(device) for k, v in ckpt_sl[key].items()}
+                    actor = sl_agent_eval.get_actor(player)
+                    if _bc and sl_obs_dim_ckpt != _BOD:
+                        target_sd = actor.state_dict()
+                        for param_name, sl_val in sl_sd.items():
+                            if param_name in target_sd:
+                                if sl_val.shape == target_sd[param_name].shape:
+                                    target_sd[param_name] = sl_val
+                                elif param_name == 'net.0.weight' and len(sl_val.shape) == 2:
+                                    target_sd[param_name][:, :sl_val.shape[1]] = sl_val
+                                    target_sd[param_name][:, sl_val.shape[1]:] = 0.0
+                                else:
+                                    target_sd[param_name] = sl_val
+                        actor.load_state_dict(target_sd)
+                    else:
+                        actor.load_state_dict(sl_sd)
+        _stageb_belief_sd = None
+
     sl_trainer = SubgameTrainer(env, cfg_sl, reward_stats=RunningStats())
     sl_trainer.agent = sl_agent_eval
 
-    # P99: Pretrain SL's belief net (same procedure as A/B, independent instance)
-    if _sl_bc and sl_trainer.belief_net is not None:
+    # Load BeliefNet into sl_trainer
+    _sl_bn_from_ckpt = bool(getattr(args, 'belief_checkpoint', None))
+    if _use_stageb and _stageb_belief_sd is not None and sl_trainer.belief_net is not None:
+        sl_trainer.belief_net.load_state_dict(
+            {k: v.to(device) for k, v in _stageb_belief_sd.items()})
+        print(f"  [SL Eval] BeliefNet loaded from Stage B checkpoint")
+    elif _sl_bc and sl_trainer.belief_net is not None and not _sl_bn_from_ckpt:
         print(f"\n  [SL Eval] Pretraining SL baseline belief net "
               f"({belief_pretrain_rounds * deals} deals)...")
         sl_trainer.pretrain_belief(
@@ -515,6 +563,12 @@ def run_competitive(args):
             max_epochs=getattr(args, 'belief_pretrain_max_epochs', 300),
         )
         print(f"  [SL Eval] Belief-conditioned SL baseline ({_sl_obs_dim}-dim)")
+    elif _sl_bn_from_ckpt and _sl_bc and sl_trainer.belief_net is not None:
+        _bn_ckpt2 = torch.load(_belief_ckpt_path, map_location=device, weights_only=False)
+        _bn_sd2   = _bn_ckpt2.get('belief_net', _bn_ckpt2)
+        sl_trainer.belief_net.load_state_dict(
+            {k: v.to(device) for k, v in _bn_sd2.items()})
+        print(f"  [Stage 1b] BeliefNet loaded for SL baseline (hidden_dim={_bn_hidden})")
 
     # ── Stage 2: RL 微调 ────────────────────────────────────────────────────
     print("\n[Stage 2] RL Fine-tuning...")
@@ -641,14 +695,15 @@ def run_competitive(args):
     print("\n" + "═" * 72)
     _mode_label = "agent_a_only (drift sweep)" if _a_only else "P100: BCA standard for all agents"
     print(f"  FINAL SUMMARY ({_mode_label})")
+    _sl_label = "SL_BCA(StageB)" if _use_stageb else "SL"
     print("═" * 72)
-    print(f"  A vs SL:  {h2h_a_sl['mean_imp']:+.3f} ± {h2h_a_sl['std_imp']:.3f} IMP  "
+    print(f"  A vs {_sl_label}:  {h2h_a_sl['mean_imp']:+.3f} ± {h2h_a_sl['std_imp']:.3f} IMP  "
           f"p={h2h_a_sl['p_value']:.3f} {'✅' if h2h_a_sl['significant'] else '(ns)'}")
     if h2h_b_sl:
-        print(f"  B vs SL:  {h2h_b_sl['mean_imp']:+.3f} ± {h2h_b_sl['std_imp']:.3f} IMP  "
+        print(f"  B vs {_sl_label}:  {h2h_b_sl['mean_imp']:+.3f} ± {h2h_b_sl['std_imp']:.3f} IMP  "
               f"p={h2h_b_sl['p_value']:.3f} {'✅' if h2h_b_sl['significant'] else '(ns)'}")
     if h2h_c_sl:
-        print(f"  C vs SL:  {h2h_c_sl['mean_imp']:+.3f} ± {h2h_c_sl['std_imp']:.3f} IMP  "
+        print(f"  C vs {_sl_label}:  {h2h_c_sl['mean_imp']:+.3f} ± {h2h_c_sl['std_imp']:.3f} IMP  "
               f"p={h2h_c_sl['p_value']:.3f} {'✅' if h2h_c_sl['significant'] else '(ns)'}")
     if h2h_ab or h2h_ac or h2h_bc:
         print(f"  ──────────────────────────────────────────────")
@@ -1002,6 +1057,11 @@ def parse_args():
                         help='SL pretrained checkpoint (4-actor format). '
                              'P100 default: sl_base_bca.pt (397-dim BCA). '
                              'Use sl_base.pt for legacy 301-dim experiments.')
+    parser.add_argument('--belief_checkpoint', default=None,
+                        help='Standalone BeliefNet checkpoint (Stage A output from sl_pretrain_bca.py). '
+                             'Use when --sl_checkpoint is a pure-actor file (e.g. sl_base.pt) '
+                             'and BeliefNet was trained separately. '
+                             'Loaded after sl_checkpoint; overrides any belief_net inside sl_checkpoint.')
     parser.add_argument('--save_dir', default='results/competitive',
                         help='Directory to save checkpoints')
     parser.add_argument('--load_agent_a', default=None,

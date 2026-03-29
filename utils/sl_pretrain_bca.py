@@ -515,17 +515,33 @@ def main():
     p.add_argument('--eval_every', type=int, default=10000)
     p.add_argument('--max_lines',  type=int, default=None)
     p.add_argument('--belief_max_lines', type=int, default=200000)
-    p.add_argument('--init_from',  type=str, default=None,
+    p.add_argument('--init_from',   type=str, default=None,
                    help='Path to sl_base.pt (571-dim) for Stage B init')
+    p.add_argument('--load_belief', type=str, default=None,
+                   help='Path to existing BeliefNet checkpoint (e.g. sl_base_bca.pt). '
+                        'If set, skip Stage A and load BeliefNet directly. '
+                        'Use with --init_from sl_base.pt to run Stage B only.')
     args = p.parse_args()
 
-    # Stage A
-    print(f"\n[Stage A] Collecting data (max {args.belief_max_lines:,} lines)...")
-    trajs = load_trajectories(args.train, max_lines=args.belief_max_lines)
-    belief_net = train_belief_net(
-        trajs, device=args.device, epochs=args.belief_epochs,
-        batch_size=2048, hidden_dim=512)
-    del trajs
+    # Stage A — skip if --load_belief provided
+    if args.load_belief:
+        import torch as _torch
+        print(f"\n[Stage A] Skipped — loading BeliefNet from: {args.load_belief}")
+        _bn_ckpt   = _torch.load(args.load_belief, map_location=args.device,
+                                  weights_only=False)
+        _bn_sd     = _bn_ckpt.get('belief_net', _bn_ckpt)
+        _bn_hidden = _bn_ckpt.get('belief_hidden_dim',
+                                   next(iter(_bn_sd.values())).shape[0])
+        belief_net = BeliefNetwork(obs_dim=OBS_DIM, hidden_dim=_bn_hidden).to(args.device)
+        belief_net.load_state_dict({k: v.to(args.device) for k, v in _bn_sd.items()})
+        print(f"  BeliefNet loaded (hidden_dim={_bn_hidden})")
+    else:
+        print(f"\n[Stage A] Collecting data (max {args.belief_max_lines:,} lines)...")
+        trajs = load_trajectories(args.train, max_lines=args.belief_max_lines)
+        belief_net = train_belief_net(
+            trajs, device=args.device, epochs=args.belief_epochs,
+            batch_size=2048, hidden_dim=512)
+        del trajs
 
     # Stage B
     print(f"\n[Stage B] Training 667-dim Actor...")
