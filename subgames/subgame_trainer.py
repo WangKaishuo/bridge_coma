@@ -1150,7 +1150,12 @@ class SubgameTrainer:
         collected = 0
 
         def _reset(i):
-            obs = envs[i].reset()
+            # P122: randomize vulnerability for each new deal
+            _vul_choices = [(False, False), (True, False),
+                            (False, True),  (True, True)]
+            _vul = _vul_choices[np.random.randint(4)]
+            hands, dd_table = envs[i].generate_deal()
+            obs = envs[i].reset(hands, dd_table, vulnerability=_vul)
             slot_hist[i]   = list(envs[i].history_int)
             slot_dealer[i] = envs[i].dealer   # dealer chosen by generate_deal()
             slot_ep[i]     = []
@@ -1211,7 +1216,8 @@ class SubgameTrainer:
                         slot_obs[i], slot_dealer[i], slot_hist[i],
                         envs[i].current_player,
                         all_hands=envs[i]._current_hands,
-                        use_prior=True)[:OBS_DIM]   # always prior here; BCA appended below
+                        use_prior=True,
+                        vulnerability=envs[i]._vulnerability)[:OBS_DIM]   # always prior here; BCA appended below
                     for i in slots])
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
@@ -1295,7 +1301,8 @@ class SubgameTrainer:
                         if self.config.use_info_bonus:
                             obs_after = self._encode_for_actor(
                                 None, slot_dealer[i], slot_hist[i], player,
-                                all_hands=all_hands)
+                                all_hands=all_hands,
+                                vulnerability=envs[i]._vulnerability)
                             step['obs_571_after'] = obs_after[:OBS_DIM]
                         else:
                             step['obs_571_after'] = None
@@ -1372,7 +1379,10 @@ class SubgameTrainer:
         for _ in range(num_deals):
             hands, dd_table = self.env.generate_deal()
             dealer = self.env.dealer   # set by generate_deal() via _sampled_dealer
-            vul = (False, False)
+            # P122: randomize vulnerability (4 states, uniform)
+            _vul_choices = [(False, False), (True, False),
+                            (False, True),  (True, True)]
+            vul = _vul_choices[np.random.randint(4)]
 
             obs  = self.env.reset(hands, dd_table, vulnerability=vul)
             done = False
@@ -1602,6 +1612,7 @@ class SubgameTrainer:
         all_hands: Optional[np.ndarray] = None,
         belief_net: Optional[BeliefNetwork] = None,
         use_prior: bool = False,
+        vulnerability: tuple = None,
     ) -> np.ndarray:
         """
         P108: 统一的 actor 输入编码，使用 OpenSpiel 571-dim observation。
@@ -1612,20 +1623,25 @@ class SubgameTrainer:
         all_hands 是 suit-major (4,52)，dealer 是真实庄家座位（0-3）。
         history_int 是我们编码的叫牌历史（0-37）。
 
+        P122: Added vulnerability parameter. When provided, the OpenSpiel state
+        is created with the correct vul, producing obs with vul-aware features.
+
         P109 perf: incremental state reuse.
         OpenSpiel obs is public-info only (no private cards). The obs at step t
-        depends only on (hands_key, dealer, history[0..t]). We cache the last
-        OpenSpiel state keyed on (hands_key, dealer, history_tuple) so that
+        depends only on (hands_key, dealer, history[0..t], vul). We cache the last
+        OpenSpiel state keyed on (hands_key, dealer, history_tuple, vul) so that
         consecutive calls for the same deal reuse the state instead of rebuilding
         it from scratch each time. This removes O(t) replay cost from every step.
         """
+        if vulnerability is None:
+            vulnerability = getattr(self.env, '_vulnerability', (False, False))
         hands_sm = all_hands
         if hands_sm is not None:
             hands_rm = convert_hands_suit_to_rank(hands_sm)
 
-            # Build cache key from (hands bytes, dealer, history)
+            # Build cache key from (hands bytes, dealer, history, vul)
             hist_tuple = tuple(history_int)
-            cache_key  = (hands_rm.tobytes(), dealer, hist_tuple)
+            cache_key  = (hands_rm.tobytes(), dealer, hist_tuple, vulnerability)
             cached = self._obs_cache.get(cache_key)
 
             if cached is not None:
@@ -1635,7 +1651,7 @@ class SubgameTrainer:
                 # rather than rebuilding from scratch.
                 prev_flat = None
                 if hist_tuple:
-                    prev_key = (hands_rm.tobytes(), dealer, hist_tuple[:-1])
+                    prev_key = (hands_rm.tobytes(), dealer, hist_tuple[:-1], vulnerability)
                     prev_state = self._obs_state_cache.get(prev_key)
                     if prev_state is not None:
                         os_state = prev_state
@@ -1656,7 +1672,8 @@ class SubgameTrainer:
 
                 if prev_flat is None:
                     # Full rebuild (first step or cache miss)
-                    os_state = hands_to_openspiel_state(hands_rm, dealer)
+                    os_state = hands_to_openspiel_state(hands_rm, dealer,
+                                                        vulnerability=vulnerability)
                     for a in history_int:
                         if os_state.is_terminal():
                             break
@@ -2267,7 +2284,8 @@ class SubgameTrainer:
                     ours_to_openspiel_raw, openspiel_raw_to_ours,
                 )
                 hands_rm = convert_hands_suit_to_rank(env._current_hands)
-                os_state = hands_to_openspiel_state(hands_rm, _dealer)
+                os_state = hands_to_openspiel_state(hands_rm, _dealer,
+                                                    vulnerability=env._vulnerability)
                 for a in history_int:
                     os_a = ours_to_openspiel_raw(a)
                     if not os_state.is_terminal():

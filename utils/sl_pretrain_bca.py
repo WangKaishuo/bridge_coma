@@ -395,10 +395,20 @@ def train_sl_bca(
     lr: float = 1e-4, hidden_dim: int = 1024,
     device: str = 'cuda', max_lines: int = None,
     eval_every: int = 10000, init_from: str = None,
+    freeze_base: bool = False,
 ):
-    """Stage B: Train 667-dim actors with belief features."""
+    """Stage B: Train 667-dim actors with belief features.
+
+    freeze_base: if True, freeze first layer's base-obs columns ([:, :571])
+    so that the SL baseline's representation is preserved. Only the belief
+    columns ([:, 571:]) in layer 0 and ALL subsequent layers are trained.
+    This ensures that when belief features are uninformative (prior/noise),
+    the actor degrades gracefully to plain SL behavior instead of getting worse.
+    """
     print(f"\n[Stage B] SL Pretrain (667-dim BCA, iteration-based)")
     print(f"  device={device}  iterations={iterations}  batch={batch_size}  lr={lr}")
+    if freeze_base:
+        print(f"  freeze_base=True → net.0.weight[:, :571] frozen")
     if init_from:
         print(f"  init_from={init_from} (571→667 zero-init)")
 
@@ -428,6 +438,20 @@ def train_sl_bca(
                     target_sd[pn] = sv
             model.load_state_dict(target_sd)
             print(f"  [init] Base weights loaded, belief cols zero-init")
+
+    # Freeze base-obs columns in first layer if requested
+    _grad_hook = None
+    if freeze_base:
+        base_dim = OBS_DIM  # 571
+        w0 = model.net[0].weight  # (hidden_dim, 667)
+        # Create a gradient mask: 0 for base cols, 1 for belief cols
+        grad_mask = torch.zeros_like(w0)
+        grad_mask[:, base_dim:] = 1.0  # only belief cols get gradients
+        _grad_hook = w0.register_hook(lambda grad: grad * grad_mask)
+        n_frozen = base_dim * w0.shape[0]
+        n_trainable = (w0.shape[1] - base_dim) * w0.shape[0]
+        print(f"  [freeze] net.0.weight: {n_frozen:,} params frozen, "
+              f"{n_trainable:,} trainable (belief cols)")
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     best_np_acc = 0.0
@@ -494,6 +518,8 @@ def train_sl_bca(
                 }, out_path)
 
     print(f"\n[Stage B] Best non_pass_acc={best_np_acc:.4f}. Saved → {out_path}")
+    if _grad_hook is not None:
+        _grad_hook.remove()
     return best_np_acc
 
 
@@ -521,6 +547,10 @@ def main():
                    help='Path to existing BeliefNet checkpoint (e.g. sl_base_bca.pt). '
                         'If set, skip Stage A and load BeliefNet directly. '
                         'Use with --init_from sl_base.pt to run Stage B only.')
+    p.add_argument('--freeze_base', action='store_true',
+                   help='Freeze first layer base-obs columns ([:, :571]) during Stage B. '
+                        'Only belief columns and subsequent layers are trained. '
+                        'Ensures graceful degradation to plain SL when belief is uninformative.')
     args = p.parse_args()
 
     # Stage A — skip if --load_belief provided
@@ -550,7 +580,8 @@ def main():
         belief_net=belief_net, iterations=args.iterations,
         batch_size=args.batch_size, lr=args.lr, hidden_dim=args.hidden_dim,
         device=args.device, max_lines=args.max_lines,
-        eval_every=args.eval_every, init_from=args.init_from)
+        eval_every=args.eval_every, init_from=args.init_from,
+        freeze_base=args.freeze_base)
 
 
 if __name__ == '__main__':

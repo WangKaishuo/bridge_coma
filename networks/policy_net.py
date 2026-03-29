@@ -137,16 +137,26 @@ _SM_TO_RM_IDX = _build_sm_to_rm_idx()
 # ==============================================================================
 
 
-def get_openspiel_game(dealer: int = 0):
-    """Get a cached OpenSpiel bridge game instance for the given dealer."""
-    if dealer not in _GAMES:
+def get_openspiel_game(dealer: int = 0,
+                       dealer_vul: bool = False,
+                       non_dealer_vul: bool = False):
+    """Get a cached OpenSpiel bridge game instance for the given parameters.
+
+    P122: Added dealer_vul and non_dealer_vul support. Cache key expanded
+    to (dealer, dealer_vul, non_dealer_vul).
+    """
+    key = (dealer, dealer_vul, non_dealer_vul)
+    if key not in _GAMES:
         import pyspiel
-        _GAMES[dealer] = pyspiel.load_game(
-            f'bridge(use_double_dummy_result=false,dealer={dealer})')
-    return _GAMES[dealer]
+        _GAMES[key] = pyspiel.load_game(
+            f'bridge(use_double_dummy_result=false,dealer={dealer},'
+            f'dealer_vul={"true" if dealer_vul else "false"},'
+            f'non_dealer_vul={"true" if non_dealer_vul else "false"})')
+    return _GAMES[key]
 
 
-def hands_to_openspiel_state(hands_rm: np.ndarray, dealer: int = 0):
+def hands_to_openspiel_state(hands_rm: np.ndarray, dealer: int = 0,
+                             vulnerability: tuple = None):
     """
     Create an OpenSpiel state from a (4, 52) rank-major hand matrix.
 
@@ -154,6 +164,7 @@ def hands_to_openspiel_state(hands_rm: np.ndarray, dealer: int = 0):
         hands_rm: (4, 52) float32, rank-major encoding (card_id = rank*4+suit).
                   If from competitive_env, convert first with convert_hands_suit_to_rank().
         dealer:   dealer seat (0=N, 1=E, 2=S, 3=W).
+        vulnerability: (ns_vul, ew_vul) tuple of bools, or None for (False, False).
 
     Returns: pyspiel.State after dealing (ready for bidding)
 
@@ -167,12 +178,30 @@ def hands_to_openspiel_state(hands_rm: np.ndarray, dealer: int = 0):
     This makes the observation identical in structure to training data.
     The SL model is seat-agnostic: it only sees bidding history, not seat labels.
 
+    P122: Added vulnerability support. The vul is specified as (ns_vul, ew_vul)
+    and converted to OpenSpiel's (dealer_vul, non_dealer_vul) relative to the
+    rolled dealer (always seat 0). When dealer is NS (d%2==0), dealer_vul=ns_vul.
+    When dealer is EW (d%2==1), dealer_vul=ew_vul.
+
     P109 perf: cache the interleaved deal-action sequence keyed on the bytes of
     hands_to_deal. Building cards_per_player via np.where+sorted is O(4×52) and
     was called once per rollout step — this reduces it to O(1) on cache hit.
     """
+    if vulnerability is None:
+        vulnerability = (False, False)
+    ns_vul, ew_vul = vulnerability
+
+    # Convert (ns_vul, ew_vul) to OpenSpiel's (dealer_vul, non_dealer_vul)
+    # After rolling, seat 0 = actual dealer. If actual dealer is NS, dealer_vul=ns_vul.
+    if dealer % 2 == 0:  # dealer is N or S (NS)
+        dealer_vul = ns_vul
+        non_dealer_vul = ew_vul
+    else:  # dealer is E or W (EW)
+        dealer_vul = ew_vul
+        non_dealer_vul = ns_vul
+
     # Always use dealer=0 game (matches SL training distribution)
-    game = get_openspiel_game(0)
+    game = get_openspiel_game(0, dealer_vul, non_dealer_vul)
 
     # Roll hands so the actual opener sits at index 0
     if dealer == 0:

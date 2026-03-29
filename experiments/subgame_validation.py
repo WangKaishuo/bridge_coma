@@ -749,11 +749,26 @@ def run_competitive(args):
     if args.save_dir:
         import json
         os.makedirs(args.save_dir, exist_ok=True)
-        trainer_a.agent.save(os.path.join(args.save_dir, f'agent_a_seed{args.seed}.pt'))
+
+        def _save_agent_with_belief(trainer, filename):
+            """Save agent checkpoint, appending BeliefNet if present."""
+            path = os.path.join(args.save_dir, filename)
+            trainer.agent.save(path)
+            # Append co-evolved BeliefNet into the same checkpoint
+            if trainer.belief_net is not None:
+                ckpt = torch.load(path, map_location='cpu', weights_only=False)
+                ckpt['belief_net'] = {
+                    k: v.cpu() for k, v in trainer.belief_net.state_dict().items()
+                }
+                ckpt['belief_hidden_dim'] = trainer.belief_net.trunk[0].out_features
+                torch.save(ckpt, path)
+                print(f"  [Save] BeliefNet appended to {filename}")
+
+        _save_agent_with_belief(trainer_a, f'agent_a_seed{args.seed}.pt')
         if trainer_b is not None:
-            trainer_b.agent.save(os.path.join(args.save_dir, f'agent_b_seed{args.seed}.pt'))
+            _save_agent_with_belief(trainer_b, f'agent_b_seed{args.seed}.pt')
         if trainer_c is not None:
-            trainer_c.agent.save(os.path.join(args.save_dir, f'agent_c_seed{args.seed}.pt'))
+            _save_agent_with_belief(trainer_c, f'agent_c_seed{args.seed}.pt')
         report = {
             'seed': args.seed, 'beta_b': 0.0, 'beta_c': _beta_c if trainer_c else None,
             'rounds': args.rounds,

@@ -439,62 +439,62 @@ class CompetitiveSubgameEnv:
         self,
         dd_table:      np.ndarray,
         vulnerability: Tuple[bool, bool],
-        dealer:        Optional[int] = None,
     ) -> int:
         """
-        DDS oracle: opener 阵营视角的双明手博弈均衡得分（P77修复）.
+        DDS oracle: NS 视角的双明手博弈均衡得分（P77修复）.
 
-        P117 fix: 旧实现硬编码 opener=NORTH/SOUTH, overcaller=EAST/WEST。
-        dealer rotation 后这个假设不成立。修复：用 dealer 参数动态确定
-        opener_seats / overcaller_seats。
-
-        dealer=None 时回退到 self.dealer（若存在）或 NORTH（向后兼容）。
+        正确语义：双明手均衡是双方都知道所有手牌时的博弈平衡点——
+        任何一方再叫牌都只会得到更差的结果，因此停叫。
+        1H-1S之后流局不可能发生。
 
         正确算法：对每个花色，只考虑能叫成的定约：
-            - opener 阵营能叫成的最高级数 → opener 视角正分
-            - overcaller 阵营能叫成的最高级数 → opener 视角负分
-            - 两者取对 opener 更好的结果
+            - NS在该花色能叫成的最高级数 → NS视角正分
+            - EW在该花色能叫成的最高级数 → NS视角负分
+            - 两者取对NS更好的结果
         跨所有花色取全局最大值。
+
+        错误的旧逻辑：
+            - best_score=0预设流局可选（竞争叫牌中不成立）
+            - EW作庄分支全pass
+            - 误把EW宕牌的负分（NS视角正数）当作可选结果
+              （EW永远不会自愿叫宕牌的定约）
         """
         from utils.scoring import Contract as C_
 
-        _dealer = dealer if dealer is not None else getattr(self, 'dealer', NORTH)
-        opener_seats     = (_dealer, (_dealer + 2) % NUM_PLAYERS)          # e.g. (0,2) or (1,3)
-        overcaller_seats = ((_dealer + 1) % NUM_PLAYERS, (_dealer + 3) % NUM_PLAYERS)
-        opener_vul, overcaller_vul = vulnerability[0], vulnerability[1]
-
+        ns_vul, ew_vul = vulnerability
         best_score = None
 
         for suit in range(5):
-            # opener 阵营能叫成的最高级数（叫成才有正分）
-            opener_best = None
+            # NS 在该花色能叫成的最高级数（叫成才有正分）
+            ns_best = None
             for level in range(7, 0, -1):
-                for declarer in opener_seats:
+                for declarer in (NORTH, SOUTH):
                     tricks = int(dd_table[suit, declarer])
                     score  = calculate_score(
                         C_(level=level, suit=suit, declarer=declarer, doubled=0),
-                        tricks, opener_vul)
+                        tricks, ns_vul)
                     if score > 0:
-                        if opener_best is None or score > opener_best:
-                            opener_best = score
+                        if ns_best is None or score > ns_best:
+                            ns_best = score
 
-            # overcaller 阵营能叫成的最高级数（opener 视角取负）
-            overcaller_best_opener_view = None
+            # EW 在该花色能叫成的最高级数（NS视角取负）
+            # EW会选对自己最有利的定约（叫最高能成的级数），
+            # 对NS而言这是最坏情况（NS视角取min）
+            ew_best_ns_view = None
             for level in range(7, 0, -1):
-                for declarer in overcaller_seats:
-                    tricks = int(dd_table[suit, declarer])
-                    oc_score = calculate_score(
+                for declarer in (EAST, WEST):
+                    tricks   = int(dd_table[suit, declarer])
+                    ew_score = calculate_score(
                         C_(level=level, suit=suit, declarer=declarer, doubled=0),
-                        tricks, overcaller_vul)
-                    if oc_score > 0:
-                        opener_view = -oc_score
-                        if (overcaller_best_opener_view is None
-                                or opener_view < overcaller_best_opener_view):
-                            overcaller_best_opener_view = opener_view
+                        tricks, ew_vul)
+                    if ew_score > 0:
+                        ns_view = -ew_score
+                        # EW叫最高能成的级数对NS最不利：取NS视角最小值
+                        if ew_best_ns_view is None or ns_view < ew_best_ns_view:
+                            ew_best_ns_view = ns_view
 
-            # 该花色对 opener 最好的结果
-            candidates = [x for x in (opener_best, overcaller_best_opener_view)
-                          if x is not None]
+            # 该花色对NS最好的结果（NS打 vs 让EW打，取较优者）
+            candidates = [x for x in (ns_best, ew_best_ns_view) if x is not None]
             if candidates:
                 suit_best = max(candidates)
                 if best_score is None or suit_best > best_score:
@@ -507,32 +507,14 @@ class CompetitiveSubgameEnv:
         contract:      Optional[Contract],
         dd_table:      np.ndarray,
         vulnerability: Tuple[bool, bool],
-        dealer:        Optional[int] = None,
     ) -> int:
-        """
-        计算开叫方阵营（opener side）视角实际得分.
-
-        P117 fix: 旧实现硬编码 declarer%2==1 → EW庄家 → 取负，
-        默认 NS(seat 0,2) = 开叫方。dealer rotation 后这个假设不成立：
-        当 dealer=EAST(1) 时，opener 阵营是 seat 1,3，打庄应是正分，
-        但旧代码却取负。修复：用 dealer 参数确定 opener_seats。
-
-        dealer=None 时回退到 self.dealer（若存在）或 NORTH（向后兼容）。
-        """
+        """计算 NS 视角实际得分."""
         if contract is None:
             return 0
-
-        # 确定 opener 阵营座位
-        _dealer = dealer if dealer is not None else getattr(self, 'dealer', NORTH)
-        opener_seats = {_dealer, (_dealer + 2) % NUM_PLAYERS}
-
         tricks = int(dd_table[contract.suit, contract.declarer])
-        # vulnerability index: opener side vul = vulnerability[0],
-        # overcaller side vul = vulnerability[1]
-        is_opener_declarer = contract.declarer in opener_seats
-        vul = vulnerability[0] if is_opener_declarer else vulnerability[1]
-        score = calculate_score(contract, tricks, vul)
-        if not is_opener_declarer:   # 争叫方庄家 → opener 阵营得负分
+        vul    = vulnerability[contract.declarer % 2]
+        score  = calculate_score(contract, tricks, vul)
+        if contract.declarer % 2 == 1:   # EW 庄家 → NS 得负分
             score = -score
         return score
 
@@ -571,6 +553,7 @@ class CompetitiveSubgameEnv:
         """
         dealer = dealer if dealer is not None else self.dealer
         self.dealer = dealer  # P93 fix: policy closures read env.dealer for encode_obs_flat
+        self._vulnerability = vulnerability  # P122: policy closures read env._vulnerability
         opener_seats = {dealer, (dealer + 2) % NUM_PLAYERS}
 
         inner = BridgeBiddingEnv(self.max_history_len)
@@ -600,7 +583,7 @@ class CompetitiveSubgameEnv:
             obs, _, done, _ = inner.step(action)
 
         contract = inner.state.final_contract
-        score    = self._compute_score_ns(contract, dd_table, vulnerability, dealer=dealer)
+        score    = self._compute_score_ns(contract, dd_table, vulnerability)
         return contract, score, list(inner.state.history)
 
 
@@ -655,6 +638,9 @@ def cross_evaluate(
         # P109: sync hands into env so policy closures can read env._current_hands
         env._current_hands  = hands
         env._eval_hands_rm  = convert_hands_suit_to_rank(hands)
+        # P122: sync vul so _encode_for_actor can read env._vulnerability
+        env._vulnerability  = vul
+        env.dealer          = dealer
 
         _, score_1, _ = env.play_mixed(
             hands, dd_table,
@@ -730,8 +716,8 @@ def dds_oracle_evaluate(
             obs, _, done, _ = inner.step(action)
 
         contract = inner.state.final_contract
-        score_ns = env._compute_score_ns(contract, dd_table, vul, dealer=dealer)
-        opt_ns   = env._compute_dds_optimal_score_ns(dd_table, vul, dealer=dealer)
+        score_ns = env._compute_score_ns(contract, dd_table, vul)
+        opt_ns   = env._compute_dds_optimal_score_ns(dd_table, vul)
 
         regret = float(score_to_imp(score_ns - opt_ns))
         regrets.append(regret)
@@ -764,6 +750,7 @@ def make_agent_policy(
     deterministic: bool = True,
     dealer: int = NORTH,
     hands_sm: np.ndarray = None,
+    vulnerability: tuple = None,
 ) -> Callable[[Dict, int, list], int]:
     """
     从 MAPPOAgent 创建 competitive policy 函数.
@@ -772,12 +759,14 @@ def make_agent_policy(
 
     P105: Uses OpenSpiel state.observation_tensor() for 571-dim observations.
     Reconstructs OpenSpiel state from (hands, dealer, history) each step.
+    P122: vulnerability passed through for vul-aware obs.
 
     Args:
         agent: MAPPOAgent with loaded actors
         deterministic: if True, use argmax
         dealer: dealer seat for this deal
         hands_sm: (4, 52) suit-major hands — REQUIRED for OpenSpiel obs.
+        vulnerability: (ns_vul, ew_vul) or None for (False, False)
     """
     import torch
     from networks.policy_net import (
@@ -789,38 +778,27 @@ def make_agent_policy(
         raise ValueError(
             "P105: make_agent_policy requires hands_sm for OpenSpiel observations.")
 
+    if vulnerability is None:
+        vulnerability = (False, False)
+
     # Pre-convert hands (done once per deal)
     hands_rm = convert_hands_suit_to_rank(hands_sm)
 
     def policy(obs: Dict, player: int, history_int: list) -> int:
         # Reconstruct OpenSpiel state and replay history
-        os_state = hands_to_openspiel_state(hands_rm, dealer)
+        os_state = hands_to_openspiel_state(hands_rm, dealer,
+                                            vulnerability=vulnerability)
         for our_action in history_int:
             os_action = ours_to_openspiel_raw(our_action)
-            if os_action >= 0 and not os_state.is_terminal():
-                legal_os = os_state.legal_actions()
-                if legal_os and legal_os[0] >= 52 and os_action in legal_os:
-                    os_state.apply_action(os_action)
+            if os_action >= 0:
+                os_state.apply_action(os_action)
 
         flat = get_openspiel_obs(os_state)
         flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(agent.device)
+        legal  = torch.tensor(
+            obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(agent.device)
 
-        # P117 fix (same as bid_inspector P116):
-        # 1. legal_mask from OpenSpiel state (not BridgeBiddingEnv obs)
-        # 2. actor selected by OpenSpiel-relative seat (player-dealer)%4, not real seat
-        from networks.policy_net import openspiel_raw_to_ours
-        os_legal = os_state.legal_actions()
-        legal_mask = np.zeros(38, dtype=np.float32)
-        for a in os_legal:
-            if a >= 52:
-                our_a = openspiel_raw_to_ours(a)
-                if 0 <= our_a < 38:
-                    legal_mask[our_a] = 1.0
-        legal = torch.tensor(legal_mask, dtype=torch.float32).unsqueeze(0).to(agent.device)
-
-        # OpenSpiel rolls hands so dealer→index0; actor must match relative seat
-        rel_seat = (player - dealer) % 4
-        actor = agent.get_actor(rel_seat)
+        actor = agent.get_actor(player)
         with torch.no_grad():
             action, _, _ = actor.get_action(flat_t, legal, deterministic=deterministic)
         return action.item()

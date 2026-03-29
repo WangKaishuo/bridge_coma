@@ -59,7 +59,7 @@ from env import (
     NORTH, EAST, SOUTH, WEST,
 )
 from networks.policy_net import (
-    MLPPolicyNetwork, OBS_DIM,
+    MLPPolicyNetwork, OBS_DIM, BELIEF_OBS_DIM,
     openspiel_raw_to_ours, ours_to_openspiel_raw,
     convert_hands_suit_to_rank, hands_to_openspiel_state,
     get_openspiel_obs, advance_openspiel_state,
@@ -122,17 +122,35 @@ def display_deal(hands: np.ndarray, dealer: int):
 # Load models
 # ==============================================================================
 
+def _detect_obs_dim(path: str) -> int:
+    """Detect obs_dim from checkpoint (571 or 667)."""
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    # RL agent format: stored obs_dim
+    if 'obs_dim' in ckpt:
+        return ckpt['obs_dim']
+    # P105 SL format: infer from first layer weight shape
+    if 'model_state' in ckpt:
+        w = ckpt['model_state'].get('net.0.weight')
+        if w is not None:
+            return w.shape[1]
+    return OBS_DIM  # fallback 571
+
+
 def load_agent(path: str, device: str) -> MAPPOAgent:
-    """Load RL agent checkpoint."""
-    agent = MAPPOAgent(MAPPOConfig(device=device, obs_dim=OBS_DIM))
+    """Load RL agent checkpoint, auto-detecting obs_dim."""
+    obs_dim = _detect_obs_dim(path)
+    agent = MAPPOAgent(MAPPOConfig(device=device, obs_dim=obs_dim))
     agent.load(path)
+    print(f"[load_agent] obs_dim={obs_dim}")
     return agent
 
 
 def load_sl(path: str, device: str) -> MAPPOAgent:
-    """Load SL checkpoint as MAPPOAgent."""
-    agent = MAPPOAgent(MAPPOConfig(device=device, obs_dim=OBS_DIM))
+    """Load SL checkpoint as MAPPOAgent, auto-detecting obs_dim."""
+    obs_dim = _detect_obs_dim(path)
+    agent = MAPPOAgent(MAPPOConfig(device=device, obs_dim=obs_dim))
     load_sl_into_mappo_agent(agent, path)
+    print(f"[load_sl] obs_dim={obs_dim}")
     return agent
 
 
@@ -242,21 +260,35 @@ def play_deal_sl_only(
     }
 
 
-def _make_play_mixed_policy(model, hands_sm, dealer, device):
+def _make_play_mixed_policy(model, hands_sm, dealer, device, belief_net=None,
+                            ablate_belief=False, vulnerability=None):
     """
     Build a (obs, player, history_int) -> action closure for play_mixed.
-    Uses OpenSpiel state for obs generation (same as RL inference).
 
-    IMPORTANT: play_mixed passes real seat numbers (0=N,1=E,2=S,3=W) as
-    `player`, but hands_to_openspiel_state always uses dealer=0 game with
-    hands rolled so opener→index 0. So the OpenSpiel-relative player index
-    is (real_player - dealer) % 4, which must be used to select the correct
-    actor (matching SL training, where dealer=0 always).
+    BCA mode: if belief_net is provided, appends 96-dim belief features to
+    the 571-dim OpenSpiel obs, producing 667-dim input for BCA actors.
+
+    ablate_belief: if True AND is_bca, replace real BeliefNet output with
+    prior (0.25 uniform) features. The actor still receives 667-dim input
+    but the belief columns carry no information. This isolates the effect
+    of belief *content* from the effect of Stage B training.
+
+    P122: vulnerability passed to hands_to_openspiel_state for vul-aware obs.
+    P122: use ABSOLUTE seat for BeliefNet target_pos.
+
+    P117 fixes:
+    - legal_mask from OpenSpiel state (not BridgeBiddingEnv obs)
+    - actor selected by (player-dealer)%4 relative seat
     """
+    from networks.policy_net import BELIEF_OBS_DIM, append_belief_features
     hands_rm = convert_hands_suit_to_rank(hands_sm)
+    is_bca = (belief_net is not None)
+    if vulnerability is None:
+        vulnerability = (False, False)
 
     def policy(obs, player, history_int):
-        os_state = hands_to_openspiel_state(hands_rm, dealer)
+        os_state = hands_to_openspiel_state(hands_rm, dealer,
+                                            vulnerability=vulnerability)
         for a in history_int:
             if os_state.is_terminal():
                 break
@@ -266,16 +298,41 @@ def _make_play_mixed_policy(model, hands_sm, dealer, device):
             os_a = ours_to_openspiel_raw(a)
             if os_a >= 0 and os_a in legal_os:
                 os_state.apply_action(os_a)
-        flat = get_openspiel_obs(os_state)
+
+        flat = get_openspiel_obs(os_state)  # (571,)
+
+        # BCA: append belief features via BeliefNet
+        if is_bca:
+            if ablate_belief:
+                # Ablation: use uniform prior (0.25) instead of real BeliefNet output
+                # Actor still receives 667-dim input, but belief columns are uninformative
+                bf = np.full(96, 0.25, dtype=np.float32)
+            else:
+                # P122: use ABSOLUTE seat for BeliefNet target_pos.
+                # BeliefNet was trained on SAYC data with dealer=0 where absolute=relative.
+                # RL training (_get_belief_features_single) uses absolute seats.
+                # bid_inspector must match to get consistent results with Stage 3.
+                partner = (player + 2) % 4
+                rho     = (player - 1) % 4
+                obs_t   = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    bf_partner = belief_net.get_probs(
+                        obs_t, torch.tensor([partner], dtype=torch.long, device=device))
+                    bf_rho     = belief_net.get_probs(
+                        obs_t, torch.tensor([rho],     dtype=torch.long, device=device))
+                bf = torch.cat([bf_partner, bf_rho], dim=-1).squeeze(0).cpu().numpy()
+            flat = append_belief_features(flat, bf)  # (667,)
+
         flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
-        # Use legal actions from OpenSpiel state (matches solo mode)
+
+        # Legal mask from OpenSpiel state
         legal_os = os_state.legal_actions()
         legal_mask = torch.zeros(1, NUM_BIDS, dtype=torch.float32, device=device)
         for os_a in legal_os:
             ours = openspiel_raw_to_ours(os_a)
             if ours >= 0:
                 legal_mask[0, ours] = 1.0
-        # Convert real seat → OpenSpiel-relative seat (dealer=0 convention)
+
         rel_player = (player - dealer) % 4
         actor = model.get_actor(rel_player)
         with torch.no_grad():
@@ -293,6 +350,7 @@ def play_deal(
     device,
     env,
     verbose=True,
+    ablate_belief_model2=False,
 ):
     """
     真正的双桌对战:
@@ -301,11 +359,22 @@ def play_deal(
       IMP = score_to_imp(score_1 - score_2)  (Agent 视角)
 
     和 cross_evaluate / evaluate_head_to_head 语义完全一致。
-    """
-    vul = (False, False)
 
-    agent_policy = _make_play_mixed_policy(agent, hands_sm, dealer, device)
-    sl_policy    = _make_play_mixed_policy(sl,    hands_sm, dealer, device)
+    ablate_belief_model2: if True, SL's belief features are replaced with prior.
+    P122: vulnerability randomized per deal.
+    """
+    # P122: randomize vulnerability
+    _vul_choices = [(False, False), (True, False),
+                    (False, True),  (True, True)]
+    vul = _vul_choices[np.random.randint(4)]
+
+    agent_policy = _make_play_mixed_policy(agent, hands_sm, dealer, device,
+                                           belief_net=getattr(agent, '_belief_net', None),
+                                           vulnerability=vul)
+    sl_policy    = _make_play_mixed_policy(sl,    hands_sm, dealer, device,
+                                           belief_net=getattr(sl,    '_belief_net', None),
+                                           ablate_belief=ablate_belief_model2,
+                                           vulnerability=vul)
 
     # 桌1: Agent NS vs SL EW
     contract_1, score_1, hist_1 = env.play_mixed(
@@ -321,10 +390,12 @@ def play_deal(
 
     imp = float(score_to_imp(score_1 - score_2))
 
+    opener_str     = f"{PLAYER_SHORT[dealer]}{PLAYER_SHORT[(dealer+2)%4]}"
+    overcaller_str = f"{PLAYER_SHORT[(dealer+1)%4]}{PLAYER_SHORT[(dealer+3)%4]}"
     results = {
-        'table1': {'label': 'Agent(NS) vs SL(EW)',
+        'table1': {'label': f'Agent({opener_str}) vs SL({overcaller_str})',
                    'contract': contract_1, 'score': score_1, 'history': hist_1},
-        'table2': {'label': 'SL(NS) vs Agent(EW)',
+        'table2': {'label': f'SL({opener_str}) vs Agent({overcaller_str})',
                    'contract': contract_2, 'score': score_2, 'history': hist_2},
         'imp': imp,
         'vul': vul,
@@ -344,6 +415,7 @@ def play_deal_ab(
     device,
     env,
     verbose=True,
+    ablate_belief_model2=False,
 ):
     """
     Agent A vs Agent B 双桌对战:
@@ -353,11 +425,22 @@ def play_deal_ab(
       IMP_B = -IMP_A                             (B 视角)
 
     与 evaluate_head_to_head 语义完全一致。
-    """
-    vul = (False, False)
 
-    policy_a = _make_play_mixed_policy(agent_a, hands_sm, dealer, device)
-    policy_b = _make_play_mixed_policy(agent_b, hands_sm, dealer, device)
+    ablate_belief_model2: if True, agent_b's belief features are replaced with prior.
+    P122: vulnerability randomized per deal, matching cross_evaluate.
+    """
+    # P122: randomize vulnerability
+    _vul_choices = [(False, False), (True, False),
+                    (False, True),  (True, True)]
+    vul = _vul_choices[np.random.randint(4)]
+
+    policy_a = _make_play_mixed_policy(agent_a, hands_sm, dealer, device,
+                                       belief_net=getattr(agent_a, '_belief_net', None),
+                                       vulnerability=vul)
+    policy_b = _make_play_mixed_policy(agent_b, hands_sm, dealer, device,
+                                       belief_net=getattr(agent_b, '_belief_net', None),
+                                       ablate_belief=ablate_belief_model2,
+                                       vulnerability=vul)
 
     # 桌1: A=NS, B=EW
     contract_1, score_1, hist_1 = env.play_mixed(
@@ -373,10 +456,13 @@ def play_deal_ab(
 
     imp_a = float(score_to_imp(score_1 - score_2))
 
+    # Label reflects actual opener/overcaller seats (dealer-dependent)
+    opener_str     = f"{PLAYER_SHORT[dealer]}{PLAYER_SHORT[(dealer+2)%4]}"
+    overcaller_str = f"{PLAYER_SHORT[(dealer+1)%4]}{PLAYER_SHORT[(dealer+3)%4]}"
     results = {
-        'table1': {'label': 'A(NS) vs B(EW)',
+        'table1': {'label': f'A({opener_str}) vs B({overcaller_str})',
                    'contract': contract_1, 'score': score_1, 'history': hist_1},
-        'table2': {'label': 'B(NS) vs A(EW)',
+        'table2': {'label': f'B({opener_str}) vs A({overcaller_str})',
                    'contract': contract_2, 'score': score_2, 'history': hist_2},
         'imp_a': imp_a,
         'vul': vul,
@@ -566,6 +652,14 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--quiet', action='store_true',
                         help='只打印最终汇总，不打印每局细节')
+    parser.add_argument('--belief_checkpoint', default=None,
+                        help='BeliefNet checkpoint (sl_base_bca.pt) for BCA models (667-dim). '
+                             'Applied to all loaded models.')
+    parser.add_argument('--ablate_belief', action='store_true',
+                        help='Ablation: replace model2\'s BeliefNet output with uniform prior '
+                             '(0.25). Model2 still uses 667-dim input but belief columns carry '
+                             'no information. Isolates belief content effect from Stage B '
+                             'training effect.')
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
@@ -581,9 +675,70 @@ def main():
         mode_str = (f"{args.type1.upper()}1 vs {args.type2.upper()}2 "
                     f"(双桌对战, model1视角)")
 
+    # ── Load BeliefNet for each model ──────────────────────────────────────
+    # Priority per model:
+    #   1. belief_net embedded in the model's own checkpoint (co-evolved)
+    #   2. --belief_checkpoint (standalone BeliefNet, e.g. sl_base_bca.pt)
+    #   3. None (571-dim model, no belief features)
+    from networks.belief_net import BeliefNetwork
+
+    # Load standalone fallback if provided
+    _fallback_bn_sd = None
+    _fallback_bn_hidden = None
+    if args.belief_checkpoint:
+        _fb_ckpt = torch.load(args.belief_checkpoint, map_location=device, weights_only=False)
+        _fallback_bn_sd = _fb_ckpt.get('belief_net', _fb_ckpt)
+        _fallback_bn_hidden = _fb_ckpt.get('belief_hidden_dim',
+                                            next(iter(_fallback_bn_sd.values())).shape[0])
+
+    def _attach_belief(model, model_path, model_label):
+        """Attach BeliefNet to a model if it's 667-dim."""
+        _obs_dim = getattr(getattr(model, 'config', None), 'obs_dim', OBS_DIM)
+        if _obs_dim != BELIEF_OBS_DIM:
+            model._belief_net = None
+            return
+
+        # Try loading from model's own checkpoint first
+        _ckpt = torch.load(model_path, map_location=device, weights_only=False)
+        if 'belief_net' in _ckpt:
+            _bn_sd = _ckpt['belief_net']
+            _bn_hidden = _ckpt.get('belief_hidden_dim',
+                                    next(iter(_bn_sd.values())).shape[0])
+            _bn = BeliefNetwork(hidden_dim=_bn_hidden).to(device)
+            _bn.load_state_dict({k: v.to(device) for k, v in _bn_sd.items()})
+            _bn.eval()
+            model._belief_net = _bn
+            print(f"[Bid Inspector] {model_label}: BeliefNet from checkpoint "
+                  f"(co-evolved, hidden={_bn_hidden})")
+            return
+
+        # Fallback to --belief_checkpoint
+        if _fallback_bn_sd is not None:
+            _bn = BeliefNetwork(hidden_dim=_fallback_bn_hidden).to(device)
+            _bn.load_state_dict({k: v.to(device) for k, v in _fallback_bn_sd.items()})
+            _bn.eval()
+            model._belief_net = _bn
+            print(f"[Bid Inspector] {model_label}: BeliefNet from --belief_checkpoint "
+                  f"(fallback, hidden={_fallback_bn_hidden})")
+            return
+
+        # No BeliefNet available for a 667-dim model — this is an error
+        print(f"[Bid Inspector] ⚠️  WARNING: {model_label} is 667-dim but no BeliefNet "
+              f"found in checkpoint or --belief_checkpoint. Using prior features.")
+        model._belief_net = None
+
+    _attach_belief(model1, args.model1, "model1")
+    if not vs_self:
+        _attach_belief(model2, args.model2, "model2")
+    else:
+        model2._belief_net = model1._belief_net
+
     print(f"[Bid Inspector] Loading deals: {args.data}")
     env = CompetitiveSubgameEnv(args.data)
-    print(f"[Bid Inspector] Mode: {mode_str}\n")
+    print(f"[Bid Inspector] Mode: {mode_str}")
+    if args.ablate_belief:
+        print(f"[Bid Inspector] ⚠️  ABLATION MODE: model2's belief features replaced with prior (0.25)")
+    print()
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -618,7 +773,8 @@ def main():
         else:
             result = play_deal_ab(hands, dd_table, dealer,
                                   model1, model2, device, env,
-                                  verbose=not args.quiet)
+                                  verbose=not args.quiet,
+                                  ablate_belief_model2=args.ablate_belief)
             imps.append(result['imp_a'])
 
     # ── Summary ──────────────────────────────────────────────────────────────
@@ -635,6 +791,8 @@ def main():
     else:
         label1 = f"{args.type1.upper()}1"
         label2 = f"{args.type2.upper()}2"
+        if args.ablate_belief:
+            label2 += "(ablated)"
         print(f"  {label1} vs {label2} CROSS-TABLE SUMMARY ({args.num_deals} deals)")
         print(f"{'█' * 65}")
         if imps:

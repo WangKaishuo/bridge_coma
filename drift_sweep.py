@@ -79,8 +79,11 @@ def run_single(mode: str, lam: float, seed: int, args) -> dict:
     
     if mode == "571":
         cmd.append("--no_belief_conditioned")
-    # else: 667-dim BCA is the default
-    
+    else:
+        # 667-dim BCA: pass standalone BeliefNet checkpoint if provided
+        if getattr(args, "belief_checkpoint", None):
+            cmd += ["--belief_checkpoint", args.belief_checkpoint]
+
     if args.quick:
         cmd.append("--quick")
     
@@ -144,6 +147,9 @@ def main():
     parser.add_argument("--eval_deals", type=int, default=3000)
     parser.add_argument("--out_dir", default=None,
                         help="Output directory (default: results/drift_sweep_{mode})")
+    parser.add_argument("--belief_checkpoint", default=None,
+                        help="Standalone BeliefNet checkpoint (Stage A output). "
+                             "Only used in --mode 667. Passed to subgame_validation.")
     parser.add_argument("--quick", action="store_true",
                         help="Quick mode for debugging")
     parser.add_argument("--verbose", action="store_true",
