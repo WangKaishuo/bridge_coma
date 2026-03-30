@@ -652,7 +652,17 @@ def cross_evaluate(
             ns_policy=agent_b_ns_policy,
             ew_policy=agent_a_ew_policy,
             vulnerability=vul, dealer=dealer)
-        imps.append(float(score_to_imp(score_1 - score_2)))
+
+        # P123: score_1/score_2 are NS-perspective (physical seats).
+        # ns_policy controls opener_seats = {dealer, dealer+2}.
+        # When dealer ∈ {N,S}: opener = NS physical seats → score_1 reflects A's opener play directly.
+        # When dealer ∈ {E,W}: opener = EW physical seats → ns_policy controls EW,
+        #   so A playing well → EW wins → NS score LOW → score_1 < 0.
+        #   Must flip sign so IMP > 0 means "A is better".
+        if dealer % 2 == 1:  # dealer is E or W
+            imps.append(float(score_to_imp(score_2 - score_1)))
+        else:
+            imps.append(float(score_to_imp(score_1 - score_2)))
 
     arr = np.array(imps)
     try:

@@ -150,7 +150,7 @@ class SubgameConfig:
     # ── 早停（基于 value_loss 平稳性）──────────────────────────────────────
     early_stop_patience:   int   = 8
     early_stop_vl_delta:   float = 0.15
-    early_stop_enabled:    bool  = True
+    early_stop_enabled:    bool  = False   # P123: disabled — fixed schedule for reproducibility
 
 
 # ==============================================================================

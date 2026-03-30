@@ -553,7 +553,7 @@ def run_competitive(args):
         sl_trainer.belief_net.load_state_dict(
             {k: v.to(device) for k, v in _stageb_belief_sd.items()})
         print(f"  [SL Eval] BeliefNet loaded from Stage B checkpoint")
-    elif _sl_bc and sl_trainer.belief_net is not None and not _sl_bn_from_ckpt:
+    elif _bc and sl_trainer.belief_net is not None and not _sl_bn_from_ckpt:
         print(f"\n  [SL Eval] Pretraining SL baseline belief net "
               f"({belief_pretrain_rounds * deals} deals)...")
         sl_trainer.pretrain_belief(
@@ -563,7 +563,7 @@ def run_competitive(args):
             max_epochs=getattr(args, 'belief_pretrain_max_epochs', 300),
         )
         print(f"  [SL Eval] Belief-conditioned SL baseline ({_sl_obs_dim}-dim)")
-    elif _sl_bn_from_ckpt and _sl_bc and sl_trainer.belief_net is not None:
+    elif _sl_bn_from_ckpt and _bc and sl_trainer.belief_net is not None:
         _bn_ckpt2 = torch.load(_belief_ckpt_path, map_location=device, weights_only=False)
         _bn_sd2   = _bn_ckpt2.get('belief_net', _bn_ckpt2)
         sl_trainer.belief_net.load_state_dict(
@@ -935,7 +935,11 @@ def _cross_eval_fixed_deals(env, deals, pol_a, pol_b):
             hands, dd_table,
             ns_policy=pol_b, ew_policy=pol_a,
             vulnerability=vul, dealer=dealer)
-        imps.append(float(score_to_imp(score_1 - score_2)))
+        # P123: flip sign when dealer is EW (see cross_evaluate comment)
+        if dealer % 2 == 1:
+            imps.append(float(score_to_imp(score_2 - score_1)))
+        else:
+            imps.append(float(score_to_imp(score_1 - score_2)))
     return np.array(imps)
 
 
@@ -1093,8 +1097,8 @@ def parse_args():
                         'BCA is always on unless --no_belief_conditioned is set.')
     parser.add_argument('--kl_lambda', type=float, default=None,
                         help='KL anchor strength. Default: 0.3→0.0 anneal if --belief_conditioned, 0.3 fixed otherwise')
-    parser.add_argument('--entropy_coef', type=float, default=0.01,
-                        help='Entropy coefficient for PPO (P98b: 0.01, was 1e-3 in P97d)')
+    parser.add_argument('--entropy_coef', type=float, default=0.001,
+                        help='Entropy coefficient for PPO')
     parser.add_argument('--eval_deals', type=int, default=5000,
                         help='Number of deals for Stage 3 evaluation (default 5000)')
     parser.add_argument('--skip_training', action='store_true',

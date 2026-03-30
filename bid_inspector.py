@@ -388,7 +388,12 @@ def play_deal(
         ns_policy=sl_policy, ew_policy=agent_policy,
         vulnerability=vul, dealer=dealer)
 
-    imp = float(score_to_imp(score_1 - score_2))
+    # P123: flip sign when dealer is EW (ns_policy controls opener=EW physical seats,
+    # but score is NS-perspective, so A playing well → NS score low → need sign flip)
+    if dealer % 2 == 1:
+        imp = float(score_to_imp(score_2 - score_1))
+    else:
+        imp = float(score_to_imp(score_1 - score_2))
 
     opener_str     = f"{PLAYER_SHORT[dealer]}{PLAYER_SHORT[(dealer+2)%4]}"
     overcaller_str = f"{PLAYER_SHORT[(dealer+1)%4]}{PLAYER_SHORT[(dealer+3)%4]}"
@@ -454,7 +459,11 @@ def play_deal_ab(
         ns_policy=policy_b, ew_policy=policy_a,
         vulnerability=vul, dealer=dealer)
 
-    imp_a = float(score_to_imp(score_1 - score_2))
+    # P123: flip sign when dealer is EW (see cross_evaluate comment)
+    if dealer % 2 == 1:
+        imp_a = float(score_to_imp(score_2 - score_1))
+    else:
+        imp_a = float(score_to_imp(score_1 - score_2))
 
     # Label reflects actual opener/overcaller seats (dealer-dependent)
     opener_str     = f"{PLAYER_SHORT[dealer]}{PLAYER_SHORT[(dealer+2)%4]}"

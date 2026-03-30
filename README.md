@@ -49,6 +49,11 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 34. **P122 invalidates ALL prior RL experiments.** Vul randomization changes the training distribution fundamentally. Agent must learn when to be aggressive (non-vul) vs conservative (vul). Prior agents trained only on non-vul developed unconstrained aggressive strategies.
 35. **`competitive_500k.npz` does NOT need regeneration.** Vul is assigned dynamically at rollout time, not baked into deal data.
 36. **SL checkpoints do NOT need retraining.** SAYC expert data was generated under None-vul. SL learns SAYC convention; RL learns vul-dependent adjustments on top.
+37. **P123 (CRITICAL): Eval IMP sign bug — 50% of deals had inverted score.** `cross_evaluate`, `_cross_eval_fixed_deals`, and `bid_inspector` all compute `IMP = score_to_imp(score_1 - score_2)`. `play_mixed`'s `ns_policy` controls **opener seats** (not physical NS), but `_compute_score_ns` returns **physical NS perspective**. When dealer ∈ {E,W}, opener = physical EW, so A playing well → NS score low → `score_1 - score_2 < 0` → wrong sign. Fix: flip to `score_2 - score_1` when `dealer % 2 == 1`. **Training code is unaffected** (uses single-table DDS regret, not `play_mixed` dual-table). All pre-P123 eval results have attenuated IMP (≈50% sign-inverted deals pull mean toward 0).
+38. **P123 is the third most severe bug.** It did not corrupt training, but made all eval results unreliable. The "vul training hurts" finding (≈0 IMP vs SL) was entirely an artifact — with fixed eval, vul-trained agent achieves +3.3 IMP, comparable to no-vul agent (+3.0 IMP).
+39. **`entropy_coef` default is 0.001.** Was accidentally set to 0.01 in a previous upload. 0.01 causes asymmetric entropy collapse across players. Always verify `entropy_coef=0.001` in the header log.
+40. **Early stop is disabled by default.** `early_stop_enabled=False` in SubgameConfig. PopArt value normalization compresses VL to ~0.5-0.9, which falsely triggers the plateau detector (threshold 0.15 was calibrated for raw VL ~20-40). Fixed schedules preferred for reproducibility.
+41. **PopArt value normalization: tested but not required.** MAPPO paper recommends it, and it does equalize VL across players with vul. However, post-P123 eval fix shows agents train correctly without it. Available in `utils/value_norm.py` if needed for future experiments with higher reward variance.
 
 ---
 
@@ -68,8 +73,10 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 | Train `sl_base_bca.pt` (BeliefNet Stage A) | ✅ Done |
 | Train `sl_base_bca_stageB.pt` (Stage B, 667-dim) | ✅ Done |
 | P122: Vul randomization + BeliefNet save + target_pos fix | ✅ |
-| **571-dim RL training (with vul)** | ⏳ Pending (retrain needed) |
-| **667-dim BCA RL training (with vul)** | ⏳ Pending (retrain needed) |
+| P123: Eval IMP sign fix + entropy_coef fix + early_stop off | ✅ |
+| **571-dim RL baseline (with vul, λ=0.0, 1 seed)** | ✅ +3.3 IMP vs SL (seed=100) |
+| **571-dim RL multi-seed (5 seeds)** | ⏳ Pending |
+| **667-dim BCA RL training (with vul)** | ⏳ Pending |
 | **BCA ablation experiment** | ⏳ Pending |
 | **BCA core experiment (Agent A vs Agent B, r_info)** | ⏳ Pending |
 
@@ -77,9 +84,16 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 
 ## Valid Experimental Results
 
-**All pre-P122 results are invalid** due to: (a) no vulnerability randomization, (b) bid_inspector BeliefNet target_pos bug, (c) co-evolved BeliefNet not saved.
+**All pre-P123 eval results are unreliable** due to IMP sign inversion on 50% of deals (dealer ∈ {E,W}).
 
-No valid results yet. Awaiting first post-P122 training run.
+### Post-P123 Results (571-dim baseline, seed=100, λ=0.0, 20 rounds, eval=5000 deals)
+
+| Agent | Training vul | Eval vul | vs SL IMP | Win rate |
+|---|---|---|---|---|
+| RL (no vul training) | None-vul only | Random | +2.97 ± 11.6 | 57.0% |
+| RL (with vul training) | Random | Random | +3.31 ± 11.4 | 56.9% |
+
+**Key finding:** Vul randomization during training does NOT hurt — slight improvement (+3.3 vs +3.0). The apparent "vul kills training" finding was entirely the P123 eval bug.
 
 ---
 
@@ -253,6 +267,9 @@ python bid_inspector.py \
 - **FSP with SL as permanent anchor is the correct training setup.** Self-play causes near-zero gradient signal.
 - **P117 was the most severe bug before P122.** Dealer rotation caused 50% of rewards to have wrong sign.
 - **P122 is the second most severe set of fixes.** Three independent bugs (vul, target_pos, BeliefNet save) all affected 667-dim experiments. Plus vul randomization fundamentally changes the training distribution.
+- **P123 eval sign bug: `play_mixed` ns_policy ≠ physical NS.** `ns_policy` controls opener seats, but `_compute_score_ns` returns physical NS perspective. When dealer is EW, the IMP sign inverts. This bug only affected eval, not training. Symptom: all agents appeared to tie with SL (~0 IMP) despite regret improving during training.
+- **Eval bugs can masquerade as training failures.** P123 wasted multiple sessions investigating training-side fixes (PopArt, entropy tuning, batch size) when the actual problem was a sign error in the evaluation function. Always verify the eval pipeline independently before diagnosing training issues.
+- **PopArt value normalization equalizes VL across players but is not necessary for correct training.** Tested and confirmed: agents train correctly without it. Available as `utils/value_norm.py` for future use if needed.
 
 ---
 
@@ -281,5 +298,5 @@ for i in range(13):
 
 ---
 
-*README version: P122*
-*Last updated: 2026-03-29*
+*README version: P123*
+*Last updated: 2026-03-30*
