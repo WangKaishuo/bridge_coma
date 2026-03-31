@@ -553,10 +553,10 @@ class SubgameTrainer:
 
         half = num_deals // 2
         print(f"[Critic Warmup] Collecting {num_deals} deals (NS:{half} + EW:{half}, batch={self.config.deals_per_step})...")
-        ns_eps = self._collect_episodes_batch(half, train_side='NS', fsp_sd=None,
+        ns_eps, _ = self._collect_episodes_batch(half, train_side='NS', fsp_sd=None,
                                                batch_size=self.config.deals_per_step,
                                                skip_dual_table=True)
-        ew_eps = self._collect_episodes_batch(half, train_side='EW', fsp_sd=None,
+        ew_eps, _ = self._collect_episodes_batch(half, train_side='EW', fsp_sd=None,
                                                batch_size=self.config.deals_per_step,
                                                skip_dual_table=True)
         self._store_episodes(ns_eps)
@@ -849,7 +849,7 @@ class SubgameTrainer:
         print(f"\n[Belief Pretrain] Collecting {total_deals} deals (1 pass)...")
 
         # ── 1. 一次性收集全量数据 ─────────────────────────────────────────────
-        all_episodes = self._collect_episodes_batch(
+        all_episodes, _ = self._collect_episodes_batch(
             total_deals, train_side='NS',
             fsp_sd=None, batch_size=self.config.deals_per_step,
             skip_dual_table=True, use_belief_prior=True)
@@ -1125,6 +1125,9 @@ class SubgameTrainer:
         self._obs_cache.clear()
         self._obs_state_cache.clear()
 
+        import time as _t2
+        _dbg = {'encode': 0.0, 'belief': 0.0, 'forward': 0.0, 'step_exec': 0.0, 'n_ts': 0}
+
         # ── 初始化 batch_size 个独立环境 ────────────────────────────────
         envs = [CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
                 for _ in range(batch_size)]
@@ -1144,7 +1147,6 @@ class SubgameTrainer:
         slot_dealer = [NORTH] * batch_size   # per-slot dealer (set on reset)
         slot_ep     = [[]   for _ in range(batch_size)]
         slot_done   = [True] * batch_size
-
         all_episodes: List[List[dict]] = []
         _pending_rewards: List[Tuple]   = []   # P76: single-table DDS IMP reward queue
         collected = 0
@@ -1168,6 +1170,7 @@ class SubgameTrainer:
             active = [i for i in range(batch_size) if not slot_done[i]]
             if not active:
                 break
+            _dbg['n_ts'] += 1
 
             # 按 actor 分组
             from collections import defaultdict
@@ -1210,19 +1213,22 @@ class SubgameTrainer:
                     critic = getattr(self.agent.model,
                                      role.replace('actor','critic'))
 
-                # Step 1: 批量构造 571-dim base obs（无 BeliefNet，O(N) 纯 numpy）
+                # Step 1: 批量构造 571-dim base obs
+                _t2a = _t2.time()
                 obs571_batch = np.stack([
                     self._encode_for_actor(
                         slot_obs[i], slot_dealer[i], slot_hist[i],
                         envs[i].current_player,
                         all_hands=envs[i]._current_hands,
                         use_prior=True,
-                        vulnerability=envs[i]._vulnerability)[:OBS_DIM]   # always prior here; BCA appended below
+                        vulnerability=envs[i]._vulnerability)[:OBS_DIM]
                     for i in slots])
+                _dbg['encode'] += _t2.time() - _t2a
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
 
                 # Step 2: 一次批量 BeliefNet forward（BCA 模式且非 prior）
+                _t2b = _t2.time()
                 if self.config.belief_conditioned and not use_belief_prior:
                     players_batch = [envs[i].current_player for i in slots]
                     bf_batch = self._get_belief_features_batch(
@@ -1235,14 +1241,17 @@ class SubgameTrainer:
                          np.tile(prior, (len(slots), 1))], axis=1)   # (B, 667)
                 else:
                     flat_batch = obs571_batch  # (B, 571)
+                _dbg['belief'] += _t2.time() - _t2b
 
                 flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
                 legal_t = torch.tensor(legal_batch, dtype=torch.float32).to(self.device)
                 ah_t    = torch.tensor(ah_batch,    dtype=torch.float32).to(self.device)
 
+                _t2c = _t2.time()
                 with torch.no_grad():
                     actions, log_probs, _ = actor.get_action(flat_t, legal_t)
                     values = critic(flat_t, ah_t)
+                _dbg['forward'] += _t2.time() - _t2c
 
                 for j, i in enumerate(slots):
                     actions_map[i] = (actions[j].item(), log_probs[j].cpu(),
@@ -1253,11 +1262,10 @@ class SubgameTrainer:
             for i in active:
                 action, log_prob, value, flat_obs, legal_actions, is_train = actions_map[i]
                 player    = envs[i].current_player
-                # Defer copy to avoid repeated allocation; use view when possible
                 all_hands = envs[i]._current_hands
 
-                opener_seats_i = {slot_dealer[i], (slot_dealer[i] + 2) % 4}
-                # obs_571: pure OpenSpiel obs (first OBS_DIM dims, strips belief features if BCA)
+                _dealer_i      = slot_dealer[i]
+                opener_seats_i = {_dealer_i, (_dealer_i + 2) % 4}
                 obs_571 = flat_obs[:OBS_DIM]
                 step = {
                     'flat_obs': flat_obs, 'legal_actions': legal_actions,
@@ -1266,18 +1274,19 @@ class SubgameTrainer:
                     'all_hands': all_hands.copy(), 'player': player,
                     'is_training_side': is_train,
                     'is_opener': player in opener_seats_i,
-                    'obs_571': obs_571,  # for BeliefNet training (new API)
+                    'obs_571': obs_571,
+                    'dealer': _dealer_i,
+                    'vulnerability': envs[i]._vulnerability,
                 }
 
-                # Belief 数据记录：只在需要时计算（避免无效开销）
-                # 需要 belief data 的条件：BeliefNet 存在且（训练中 or r_info 计算）
-                _dealer_i      = slot_dealer[i]
-                opener_seats_i = {_dealer_i, (_dealer_i + 2) % 4}
                 _need_belief = (self.belief_net is not None and
                                 (self.config.use_info_bonus or
                                  not self.config.freeze_belief))
+                _is_opener_step = player in opener_seats_i
+                _is_ew_diag     = not _is_opener_step  # EW diagnostic for belief update
+
                 if _need_belief:
-                    if player in opener_seats_i:
+                    if _is_opener_step:
                         partner = (player + 2) % 4
                         step.update({
                             'target_pos':    partner,
@@ -1293,30 +1302,29 @@ class SubgameTrainer:
                         })
 
                 slot_hist[i].append(action)
-                if _need_belief:
-                    if player in opener_seats_i or step.get('ew_diagnostic'):
-                        step['history_int_after'] = slot_hist[i][:]
-                        # obs_571_after only needed for r_info (Agent B)
-                        # Skip for Agent A to avoid expensive OpenSpiel rebuild
-                        if self.config.use_info_bonus:
-                            obs_after = self._encode_for_actor(
-                                None, slot_dealer[i], slot_hist[i], player,
-                                all_hands=all_hands,
-                                vulnerability=envs[i]._vulnerability)
-                            step['obs_571_after'] = obs_after[:OBS_DIM]
-                        else:
-                            step['obs_571_after'] = None
+
+                if _need_belief and (_is_opener_step or _is_ew_diag):
+                    step['history_int_after'] = slot_hist[i][:]
+
+                # P_OPT: obs_571_after filled by post-rollout shift (no encode here).
+                if self.config.use_info_bonus and _is_opener_step:
+                    step['_rinfo'] = True
+                    # Pre-compute opp_belief_target here (costs one call now,
+                    # saves 131k repeated calls in the post-rollout pass).
+                    step['opp_belief_target'] = hand_to_belief_target(
+                        all_hands[(player + 1) % 4])
 
                 # env.step() gives oracle reward; we overwrite with dual-table IMP after batch
+                _t2d = _t2.time()
                 obs_next, reward, done, info = envs[i].step(action)
-                step['reward'] = reward   # placeholder, overwritten if not skip_dual_table
+                _dbg['step_exec'] += _t2.time() - _t2d
+                step['reward'] = reward
                 step['done']   = done
                 slot_ep[i].append(step)
                 slot_obs[i] = obs_next
 
                 if done:
                     all_episodes.append(slot_ep[i])
-                    # P76: 单桌DDS IMP reward，不再做换桌rollout
                     if not skip_dual_table:
                         _pending_rewards.append((
                             len(all_episodes) - 1,
@@ -1329,6 +1337,14 @@ class SubgameTrainer:
                     slot_done[i] = True
                     if collected < num_deals:
                         slot_obs[i] = _reset(i)
+
+        _tot = sum(v for k,v in _dbg.items() if k != 'n_ts')
+        print(f"  [DBG rollout] timesteps={_dbg['n_ts']}  "
+              f"encode={_dbg['encode']:.1f}s  "
+              f"belief_fwd={_dbg['belief']:.1f}s  "
+              f"actor_fwd={_dbg['forward']:.1f}s  "
+              f"env_step={_dbg['step_exec']:.1f}s  "
+              f"other={max(0,_tot - _dbg['encode'] - _dbg['belief'] - _dbg['forward'] - _dbg['step_exec']):.1f}s")
 
         # ── P82: 每个player的最后一步都标记done=True并赋对应reward ────────
         # 旧逻辑只给env.step()返回done=True的那个step（最后行动者）赋reward，
@@ -1354,9 +1370,73 @@ class SubgameTrainer:
                     s['done']   = True
                     s['reward'] = imp_ns if player in opener_seats else imp_ew
 
-        return all_episodes[:num_deals]
+        # Post-rollout: build rinfo_data via shift trick.
+        # obs_571_after[t] = obs_571[t+1] for same player (zero extra encode calls).
+        # Terminal steps: use obs_571 itself as proxy (bidding over, obs unchanged).
+        # opp_belief_target pre-stored in step dict (computed once during rollout).
+        result_eps = all_episodes[:num_deals]
+        if self.config.use_info_bonus:
+            # Count _rinfo steps to pre-allocate (avoids np.stack on list-of-arrays)
+            n_rinfo = sum(1 for ep in result_eps
+                          for step in ep if step.get('_rinfo'))
+            if n_rinfo > 0:
+                obs_b_arr   = np.empty((n_rinfo, OBS_DIM),    dtype=np.float32)
+                obs_a_arr   = np.empty((n_rinfo, OBS_DIM),    dtype=np.float32)
+                tgt_arr     = np.empty((n_rinfo, BELIEF_DIM), dtype=np.float32)
+                opp_tgt_arr = np.empty((n_rinfo, BELIEF_DIM), dtype=np.float32)
+                pp_arr      = np.empty(n_rinfo,               dtype=np.int64)
+                oo_arr      = np.empty(n_rinfo,               dtype=np.int64)
+                ep_step_list: List[Tuple] = []
+                ptr = 0
+
+                for ep_idx, ep in enumerate(result_eps):
+                    # per-player pending: player -> (s_idx, step)
+                    player_pending: dict = {}
+                    for s_idx, step in enumerate(ep):
+                        p = step['player']
+                        if p in player_pending:
+                            prev_s_idx, prev_step = player_pending[p]
+                            if prev_step.get('_rinfo'):
+                                obs_b_arr[ptr]   = prev_step['obs_571']
+                                obs_a_arr[ptr]   = step['obs_571']  # shift
+                                tgt_arr[ptr]     = prev_step['belief_target']
+                                opp_tgt_arr[ptr] = prev_step['opp_belief_target']
+                                pp_arr[ptr]      = (prev_step['player'] + 2) % 4
+                                oo_arr[ptr]      = (prev_step['player'] + 1) % 4
+                                ep_step_list.append((ep_idx, prev_s_idx))
+                                ptr += 1
+                        player_pending[p] = (s_idx, step)
+
+                    # Terminal steps: obs_after = obs_before (bidding ended, obs static)
+                    for p, (s_idx, step) in player_pending.items():
+                        if step.get('_rinfo'):
+                            obs_b_arr[ptr]   = step['obs_571']
+                            obs_a_arr[ptr]   = step['obs_571']  # proxy: obs unchanged post-bid
+                            tgt_arr[ptr]     = step['belief_target']
+                            opp_tgt_arr[ptr] = step['opp_belief_target']
+                            pp_arr[ptr]      = (step['player'] + 2) % 4
+                            oo_arr[ptr]      = (step['player'] + 1) % 4
+                            ep_step_list.append((ep_idx, s_idx))
+                            ptr += 1
+
+                _rinfo_data = {
+                    'obs_b':   obs_b_arr[:ptr],
+                    'obs_a':   obs_a_arr[:ptr],
+                    'tgt':     tgt_arr[:ptr],
+                    'opp_tgt': opp_tgt_arr[:ptr],
+                    'pp':      pp_arr[:ptr],
+                    'oo':      oo_arr[:ptr],
+                    'ep_step': ep_step_list,
+                }
+            else:
+                _rinfo_data = None
+        else:
+            _rinfo_data = None
+
+        return result_eps, _rinfo_data
 
     def _collect_episodes(
+
         self,
         num_deals:         int,
         use_fsp_opponent:  bool = True,
@@ -1707,42 +1787,58 @@ class SubgameTrainer:
     # r_info 计算
     # ======================================================================
 
-    def _compute_info_bonus(self, episodes: List[List[dict]]) -> List[List[float]]:
+    def _compute_info_bonus(self, episodes: List[List[dict]],
+                             rinfo_data: Optional[dict] = None) -> List[List[float]]:
         """
         为每个 episode 的每个 step 计算 r_info，并归一化到 IMP 量纲。
 
-        r_info_raw = I(bid; hand | partner) - β × I(bid; hand | opponent)
-                   ≈ CE_reduction(belief_before, target) - CE_reduction(belief_after, target)
+        P_OPT: When rinfo_data is provided (pre-built by _collect_episodes_batch),
+        skip the expensive np.stack pass over all valid_steps dicts.  The arrays
+        obs_b / obs_a / tgt / opp_tgt / pp / oo are already contiguous numpy
+        arrays, saving ~1-2 sec of pure Python list iteration + memory copies.
 
-        P87b: 保留动态归一化（imp_std/rinfo_std 自动对齐量纲），
-        w 的语义 = r_info 占 IMP 方差的比例。
-        从 w=0.02（step_ir≈0.09，PPO 无法利用）提升到 w=0.2（step_ir≈1.4）。
+        P_OPT2 (BeliefNet forward): merge partner + opponent queries into a single
+        2x-batch forward call instead of 4 separate forward calls per chunk,
+        halving BeliefNet inference time.
         """
         if self.dual_info is None:
             return [[0.0] * len(ep) for ep in episodes]
 
-        # P75 Fix A: 全批量化——从O(N×4次单样本forward)降到O(4次批量forward)
-        valid_steps: List[dict] = []
-        ep_step_idx: List[tuple] = []
-        for ep_idx, ep in enumerate(episodes):
-            for s_idx, step in enumerate(ep):
-                if 'belief_target' in step and not step.get('ew_diagnostic'):
-                    valid_steps.append(step)
-                    ep_step_idx.append((ep_idx, s_idx))
-
         raw_ep_bonuses: List[List[float]] = [[0.0] * len(ep) for ep in episodes]
-        if not valid_steps:
-            return raw_ep_bonuses
 
-        n = len(valid_steps)
-        # New BeliefNet API: get_probs(obs_571, target_pos)
-        # obs_571 / obs_571_after stored in step dict by _collect_episodes_batch
-        obs_b_arr   = np.stack([s['obs_571']       for s in valid_steps])   # before bid
-        obs_a_arr   = np.stack([s['obs_571_after']  for s in valid_steps])   # after bid
-        tgt_arr     = np.stack([s['belief_target']  for s in valid_steps])
-        pp_arr      = np.array([(s['player']+2)%4   for s in valid_steps])   # partner
-        oo_arr      = np.array([(s['player']+1)%4   for s in valid_steps])   # LHO (opponent)
-        opp_tgt_arr = np.stack([hand_to_belief_target(s['all_hands'][(s['player']+1)%4]) for s in valid_steps])
+        if rinfo_data is not None:
+            # Fast path: arrays pre-built during rollout (P_OPT2)
+            obs_b_arr   = rinfo_data['obs_b']
+            obs_a_arr   = rinfo_data['obs_a']
+            tgt_arr     = rinfo_data['tgt']
+            opp_tgt_arr = rinfo_data['opp_tgt']
+            pp_arr      = rinfo_data['pp']
+            oo_arr      = rinfo_data['oo']
+            ep_step_idx = rinfo_data['ep_step']
+            n = len(ep_step_idx)
+        else:
+            # Fallback: build arrays from episode dicts (legacy path / non-batch callers)
+            valid_steps: List[dict] = []
+            ep_step_idx_list: List[tuple] = []
+            for ep_idx, ep in enumerate(episodes):
+                for s_idx, step in enumerate(ep):
+                    if 'belief_target' in step and not step.get('ew_diagnostic'):
+                        valid_steps.append(step)
+                        ep_step_idx_list.append((ep_idx, s_idx))
+            if not valid_steps:
+                return raw_ep_bonuses
+            obs_b_arr   = np.stack([s['obs_571']      for s in valid_steps])
+            obs_a_arr   = np.stack([s['obs_571_after'] for s in valid_steps])
+            tgt_arr     = np.stack([s['belief_target'] for s in valid_steps])
+            pp_arr      = np.array([(s['player']+2)%4  for s in valid_steps])
+            oo_arr      = np.array([(s['player']+1)%4  for s in valid_steps])
+            opp_tgt_arr = np.stack([hand_to_belief_target(
+                              s['all_hands'][(s['player']+1)%4]) for s in valid_steps])
+            ep_step_idx = ep_step_idx_list
+            n = len(valid_steps)
+
+        if n == 0:
+            return raw_ep_bonuses
 
         obs_b_t   = torch.tensor(obs_b_arr,   dtype=torch.float32).to(self.device)
         obs_a_t   = torch.tensor(obs_a_arr,   dtype=torch.float32).to(self.device)
@@ -1751,16 +1847,26 @@ class SubgameTrainer:
         oo_t      = torch.tensor(oo_arr,      dtype=torch.long).to(self.device)
         opp_tgt_t = torch.tensor(opp_tgt_arr, dtype=torch.float32).to(self.device)
 
+        # P_OPT2: merge partner+opponent into one 2x-batch forward (4 calls → 2 calls).
+        # Layout: rows [0:B] = partner queries, rows [B:2B] = opponent queries.
         CHUNK = 2048
         bonuses_flat = np.zeros(n, dtype=np.float32)
         with torch.no_grad():
             for start in range(0, n, CHUNK):
                 sl = slice(start, start + CHUNK)
-                b_before_p   = self.belief_net.get_probs(obs_b_t[sl], pp_t[sl])
-                b_after_p    = self.belief_net.get_probs(obs_a_t[sl], pp_t[sl])
+                B  = obs_b_t[sl].shape[0]
+
+                obs_b_2x = torch.cat([obs_b_t[sl], obs_b_t[sl]], dim=0)
+                obs_a_2x = torch.cat([obs_a_t[sl], obs_a_t[sl]], dim=0)
+                tp_2x    = torch.cat([pp_t[sl],    oo_t[sl]],    dim=0)
+
+                probs_b_2x = self.belief_net.get_probs(obs_b_2x, tp_2x)
+                probs_a_2x = self.belief_net.get_probs(obs_a_2x, tp_2x)
+
+                b_before_p, b_before_o = probs_b_2x[:B], probs_b_2x[B:]
+                b_after_p,  b_after_o  = probs_a_2x[:B], probs_a_2x[B:]
+
                 partner_gain = self.dual_info.compute_info_gain(b_before_p, b_after_p, tgt_t[sl])
-                b_before_o   = self.belief_net.get_probs(obs_b_t[sl], oo_t[sl])
-                b_after_o    = self.belief_net.get_probs(obs_a_t[sl], oo_t[sl])
                 opp_leak     = self.dual_info.compute_info_gain(b_before_o, b_after_o, opp_tgt_t[sl])
                 bonus, _     = self.dual_info.compute_dual_info_bonus(partner_gain, opp_leak)
                 bonuses_flat[start:start + CHUNK] = bonus.cpu().numpy()
@@ -1768,11 +1874,7 @@ class SubgameTrainer:
         for i, (ep_idx, s_idx) in enumerate(ep_step_idx):
             raw_ep_bonuses[ep_idx][s_idx] = float(bonuses_flat[i])
 
-        # ── 量纲归一化 (P73) + 外部权重 (P87b) ─────────────────────────────
-        # 集中到最后一步（与IMP时序对齐），只做Scale不做Shift。
-        # P87b: 恢复动态归一化（w 的语义 = r_info 占 IMP 方差的比例），
-        # 仅将 w 从 0.02 提升到 0.2 使 step_ir 达到 ~1.5 IMP。
-        ep_totals = [sum(b for b in bs) for bs in raw_ep_bonuses]
+        ep_totals = [sum(bs) for bs in raw_ep_bonuses]
         for v in ep_totals:
             self.partner_stats.update(v)
         imp_std   = max(self.reward_stats.std, 1.0)
@@ -1969,11 +2071,15 @@ class SubgameTrainer:
 
             # ── (P93: JIT burn-in removed — belief update moved to after PPO) ──
 
+            import time as _time
+
             # ── 桌1: agent=NS, FSP=EW ──────────────────────────────────
             print(f"  [Table1/NS] Collecting {n_deals} deals (batch={batch_sz})...")
-            ns_eps = self._collect_episodes_batch(
+            _t = _time.time()
+            ns_eps, ns_rinfo = self._collect_episodes_batch(
                 n_deals, train_side='NS', fsp_sd=fsp_sd, batch_size=batch_sz,
                 use_belief_prior=_bw)
+            print(f"  [TIME] NS rollout:       {_time.time()-_t:6.1f}s")
 
             # 收集NS方的DDS regret用于reward_stats和日志（每局一个值）
             raw_ns_vals = []
@@ -1983,17 +2089,20 @@ class SubgameTrainer:
                         v = float(step['reward'])
                         self.reward_stats.update(v)
                         raw_ns_vals.append(v)
-                        break  # 同一局NS方reward相同，只取一次
+                        break
 
             # r_info bonus（Agent B only, NS桌）
+            _t = _time.time()
             if self.config.use_info_bonus:
-                bonuses = self._compute_info_bonus(ns_eps)
+                bonuses = self._compute_info_bonus(ns_eps, rinfo_data=ns_rinfo)
                 for ep, bs in zip(ns_eps, bonuses):
                     for step, b in zip(ep, bs):
                         step['reward'] += b
                         if b != 0.0: _ir_vals.append(b)
+            print(f"  [TIME] NS r_info bonus:  {_time.time()-_t:6.1f}s")
 
             # 存NS actors的数据并update
+            _t = _time.time()
             for ep in ns_eps:
                 for step in ep:
                     if step['player'] in (NORTH, SOUTH):
@@ -2005,12 +2114,15 @@ class SubgameTrainer:
             for p in (NORTH, SOUTH):
                 m = self._safe_update(p, rnd)
                 if m: ns_metrics[p] = m
+            print(f"  [TIME] NS PPO update:    {_time.time()-_t:6.1f}s")
 
             # ── 桌2: agent=EW, FSP=NS ──────────────────────────────────
             print(f"  [Table2/EW] Collecting {n_deals} deals (batch={batch_sz})...")
-            ew_eps = self._collect_episodes_batch(
+            _t = _time.time()
+            ew_eps, ew_rinfo = self._collect_episodes_batch(
                 n_deals, train_side='EW', fsp_sd=fsp_sd, batch_size=batch_sz,
                 use_belief_prior=_bw)
+            print(f"  [TIME] EW rollout:       {_time.time()-_t:6.1f}s")
 
             # 收集EW方的DDS regret（每局一个值）
             raw_ew_vals = []
@@ -2020,17 +2132,20 @@ class SubgameTrainer:
                         v = float(step['reward'])
                         self.reward_stats.update(v)
                         raw_ew_vals.append(v)
-                        break  # 同一局EW方reward相同，只取一次
+                        break
 
             # r_info bonus（Agent B only, EW桌）
+            _t = _time.time()
             if self.config.use_info_bonus:
-                ew_bonuses = self._compute_info_bonus(ew_eps)
+                ew_bonuses = self._compute_info_bonus(ew_eps, rinfo_data=ew_rinfo)
                 for ep, bs in zip(ew_eps, ew_bonuses):
                     for step, b in zip(ep, bs):
                         step['reward'] += b
                         if b != 0.0: _ir_vals.append(b)
+            print(f"  [TIME] EW r_info bonus:  {_time.time()-_t:6.1f}s")
 
             # 存EW actors的数据并update
+            _t = _time.time()
             for ep in ew_eps:
                 for step in ep:
                     if step['player'] in (EAST, WEST):
@@ -2042,11 +2157,14 @@ class SubgameTrainer:
             for p in (EAST, WEST):
                 m = self._safe_update(p, rnd)
                 if m: ew_metrics[p] = m
+            print(f"  [TIME] EW PPO update:    {_time.time()-_t:6.1f}s")
 
             # ── Belief Update: frozen (P96) or on-policy (P93/P95) ─────────
+            _t = _time.time()
             if self.belief_net is not None and not self.config.freeze_belief:
                 bl = self.update_belief_on_policy(ns_eps + ew_eps)
                 if bl is not None: _bl_vals.append(bl)
+            print(f"  [TIME] belief update:    {_time.time()-_t:6.1f}s")
 
             # ── 日志 ────────────────────────────────────────────────────
             all_vals = raw_ns_vals + raw_ew_vals

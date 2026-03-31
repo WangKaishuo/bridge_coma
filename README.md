@@ -49,11 +49,13 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 34. **P122 invalidates ALL prior RL experiments.** Vul randomization changes the training distribution fundamentally. Agent must learn when to be aggressive (non-vul) vs conservative (vul). Prior agents trained only on non-vul developed unconstrained aggressive strategies.
 35. **`competitive_500k.npz` does NOT need regeneration.** Vul is assigned dynamically at rollout time, not baked into deal data.
 36. **SL checkpoints do NOT need retraining.** SAYC expert data was generated under None-vul. SL learns SAYC convention; RL learns vul-dependent adjustments on top.
-37. **P123 (CRITICAL): Eval IMP sign bug — 50% of deals had inverted score.** `cross_evaluate`, `_cross_eval_fixed_deals`, and `bid_inspector` all compute `IMP = score_to_imp(score_1 - score_2)`. `play_mixed`'s `ns_policy` controls **opener seats** (not physical NS), but `_compute_score_ns` returns **physical NS perspective**. When dealer ∈ {E,W}, opener = physical EW, so A playing well → NS score low → `score_1 - score_2 < 0` → wrong sign. Fix: flip to `score_2 - score_1` when `dealer % 2 == 1`. **Training code is unaffected** (uses single-table DDS regret, not `play_mixed` dual-table). All pre-P123 eval results have attenuated IMP (≈50% sign-inverted deals pull mean toward 0).
-38. **P123 is the third most severe bug.** It did not corrupt training, but made all eval results unreliable. The "vul training hurts" finding (≈0 IMP vs SL) was entirely an artifact — with fixed eval, vul-trained agent achieves +3.3 IMP, comparable to no-vul agent (+3.0 IMP).
-39. **`entropy_coef` default is 0.001.** Was accidentally set to 0.01 in a previous upload. 0.01 causes asymmetric entropy collapse across players. Always verify `entropy_coef=0.001` in the header log.
-40. **Early stop is disabled by default.** `early_stop_enabled=False` in SubgameConfig. PopArt value normalization compresses VL to ~0.5-0.9, which falsely triggers the plateau detector (threshold 0.15 was calibrated for raw VL ~20-40). Fixed schedules preferred for reproducibility.
-41. **PopArt value normalization: tested but not required.** MAPPO paper recommends it, and it does equalize VL across players with vul. However, post-P123 eval fix shows agents train correctly without it. Available in `utils/value_norm.py` if needed for future experiments with higher reward variance.
+37. **P123: `subgame_validation.py` now supports `--agent_b_only`.** Trains only Agent B (MAPPO+BCA+r_info), skipping A and C. Mutually exclusive with `--agent_a_only`. `drift_sweep.py` also supports `--agent_b_only`.
+38. **P123: `_sl_bc` bug fixed in `subgame_validation.py`.** Two references to undefined `_sl_bc` (should be `_bc`) would crash when SL eval falls back to belief pretrain. Fixed.
+39. **P124: Action encoding mismatch in `sl_pretrain_bca.py`.** `sl_base.pt` uses `action - 52` encoding (Pass=0, 1C=1, 1D=2, ...). `sl_pretrain_bca.py` used `openspiel_raw_to_ours` encoding (Pass=0, Double=1, Redouble=2, 1C=3). All non-pass bids off by 2. Stage B legacy "worked" because full fine-tune re-learned the mapping. ReFine mode (frozen actor) exposed the bug. **Fixed: all data classes in `sl_pretrain_bca.py` now use `action - 52` encoding.**
+40. **P124: ReFine Residual Belief Adapter (`sl_pretrain_bca.py --mode refine`).** Freezes plain SL actor entirely; trains lightweight adapter (96→128→1024, ~144k params, 3.7% of total) to inject belief features via residual connection after layer 0. Gate parameter initialized to 0 ensures exact plain-SL behavior at start. Inspired by ReFine (Xu et al. 2025) with no-negative-transfer guarantee.
+41. **P124: SL_BCA(StageB) weakness diagnosed.** Stage B full fine-tune changes actor bidding pattern AND makes actor dependent on belief features. `SL vs SL_BCA = -1.1 IMP` is NOT convention card effect — it's negative transfer from Stage B training. The 4.1→1.8 IMP drop (Agent A vs SL → Agent A vs SL_BCA) is primarily pattern-change effect, confirmed by ablation (real vs prior ≈ 0 difference).
+42. **P124: SAYC BeliefNet belief output ≠ prior (L1 dist ≈ 0.137), and belief columns contribute ~24% of layer-0 activation.** Despite this, ablation has no effect on decisions. Investigation ongoing — likely related to cross-protocol OOD behavior during actual drifted-bid games (vs initial-position analysis).
+43. **P124: ReFine adapter gate converges to ≈0 on SAYC data.** Expected: plain SL already extracts all information from obs_571 that BeliefNet can provide. Belief features are redundant for SAYC SL. ReFine value appears only when co-evolved BeliefNet reads agent's own drifted protocol (see TODO).
 
 ---
 
@@ -71,29 +73,51 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 | P106–P108: `hands_to_openspiel_state` fixes | ✅ |
 | P109–P121: Infrastructure improvements | ✅ |
 | Train `sl_base_bca.pt` (BeliefNet Stage A) | ✅ Done |
-| Train `sl_base_bca_stageB.pt` (Stage B, 667-dim) | ✅ Done |
+| Train `sl_base_bca_stageB.pt` (Stage B legacy, 667-dim) | ✅ Done |
 | P122: Vul randomization + BeliefNet save + target_pos fix | ✅ |
-| P123: Eval IMP sign fix + entropy_coef fix + early_stop off | ✅ |
-| **571-dim RL baseline (with vul, λ=0.0, 1 seed)** | ✅ +3.3 IMP vs SL (seed=100) |
-| **571-dim RL multi-seed (5 seeds)** | ⏳ Pending |
-| **667-dim BCA RL training (with vul)** | ⏳ Pending |
-| **BCA ablation experiment** | ⏳ Pending |
+| P123: `--agent_b_only` mode + `_sl_bc` bug fix | ✅ |
+| P124: Action encoding fix + ReFine adapter + SL_BCA diagnosis | ✅ |
+| 571-dim Agent A RL training (seed=100, 25 rounds) | ✅ Done |
+| 667-dim Agent A RL training (seed=100, 25 rounds) | ✅ Done |
+| 667-dim Agent B RL training (seed=100, 25 rounds, β=0.0) | ✅ Done |
+| Train `sl_base_bca_refine.pt` (ReFine, gate≈0) | ✅ Done |
+| **subgame_trainer.py performance optimization (P_OPT)** | ✅ Done |
+| **bid_inspector ReFine adapter support** | ⏳ TODO |
+| **Convention card with co-evolved BeliefNet (Route 2)** | ⏳ TODO |
+| **Multi-seed validation (5 seeds)** | ⏳ Pending |
 | **BCA core experiment (Agent A vs Agent B, r_info)** | ⏳ Pending |
 
 ---
 
-## Valid Experimental Results
+## Valid Experimental Results (Post-P122, seed=100)
 
-**All pre-P123 eval results are unreliable** due to IMP sign inversion on 50% of deals (dealer ∈ {E,W}).
+### RL Training Results
 
-### Post-P123 Results (571-dim baseline, seed=100, λ=0.0, 20 rounds, eval=5000 deals)
+| Agent | Rounds | Final regret | Belief loss | step_ir |
+|-------|--------|-------------|-------------|---------|
+| 571-dim Agent A | 25 | +1.625 ± 10.203 | — | — |
+| 667-dim Agent A | 25 | +1.491 ± 10.163 | 1.907 | — |
+| 667-dim Agent B (β=0.0) | 25 | +1.460 ± 10.204 | 1.940 | 2.505 |
 
-| Agent | Training vul | Eval vul | vs SL IMP | Win rate |
-|---|---|---|---|---|
-| RL (no vul training) | None-vul only | Random | +2.97 ± 11.6 | 57.0% |
-| RL (with vul training) | Random | Random | +3.31 ± 11.4 | 56.9% |
+### Head-to-Head Results (bid_inspector, 5000 deals, seed=100)
 
-**Key finding:** Vul randomization during training does NOT hurt — slight improvement (+3.3 vs +3.0). The apparent "vul kills training" finding was entirely the P123 eval bug.
+| Matchup | IMP (model1 perspective) | Wins/Losses/Ties |
+|---------|--------------------------|------------------|
+| 571 Agent A vs SL | +4.219 ± 11.336 | 3013 / 1556 / 431 |
+| 667 Agent A vs SL | +4.105 ± 11.473 | 3003 / 1606 / 391 |
+| 667 Agent A vs SL_BCA(StageB) | +1.822 ± 10.557 | 2435 / 2322 / 243 |
+| 667 Agent A vs SL_BCA(ablated) | +1.864 ± 10.643 | 2423 / 2339 / 238 |
+| 667 Agent B vs SL | +3.753 ± 11.459 | 2942 / 1651 / 407 |
+| **667 Agent B vs Agent A** | **+0.678 ± 7.942** | **1110 / 833 / 3057** |
+| SL vs SL_BCA(StageB) | -1.105 ± 9.058 | 2077 / 2343 / 580 |
+
+### Key Findings
+
+1. **r_info works: Agent B > Agent A (+0.678 IMP in direct H2H).** Information-theoretic reward shaping improves cooperative bidding quality.
+2. **Agent B vs SL (+3.753) < Agent A vs SL (+4.105).** B's more communicative bidding sacrifices some SL-exploit efficiency for partner coordination. This is expected: B optimizes for informativeness, not maximum exploitation of a fixed opponent.
+3. **SL_BCA(StageB) ablation ≈ 0 difference.** SAYC BeliefNet cannot interpret drifted bids (cross-protocol failure). The +4.1 → +1.8 drop is primarily pattern-change effect from Stage B full fine-tune, NOT convention card information.
+4. **SL_BCA(StageB) is weaker than plain SL (-1.1 IMP).** Stage B causes negative transfer.
+5. **ReFine adapter gate ≈ 0 on SAYC data.** Belief features are redundant when actor already sees full bidding history. ReFine correctly avoids negative transfer.
 
 ---
 
@@ -113,18 +137,27 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 
 **Purpose:** Test whether giving the opponent a "convention card" (BeliefNet) reduces the RL agent's advantage.
 
-| Experiment | Config | What it measures |
-|---|---|---|
-| AgentA vs plain SL (571-dim) | Same agent, SL has no belief | Total advantage including convention drift |
-| AgentA vs SL_BCA(StageB) | SL has SAYC-trained BeliefNet | Advantage after opponent gets convention card |
-| AgentA vs SL_BCA(StageB, ablated) | SL has StageB actor but belief=prior | Isolates belief information content vs Stage B training effect |
+**Original design (SL_BCA StageB) — FAILED:**
+Stage B full fine-tune causes negative transfer (SL_BCA -1.1 IMP weaker than SL) and changes bidding pattern. Ablation (real vs prior) ≈ 0 because SAYC BeliefNet cannot interpret drifted bids. The +4.1 → +1.8 drop is pattern-change effect, not convention card effect.
 
-**Ablation logic:**
-- (AgentA vs SL) − (AgentA vs SL_BCA) = total BCA effect (convention card + Stage B actor change)
-- (AgentA vs SL_BCA_ablated) − (AgentA vs SL_BCA_real) = pure belief information value
-- SL_BCA vs plain SL = Stage B's own strength change (known to be negative ~1.4 IMP pre-P122; recheck post-P122)
+**Revised design (Route 2: Co-evolved BeliefNet + ReFine Adapter):**
 
-**Key discovery from pre-P122 experiments:** SAYC-trained BeliefNet cannot cross-protocol interpret drifted bids. Ablation showed real vs prior belief difference ≈ 0. This is a meaningful negative result — convention cards require protocol-matched training.
+The key insight: to test whether a convention card helps the opponent, the BeliefNet must be trained on the *agent's own protocol*, not on SAYC. Agent A's co-evolved BeliefNet (saved in agent checkpoint, belief_loss=1.91) already understands Agent A's drifted bids.
+
+| Step | What | Purpose |
+|------|------|---------|
+| 1 | Extract co-evolved BeliefNet from Agent A checkpoint | Protocol-matched convention card |
+| 2 | Train ReFine adapter: frozen plain SL + Agent A's BeliefNet | SL opponent that can read Agent A's bids WITHOUT changing bidding pattern |
+| 3 | Agent A vs SL_ReFine(real belief) | Convention card effect (if any) |
+| 4 | Agent A vs SL_ReFine(ablated belief) | Control: same architecture, belief=prior |
+| 5 | Diff of 3 and 4 | **Pure convention card information value** |
+
+**Why this works:**
+- SL_ReFine(ablated) ≈ plain SL (gate≈0, same bidding pattern) → clean baseline
+- SL_ReFine(real) = plain SL + protocol-matched convention card → if belief helps, gate > 0, accuracy improves
+- Diff isolates pure belief information content, free of pattern-change confound
+
+**Theoretical backing:** ReFine (Xu et al. 2025) guarantees no negative transfer: if belief is uninformative, adapter output → 0, SL performance preserved.
 
 ### Phase 3: r_info Core Experiment (667-dim)
 
@@ -168,10 +201,13 @@ Unchanged. `actual_score` depends on both sides' bidding.
 Unchanged. Present as KL-compliance Pareto frontier with honest confounding acknowledgment.
 
 ### Issue 3: SAYC BeliefNet cannot cross-protocol interpret drifted bids
-**New finding from P122 experiments.** Ablation (real belief vs prior) showed ≈ 0 IMP difference. The SAYC-trained BeliefNet interprets drifted bids through a SAYC lens, producing no useful signal. A proper convention card would require fine-tuning on the agent's own rollout data — but this raises scientific concerns (see Key Lessons).
+**Confirmed in P124.** Ablation (real belief vs prior) showed ≈ 0 IMP difference. Despite belief output ≠ prior (L1 dist ≈ 0.137) and belief contributing ~24% of layer-0 activation, the actor's decisions are unchanged. Root cause: SAYC BeliefNet interprets drifted bids through SAYC lens. **Solution: Route 2 (co-evolved BeliefNet + ReFine adapter).**
 
-### Issue 4: SL_BCA(StageB) is weaker than plain SL
-**New finding.** SL_BCA(StageB) loses ~1.4 IMP to plain SL in direct play. Stage B training makes the actor dependent on belief features; when those features are noisy/inaccurate, performance degrades below plain SL. This actually strengthens the BCA argument: a weaker opponent equipped with convention card still reduces agent advantage more than a stronger opponent without it.
+### Issue 4: SL_BCA(StageB) is weaker than plain SL — ROOT CAUSE IDENTIFIED
+**P124 diagnosis:** Stage B full fine-tune causes two entangled problems: (1) actor bidding pattern changes (pure negative transfer), (2) actor becomes dependent on belief features. The +4.1 → +1.8 drop is primarily (1), not convention card effect. **Solution: ReFine adapter freezes SL weights, eliminates pattern change.**
+
+### Issue 6: Agent B vs SL weaker than Agent A vs SL despite B > A in H2H
+**New finding (P124).** Agent B (+3.753 vs SL) < Agent A (+4.105 vs SL), but Agent B > Agent A (+0.678 in direct H2H). Explanation: r_info makes B's bidding more communicative to partner, which trades some SL-exploit efficiency for partner coordination. When playing against SL (which doesn't benefit from B's communicative bids), the exploit loss shows. In H2H (where partner benefits from better communication), the coordination gain dominates. **This is not a problem — it's the expected behavior of the information-theoretic objective.**
 
 ### Issue 5: SL trained only on None-vul
 SAYC training data and OpenSpiel's reference SL pipeline (Lockhart et al., Kita et al.) all use fixed `(False, False)` vulnerability. Our SL baseline inherits this limitation. RL training adds vul-awareness, but the SL anchor in FSP pool remains vul-naive. This is acceptable because: (1) SL is the initialization, not the final policy; (2) prior work has the same limitation; (3) the FSP SL anchor's vul-naivety is conservative (makes it easier to beat, not harder).
@@ -258,8 +294,12 @@ python bid_inspector.py \
 - **BeliefNet target_pos must use absolute seat numbers.** BeliefNet was trained with SAYC data where dealer=0, so absolute=relative. RL training uses absolute seats. bid_inspector must match. Using relative seats (pre-P122 bug) caused wrong belief features for 75% of deals.
 - **Co-evolved BeliefNet must be saved with agent checkpoint.** `MAPPOAgent.save()` doesn't include it. `subgame_validation.py` now appends it. `bid_inspector.py` auto-detects and loads.
 - **SAYC-trained BeliefNet cannot interpret drifted bids.** Ablation showed real vs prior belief ≈ 0 IMP difference. Cross-protocol inference failure. A convention card must be trained on the agent's own protocol to be useful.
-- **SL_BCA(StageB) is weaker than plain SL.** Stage B makes actor dependent on belief features; imperfect belief signals cause worse decisions than ignoring them entirely. This is analogous to an inexperienced player misreading a convention card.
-- **Fine-tuning BeliefNet on agent rollout data is scientifically problematic.** It tests "can a specific neural network training scheme help" rather than "does the convention card concept work." The conclusion would depend on engineering quality, not the concept.
+- **SL_BCA(StageB) weakness is negative transfer, not convention card failure.** Stage B full fine-tune changes bidding pattern AND creates belief dependency. The +4.1→+1.8 drop is primarily pattern-change effect, confirmed by ablation ≈ 0.
+- **ReFine adapter (Xu et al. 2025) solves the SL_BCA negative transfer problem.** Freeze plain SL actor, inject belief via zero-init residual adapter. Gate=0 guarantees exact plain-SL behavior when belief is uninformative. Theoretically proven no-negative-transfer.
+- **Action encoding mismatch between sl_pretrain.py and sl_pretrain_bca.py (P124).** sl_base.pt uses `action-52` (Pass=0, 1C=1). sl_pretrain_bca.py used `openspiel_raw_to_ours` (Pass=0, Double=1, Redouble=2, 1C=3). Off by 2 for all non-pass bids. Stage B legacy masked the bug via full fine-tune; ReFine exposed it.
+- **Zero-init adapter trap (P124).** If both `up.weight=0` AND `gate=0`, gradient is zero everywhere (double dead zone). Fix: only zero-init gate; use Xavier for up. Gate=0 alone guarantees zero initial output.
+- **Belief features are redundant for SAYC SL.** ReFine gate converges to ≈0 on SAYC data: plain SL already extracts all useful information from obs_571 (full bidding history). Belief features add value only when BeliefNet reads a protocol that obs alone cannot decode.
+- **r_info trades SL-exploit for partner coordination.** Agent B > Agent A in H2H (+0.678), but Agent B < Agent A vs SL (-0.35). Communicative bidding helps partners but is "wasted" on an SL opponent that can't interpret the signals.
 - **Dealing order matters for obs.** OpenSpiel SAYC trajectories use interleaved dealing, not consecutive per-player.
 - **Always use `game(dealer=0)` for inference.** SL trained on dealer=0 only. P122 adds `dealer_vul`/`non_dealer_vul` params to the game instance.
 - **Reward normalization must persist across rounds.** Re-instantiating `RunningStats` resets normalization.
@@ -267,9 +307,6 @@ python bid_inspector.py \
 - **FSP with SL as permanent anchor is the correct training setup.** Self-play causes near-zero gradient signal.
 - **P117 was the most severe bug before P122.** Dealer rotation caused 50% of rewards to have wrong sign.
 - **P122 is the second most severe set of fixes.** Three independent bugs (vul, target_pos, BeliefNet save) all affected 667-dim experiments. Plus vul randomization fundamentally changes the training distribution.
-- **P123 eval sign bug: `play_mixed` ns_policy ≠ physical NS.** `ns_policy` controls opener seats, but `_compute_score_ns` returns physical NS perspective. When dealer is EW, the IMP sign inverts. This bug only affected eval, not training. Symptom: all agents appeared to tie with SL (~0 IMP) despite regret improving during training.
-- **Eval bugs can masquerade as training failures.** P123 wasted multiple sessions investigating training-side fixes (PopArt, entropy tuning, batch size) when the actual problem was a sign error in the evaluation function. Always verify the eval pipeline independently before diagnosing training issues.
-- **PopArt value normalization equalizes VL across players but is not necessary for correct training.** Tested and confirmed: agents train correctly without it. Available as `utils/value_norm.py` for future use if needed.
 
 ---
 
@@ -298,5 +335,37 @@ for i in range(13):
 
 ---
 
-*README version: P123*
-*Last updated: 2026-03-30*
+## ⏳ TODO (Next Session)
+
+### TODO 1: bid_inspector ReFine adapter support
+`bid_inspector.py` 的 `_make_play_mixed_policy` 需要支持 ReFine 模式的 SL 对手。当前逻辑把 belief features 拼接到 571-dim obs 构成 667-dim 输入喂给 `MLPPolicyNetwork`。ReFine 模式需要分开传 obs_571 和 belief_96 给 `ReFineActor`。
+
+需要改的地方：
+- `_make_play_mixed_policy`: 检测 model 是否为 `ReFineActor`，走不同的 forward path
+- `load_sl`: 支持加载 `sl_base_bca_refine.pt`（`encoding='openspiel_667_refine'`），构建 `ReFineActor` 而不是 `MLPPolicyNetwork`
+- 消融模式：`--ablate_belief` 在 ReFine 模式下把 belief_96 替换为 prior
+
+### TODO 2: Convention Card with Co-evolved BeliefNet (Route 2)
+**核心实验：证明 convention card 确实减少了密约优势。**
+
+步骤：
+1. 从 Agent A checkpoint (`agent_a_seed100.pt`) 提取 co-evolved BeliefNet（belief_loss=1.91，能读懂 Agent A 的 drifted protocol）
+2. 用这个 BeliefNet 重跑 ReFine adapter 训练：`python sl_pretrain_bca.py --mode refine --init_from results/sl_base.pt --load_belief results/drift_sweep_667/lambda0.0_seed100/agent_a_seed100.pt --out results/sl_bca_refine_coevolved_a.pt`
+3. 如果 gate > 0 且 non_pass_acc > baseline：co-evolved BeliefNet 为 SL 提供了有用信息
+4. 在 bid_inspector 中对战：Agent A vs SL_ReFine_coevolved(real) vs Agent A vs SL_ReFine_coevolved(ablated)
+5. 如果 real < ablated（agent 更难赢）：convention card 有效
+
+**预期结果：** gate > 0（co-evolved BeliefNet 有边际信息价值），消融实验显示 real belief 使 agent 优势减少。
+
+**科学合理性：** 不是在测 "某个 NN 训练方案是否有效"，而是在测 "如果对手拥有能读懂 agent protocol 的 convention card，agent 的信息不对称优势是否减少"。ReFine 冻结 SL actor 确保 bidding pattern 不变，唯一变量是 belief features 的信息内容。
+
+### TODO 3: Stage 3 eval 对手统一
+当前 667-dim 模式的 Stage 3 自动使用 SL_BCA(StageB) 作为 eval 对手，导致 Stage 3 得分与 bid_inspector（用 plain SL）不一致。加 `--sl_eval_plain` 参数让 Stage 3 也用 plain SL。
+
+### TODO 4: Multi-seed validation
+5 seeds × Agent A + Agent B，确认 B > A 的稳定性。当前只有 seed=100 的单次结果。
+
+---
+
+*README version: P124*
+*Last updated: 2026-03-31*

@@ -31,12 +31,17 @@ Usage:
       --model2 results/agent_b.pt --type2 agent \
       --data data/competitive_500k.npz --num_deals 20
 
-  # SL vs SL（双桌对战）
+  # Agent vs SL_ReFine（双桌对战，ReFine 模式）
   python bid_inspector.py \
-      --model1 results/sl_base.pt      --type1 sl \
-      --model2 results/sl_competitive.pt --type2 sl \
-      --data data/competitive_500k.npz --num_deals 20
-"""
+      --model1 results/agent_a.pt --type1 agent \
+      --model2 results/sl_base_bca_refine.pt --type2 sl \
+      --data data/competitive_500k.npz --num_deals 5000
+
+  # Agent vs SL_ReFine_coevolved（消融实验: real vs prior belief）
+  python bid_inspector.py \
+      --model1 results/agent_a.pt --type1 agent \
+      --model2 results/sl_bca_refine_coevolved_a.pt --type2 sl \
+      --data data/competitive_500k.npz --num_deals 5000 --ablate_belief
 
 from __future__ import annotations
 
@@ -59,7 +64,7 @@ from env import (
     NORTH, EAST, SOUTH, WEST,
 )
 from networks.policy_net import (
-    MLPPolicyNetwork, OBS_DIM, BELIEF_OBS_DIM,
+    MLPPolicyNetwork, OBS_DIM, BELIEF_OBS_DIM, BELIEF_FEAT_DIM,
     openspiel_raw_to_ours, ours_to_openspiel_raw,
     convert_hands_suit_to_rank, hands_to_openspiel_state,
     get_openspiel_obs, advance_openspiel_state,
@@ -141,15 +146,68 @@ def load_agent(path: str, device: str) -> MAPPOAgent:
     obs_dim = _detect_obs_dim(path)
     agent = MAPPOAgent(MAPPOConfig(device=device, obs_dim=obs_dim))
     agent.load(path)
+    agent._is_refine = False
     print(f"[load_agent] obs_dim={obs_dim}")
     return agent
 
 
-def load_sl(path: str, device: str) -> MAPPOAgent:
-    """Load SL checkpoint as MAPPOAgent, auto-detecting obs_dim."""
-    obs_dim = _detect_obs_dim(path)
+def load_sl(path: str, device: str):
+    """Load SL checkpoint as MAPPOAgent (or ReFineActor wrapper), auto-detecting obs_dim.
+
+    ReFine mode (encoding='openspiel_667_refine'):
+      Returns a MAPPOAgent (571-dim) with ._refine_actor set to a ReFineActor.
+      _make_play_mixed_policy detects this and routes through the ReFine forward path.
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    encoding = ckpt.get('encoding', '')
+
+    if encoding == 'openspiel_667_refine':
+        # ── ReFine mode: load frozen actor + adapter ──────────────────────────
+        from networks.policy_net import OBS_DIM as _OD
+        try:
+            from sl_pretrain_bca import ReFineActor, BeliefAdapter
+        except ImportError:
+            from experiments.sl_pretrain_bca import ReFineActor, BeliefAdapter
+
+        hidden_dim  = ckpt.get('hidden_dim', 1024)
+        bottleneck  = ckpt.get('bottleneck', 128)
+
+        frozen_actor = MLPPolicyNetwork(obs_dim=_OD, hidden_dim=hidden_dim).to(device)
+        frozen_actor.load_state_dict(
+            {k: v.to(device) for k, v in ckpt['model_state'].items()})
+
+        adapter = BeliefAdapter(
+            belief_dim=BELIEF_FEAT_DIM,
+            hidden_dim=hidden_dim, bottleneck=bottleneck).to(device)
+        adapter.load_state_dict(
+            {k: v.to(device) for k, v in ckpt['adapter_state'].items()})
+
+        refine_actor = ReFineActor(frozen_actor, adapter).to(device)
+        refine_actor.eval()
+
+        gate_val = adapter.gate.item()
+        print(f"[load_sl] ReFine mode (encoding={encoding}), gate={gate_val:.4f}")
+
+        # Wrap in a MAPPOAgent shell (571-dim) so the caller can still call
+        # _attach_belief, etc.  The actual inference goes through ._refine_actor.
+        obs_dim = _OD  # 571 — the frozen actor's input dim
+        agent = MAPPOAgent(MAPPOConfig(device=device, obs_dim=obs_dim))
+        load_sl_into_mappo_agent(agent, path)  # loads 571-dim weights normally
+        agent._refine_actor = refine_actor      # attach ReFine actor as side-car
+        agent._is_refine    = True
+        print(f"[load_sl] ReFineActor attached (adapter params: "
+              f"{sum(p.numel() for p in adapter.parameters()):,})")
+        return agent
+
+    # ── Standard SL (571 or 667 legacy) ──────────────────────────────────────
+    obs_dim = ckpt.get('obs_dim', OBS_DIM)
+    if 'model_state' in ckpt:
+        w = ckpt['model_state'].get('net.0.weight')
+        if w is not None:
+            obs_dim = w.shape[1]
     agent = MAPPOAgent(MAPPOConfig(device=device, obs_dim=obs_dim))
     load_sl_into_mappo_agent(agent, path)
+    agent._is_refine = False
     print(f"[load_sl] obs_dim={obs_dim}")
     return agent
 
@@ -268,10 +326,12 @@ def _make_play_mixed_policy(model, hands_sm, dealer, device, belief_net=None,
     BCA mode: if belief_net is provided, appends 96-dim belief features to
     the 571-dim OpenSpiel obs, producing 667-dim input for BCA actors.
 
-    ablate_belief: if True AND is_bca, replace real BeliefNet output with
-    prior (0.25 uniform) features. The actor still receives 667-dim input
-    but the belief columns carry no information. This isolates the effect
-    of belief *content* from the effect of Stage B training.
+    ReFine mode (P125): if model._is_refine=True, obs_571 and belief_96 are
+    passed SEPARATELY to ReFineActor.get_action() instead of concatenating.
+    The frozen SL actor receives obs_571 only; the adapter adjusts via belief_96.
+
+    ablate_belief: if True AND (is_bca or is_refine), replace real BeliefNet
+    output with prior (0.25 uniform). Isolates belief *content* effect.
 
     P122: vulnerability passed to hands_to_openspiel_state for vul-aware obs.
     P122: use ABSOLUTE seat for BeliefNet target_pos.
@@ -285,6 +345,9 @@ def _make_play_mixed_policy(model, hands_sm, dealer, device, belief_net=None,
     is_bca = (belief_net is not None)
     if vulnerability is None:
         vulnerability = (False, False)
+
+    # Detect ReFine mode: model has a ._refine_actor side-car
+    is_refine = getattr(model, '_is_refine', False) and hasattr(model, '_refine_actor')
 
     def policy(obs, player, history_int):
         os_state = hands_to_openspiel_state(hands_rm, dealer,
@@ -301,43 +364,65 @@ def _make_play_mixed_policy(model, hands_sm, dealer, device, belief_net=None,
 
         flat = get_openspiel_obs(os_state)  # (571,)
 
-        # BCA: append belief features via BeliefNet
-        if is_bca:
-            if ablate_belief:
-                # Ablation: use uniform prior (0.25) instead of real BeliefNet output
-                # Actor still receives 667-dim input, but belief columns are uninformative
-                bf = np.full(96, 0.25, dtype=np.float32)
-            else:
-                # P122: use ABSOLUTE seat for BeliefNet target_pos.
-                # BeliefNet was trained on SAYC data with dealer=0 where absolute=relative.
-                # RL training (_get_belief_features_single) uses absolute seats.
-                # bid_inspector must match to get consistent results with Stage 3.
-                partner = (player + 2) % 4
-                rho     = (player - 1) % 4
-                obs_t   = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    bf_partner = belief_net.get_probs(
-                        obs_t, torch.tensor([partner], dtype=torch.long, device=device))
-                    bf_rho     = belief_net.get_probs(
-                        obs_t, torch.tensor([rho],     dtype=torch.long, device=device))
-                bf = torch.cat([bf_partner, bf_rho], dim=-1).squeeze(0).cpu().numpy()
-            flat = append_belief_features(flat, bf)  # (667,)
-
-        flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
-
-        # Legal mask from OpenSpiel state
-        legal_os = os_state.legal_actions()
+        # Legal mask from OpenSpiel state (shared for all paths)
+        legal_os_acts = os_state.legal_actions()
         legal_mask = torch.zeros(1, NUM_BIDS, dtype=torch.float32, device=device)
-        for os_a in legal_os:
+        for os_a in legal_os_acts:
             ours = openspiel_raw_to_ours(os_a)
             if ours >= 0:
                 legal_mask[0, ours] = 1.0
 
         rel_player = (player - dealer) % 4
-        actor = model.get_actor(rel_player)
-        with torch.no_grad():
-            action, _, _ = actor.get_action(flat_t, legal_mask, deterministic=True)
-        return action.item()
+
+        if is_refine:
+            # ── ReFine path: obs_571 and belief_96 passed separately ──────────
+            # belief_net must be provided for ReFine (it was loaded alongside model)
+            obs_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
+
+            if is_bca and belief_net is not None:
+                if ablate_belief:
+                    bf_t = torch.full((1, 96), 0.25, dtype=torch.float32, device=device)
+                else:
+                    partner = (player + 2) % 4
+                    rho     = (player - 1) % 4
+                    with torch.no_grad():
+                        bf_partner = belief_net.get_probs(
+                            obs_t, torch.tensor([partner], dtype=torch.long, device=device))
+                        bf_rho     = belief_net.get_probs(
+                            obs_t, torch.tensor([rho],     dtype=torch.long, device=device))
+                    bf_t = torch.cat([bf_partner, bf_rho], dim=-1)  # (1, 96)
+            else:
+                # No BeliefNet: use prior
+                bf_t = torch.full((1, 96), 0.25, dtype=torch.float32, device=device)
+
+            with torch.no_grad():
+                action, _, _ = model._refine_actor.get_action(
+                    obs_t, bf_t, legal_mask, deterministic=True)
+            return action.item()
+
+        else:
+            # ── Standard path (plain SL or RL agent, 571 or 667-dim) ──────────
+            if is_bca:
+                if ablate_belief:
+                    bf = np.full(96, 0.25, dtype=np.float32)
+                else:
+                    # P122: use ABSOLUTE seat for BeliefNet target_pos.
+                    partner = (player + 2) % 4
+                    rho     = (player - 1) % 4
+                    obs_t   = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        bf_partner = belief_net.get_probs(
+                            obs_t, torch.tensor([partner], dtype=torch.long, device=device))
+                        bf_rho     = belief_net.get_probs(
+                            obs_t, torch.tensor([rho],     dtype=torch.long, device=device))
+                    bf = torch.cat([bf_partner, bf_rho], dim=-1).squeeze(0).cpu().numpy()
+                flat = append_belief_features(flat, bf)  # (667,)
+
+            flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
+            actor = model.get_actor(rel_player)
+            with torch.no_grad():
+                action, _, _ = actor.get_action(flat_t, legal_mask, deterministic=True)
+            return action.item()
     return policy
 
 
@@ -388,12 +473,7 @@ def play_deal(
         ns_policy=sl_policy, ew_policy=agent_policy,
         vulnerability=vul, dealer=dealer)
 
-    # P123: flip sign when dealer is EW (ns_policy controls opener=EW physical seats,
-    # but score is NS-perspective, so A playing well → NS score low → need sign flip)
-    if dealer % 2 == 1:
-        imp = float(score_to_imp(score_2 - score_1))
-    else:
-        imp = float(score_to_imp(score_1 - score_2))
+    imp = float(score_to_imp(score_1 - score_2))
 
     opener_str     = f"{PLAYER_SHORT[dealer]}{PLAYER_SHORT[(dealer+2)%4]}"
     overcaller_str = f"{PLAYER_SHORT[(dealer+1)%4]}{PLAYER_SHORT[(dealer+3)%4]}"
@@ -459,11 +539,7 @@ def play_deal_ab(
         ns_policy=policy_b, ew_policy=policy_a,
         vulnerability=vul, dealer=dealer)
 
-    # P123: flip sign when dealer is EW (see cross_evaluate comment)
-    if dealer % 2 == 1:
-        imp_a = float(score_to_imp(score_2 - score_1))
-    else:
-        imp_a = float(score_to_imp(score_1 - score_2))
+    imp_a = float(score_to_imp(score_1 - score_2))
 
     # Label reflects actual opener/overcaller seats (dealer-dependent)
     opener_str     = f"{PLAYER_SHORT[dealer]}{PLAYER_SHORT[(dealer+2)%4]}"
@@ -701,9 +777,17 @@ def main():
                                             next(iter(_fallback_bn_sd.values())).shape[0])
 
     def _attach_belief(model, model_path, model_label):
-        """Attach BeliefNet to a model if it's 667-dim."""
+        """Attach BeliefNet to a model if it's 667-dim or ReFine.
+
+        ReFine models (is_refine=True) have obs_dim=571 but still need a BeliefNet
+        for the belief_96 adapter input.  Their BeliefNet is embedded in the
+        sl_base_bca_refine.pt checkpoint under the 'belief_net' key.
+        """
+        is_refine_model = getattr(model, '_is_refine', False)
         _obs_dim = getattr(getattr(model, 'config', None), 'obs_dim', OBS_DIM)
-        if _obs_dim != BELIEF_OBS_DIM:
+
+        # Non-BCA and non-ReFine: no BeliefNet needed
+        if _obs_dim != BELIEF_OBS_DIM and not is_refine_model:
             model._belief_net = None
             return
 
@@ -717,8 +801,16 @@ def main():
             _bn.load_state_dict({k: v.to(device) for k, v in _bn_sd.items()})
             _bn.eval()
             model._belief_net = _bn
+            _mode_tag = ' (ReFine)' if is_refine_model else ''
             print(f"[Bid Inspector] {model_label}: BeliefNet from checkpoint "
-                  f"(co-evolved, hidden={_bn_hidden})")
+                  f"(co-evolved{_mode_tag}, hidden={_bn_hidden})")
+            return
+
+        if is_refine_model:
+            # ReFine model without embedded BeliefNet — prior only
+            model._belief_net = None
+            print(f"[Bid Inspector] ⚠️  {model_label}: ReFine model but no BeliefNet in "
+                  f"checkpoint. Will use prior features (0.25).")
             return
 
         # Fallback to --belief_checkpoint

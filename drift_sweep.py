@@ -73,9 +73,13 @@ def run_single(mode: str, lam: float, seed: int, args) -> dict:
         "--eval_deals", str(args.eval_deals),
         "--kl_lambda", str(lam),
         "--save_dir", save_dir,
-        # Drift experiment: only Agent A, no B or C
-        "--agent_a_only",
     ]
+
+    # Select which agent to train
+    if getattr(args, "agent_b_only", False):
+        cmd.append("--agent_b_only")
+    else:
+        cmd.append("--agent_a_only")
     
     if mode == "571":
         cmd.append("--no_belief_conditioned")
@@ -121,8 +125,13 @@ def run_single(mode: str, lam: float, seed: int, args) -> dict:
                 print(f"  {line}")
     else:
         # Extract key metrics from report
-        a_vs_sl = report.get("a_vs_sl_imp", "?")
-        print(f"  ✅ Done in {elapsed:.0f}s  A vs SL: {a_vs_sl} IMP")
+        _b_only = getattr(args, "agent_b_only", False)
+        if _b_only:
+            vs_sl = report.get("b_vs_sl_imp", "?")
+            print(f"  ✅ Done in {elapsed:.0f}s  B vs SL: {vs_sl} IMP")
+        else:
+            vs_sl = report.get("a_vs_sl_imp", "?")
+            print(f"  ✅ Done in {elapsed:.0f}s  A vs SL: {vs_sl} IMP")
     
     return run_result
 
@@ -154,6 +163,9 @@ def main():
                         help="Quick mode for debugging")
     parser.add_argument("--verbose", action="store_true",
                         help="Show subprocess output")
+    parser.add_argument("--agent_b_only", action="store_true",
+                        help="Train Agent B (MAPPO+BCA+r_info) instead of Agent A. "
+                             "For r_info experiments.")
     args = parser.parse_args()
     
     if args.out_dir is None:
@@ -202,12 +214,16 @@ def main():
     for r in all_results:
         by_lambda[r["lambda"]].append(r)
     
+    _b_only = getattr(args, "agent_b_only", False)
+    _imp_key = "b_vs_sl_imp" if _b_only else "a_vs_sl_imp"
+    _agent_label = "B" if _b_only else "A"
+
     summary_table = []
     for lam in sorted(by_lambda.keys()):
         runs = by_lambda[lam]
         imps = []
         for r in runs:
-            imp = r.get("report", {}).get("a_vs_sl_imp")
+            imp = r.get("report", {}).get(_imp_key)
             if imp is not None:
                 imps.append(imp)
         
@@ -229,7 +245,7 @@ def main():
         status = (f"{entry['mean_imp']:+.3f} ± {entry['std_imp']:.3f}"
                   if entry['mean_imp'] is not None else "NO DATA")
         print(f"  λ={lam:.1f}  n={entry['n_seeds']}  "
-              f"A vs SL: {status} IMP")
+              f"{_agent_label} vs SL: {status} IMP")
     
     print(f"\n  Total time: {total_time/3600:.1f} hours")
     
