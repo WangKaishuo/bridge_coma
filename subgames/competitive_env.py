@@ -17,10 +17,14 @@ Competitive Subgame Environment  (重构版)
 4. rule_based_bc_data：生成 ~5k 局 competitive 规则牌数据用于 BC 预热，
    不依赖外部 WBridge5 数据集。
 
+5. (P123 修复) play_mixed 的策略命名由 ns_policy / ew_policy 更名为
+   opener_policy / overcaller_policy 彻底消除语义误导。并在 cross_evaluate
+   增加了 dealer % 2 的物理座位纠正逻辑。
+
 环境特点:
     - 四方都参与决策（竞争激烈）
     - 1S 争叫（非跳叫），双方牌力接近
-    - 支持 play_mixed：NS / EW 由不同 agent 控制
+    - 支持 play_mixed：Opener / Overcaller 阵营由不同 agent 控制
 """
 
 from __future__ import annotations
@@ -538,19 +542,27 @@ class CompetitiveSubgameEnv:
         self,
         hands:         np.ndarray,
         dd_table:      np.ndarray,
-        ns_policy:     Callable[[Dict, int, list], int],
-        ew_policy:     Callable[[Dict, int, list], int],
+        opener_policy:     Optional[Callable[[Dict, int, list], int]] = None,
+        overcaller_policy: Optional[Callable[[Dict, int, list], int]] = None,
         vulnerability: Tuple[bool, bool] = (False, False),
         dealer:        Optional[int] = None,
+        **kwargs
     ) -> Tuple[Optional[Contract], int, List[int]]:
         """
-        混合对抗: NS / EW 由不同策略控制.
+        混合对抗: Opener / Overcaller 阵营由不同策略控制.
 
         opener_seats  = {dealer, (dealer+2)%4}  (开叫方阵营)
         overcall_seats= {(dealer+1)%4, (dealer+3)%4}
-
-        NS/EW 语义保持: 开叫方阵营 = NS policy, 争叫方阵营 = EW policy.
         """
+        # 向下兼容旧的 kwargs: ns_policy / ew_policy 以防外部如 subgame_trainer 仍在使用
+        if opener_policy is None:
+            opener_policy = kwargs.get('ns_policy')
+        if overcaller_policy is None:
+            overcaller_policy = kwargs.get('ew_policy')
+        
+        if opener_policy is None or overcaller_policy is None:
+            raise ValueError("Must provide opener_policy and overcaller_policy")
+
         dealer = dealer if dealer is not None else self.dealer
         self.dealer = dealer  # P93 fix: policy closures read env.dealer for encode_obs_flat
         self._vulnerability = vulnerability  # P122: policy closures read env._vulnerability
@@ -572,9 +584,9 @@ class CompetitiveSubgameEnv:
         while not done:
             player = inner.state.current_player
             if player in opener_seats:
-                action = ns_policy(obs, player, hist[:])
+                action = opener_policy(obs, player, hist[:])
             else:
-                action = ew_policy(obs, player, hist[:])
+                action = overcaller_policy(obs, player, hist[:])
 
             if not inner._is_valid_action(action):
                 action = BID_PASS
@@ -604,27 +616,33 @@ class CrossEvalResult:
 
 def cross_evaluate(
     env:               "CompetitiveSubgameEnv",
-    agent_a_ns_policy: Callable,
-    agent_a_ew_policy: Callable,
-    agent_b_ns_policy: Callable,
-    agent_b_ew_policy: Callable,
+    agent_a_opener_policy:     Optional[Callable] = None,
+    agent_a_overcaller_policy: Optional[Callable] = None,
+    agent_b_opener_policy:     Optional[Callable] = None,
+    agent_b_overcaller_policy: Optional[Callable] = None,
     num_deals:         int = 500,
+    **kwargs
 ) -> CrossEvalResult:
     """
     交叉对抗评估（双桌 IMP，A 视角）.
 
     桌1: A=开叫方阵营, B=争叫方阵营 → score_1
     桌2: B=开叫方阵营, A=争叫方阵营 → score_2
-    IMP = score_to_imp(score_1 - score_2)  (A 视角: 正=A赢)
+    IMP = 根据 dealer 座位自动判断并进行翻转（保证 A 视角为正向）
 
     统计检验: Wilcoxon signed-rank（IMP 重尾非参）.
     dealer 轮换：每局 generate_deal() 后从 env._sampled_dealer 读取。
-
-    P109 fix: set env._current_hands and env._eval_hands_rm before play_mixed
-    so that policy closures in evaluate_head_to_head can call _encode_for_actor
-    with the correct hands (not None). Without this, all_hands=None → zero obs
-    → all IMPs are 0.000, win_rate=0.0%, Wilcoxon p=nan.
     """
+    # 兼容通过 kwargs 传入旧版本 ns_policy/ew_policy 的代码
+    if agent_a_opener_policy is None:
+        agent_a_opener_policy = kwargs.get('agent_a_ns_policy')
+    if agent_a_overcaller_policy is None:
+        agent_a_overcaller_policy = kwargs.get('agent_a_ew_policy')
+    if agent_b_opener_policy is None:
+        agent_b_opener_policy = kwargs.get('agent_b_ns_policy')
+    if agent_b_overcaller_policy is None:
+        agent_b_overcaller_policy = kwargs.get('agent_b_ew_policy')
+
     from scipy.stats import wilcoxon
     from networks.policy_net import convert_hands_suit_to_rank
 
@@ -644,22 +662,20 @@ def cross_evaluate(
 
         _, score_1, _ = env.play_mixed(
             hands, dd_table,
-            ns_policy=agent_a_ns_policy,
-            ew_policy=agent_b_ew_policy,
+            opener_policy=agent_a_opener_policy,
+            overcaller_policy=agent_b_overcaller_policy,
             vulnerability=vul, dealer=dealer)
         _, score_2, _ = env.play_mixed(
             hands, dd_table,
-            ns_policy=agent_b_ns_policy,
-            ew_policy=agent_a_ew_policy,
+            opener_policy=agent_b_opener_policy,
+            overcaller_policy=agent_a_overcaller_policy,
             vulnerability=vul, dealer=dealer)
 
-        # P123: score_1/score_2 are NS-perspective (physical seats).
-        # ns_policy controls opener_seats = {dealer, dealer+2}.
-        # When dealer ∈ {N,S}: opener = NS physical seats → score_1 reflects A's opener play directly.
-        # When dealer ∈ {E,W}: opener = EW physical seats → ns_policy controls EW,
-        #   so A playing well → EW wins → NS score LOW → score_1 < 0.
-        #   Must flip sign so IMP > 0 means "A is better".
-        if dealer % 2 == 1:  # dealer is E or W
+        # P123 修复: score_1/score_2 永远返回物理 NS 视角
+        # 当 dealer 是 E 或 W 时，开叫方在物理 EW，A (桌1开叫方) 打得好会导致
+        # 桌 1 物理 EW 分数高 -> 物理 NS 分数低 -> score_1 为负或更小。
+        # 此时需要将公式翻转。
+        if dealer % 2 == 1:
             imps.append(float(score_to_imp(score_2 - score_1)))
         else:
             imps.append(float(score_to_imp(score_1 - score_2)))

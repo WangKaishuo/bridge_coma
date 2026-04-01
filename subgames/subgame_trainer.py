@@ -28,6 +28,8 @@ Subgame Trainer  (新架构版)
 from __future__ import annotations
 
 import numpy as np
+import random
+import statistics
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,9 +103,16 @@ class SubgameConfig:
     info_reward_weight:  float = 0.2         # P87b: 占 IMP 方差的比例 (0.02→0.2)
 
     # ── FSP ─────────────────────────────────────────────────────────────────
-    fsp_pool_size:    int   = 10          # Kita et al. 2024
+    fsp_pool_size:    int   = 0           # P126: 0 = unlimited (was 10). FIFO cap removed.
     fsp_add_interval: int   = 2           # 每 N 轮将 actor 存入 pool
     self_play:        bool  = False       # P115: True = pure self-play (opponent = current agent, skip FSP)
+
+    # ── P126: FSP Quality Gate + Weighted SL Sampling ──────────────────────
+    fsp_quality_gate:          bool  = True   # Enable quality gate before pool insertion
+    fsp_gate_eval_deals:       int   = 200    # Deals to play vs SL for quality evaluation
+    fsp_gate_max_auction_len:  int   = 7      # Reject if median auction length > this (SL median=6)
+    fsp_gate_max_double_rate:  float = 0.60   # Reject if doubled contract rate > this (SL ≈ 53%)
+    fsp_sl_sample_prob:        float = 0.30   # Minimum probability of sampling SL permanent member
 
     # ── Belief Net Update ────────────────────────────────────────────────
     # P93: on-policy update (epochs=8, lr=5e-5) — caused catastrophic
@@ -378,7 +387,9 @@ class SubgameTrainer:
         self.reward_stats: RunningStats = reward_stats or RunningStats()
 
         # ── FSP pool ───────────────────────────────────────────────────────
-        self.fsp_pool = FSPPool(max_size=config.fsp_pool_size)
+        # P126: fsp_pool_size=0 → unlimited (use 999999 as practical max)
+        _pool_max = config.fsp_pool_size if config.fsp_pool_size > 0 else 999999
+        self.fsp_pool = FSPPool(max_size=_pool_max)
 
         # ── KL anchor（BC checkpoint，由外部 set_bc_anchor 设置）──────────
         self.bc_actors: Optional[Dict[int, MLPPolicyNetwork]] = None
@@ -523,22 +534,117 @@ class SubgameTrainer:
     # ======================================================================
 
     def _maybe_add_to_fsp(self, round_idx: int):
-        """每 fsp_add_interval 轮将当前 actor 存入 pool."""
-        if (self.config.fsp_pool_size > 0
-                and round_idx % self.config.fsp_add_interval == 0):
-            self.fsp_pool.add(self.agent)
-            print(f"  [FSP] Pool size: {len(self.fsp_pool)}")
+        """
+        P126: Quality-gated FSP pool insertion.
+
+        Every fsp_add_interval rounds, evaluate the current snapshot vs SL
+        on a small number of deals. Only add to pool if:
+          - median auction length <= fsp_gate_max_auction_len
+          - doubled contract rate  <= fsp_gate_max_double_rate
+
+        This prevents chaos bidding snapshots from polluting the pool.
+        """
+        if self.config.self_play:
+            return
+        if round_idx % self.config.fsp_add_interval != 0:
+            return
+
+        cfg = self.config
+
+        # ── Quality gate evaluation ──────────────────────────────────────
+        if cfg.fsp_quality_gate and self._fsp_seeded:
+            # Use the SL permanent member (first entry) as evaluation opponent
+            sl_sd = self.fsp_pool._permanent[0] if self.fsp_pool._permanent else None
+            if sl_sd is not None:
+                gate_ok, gate_info = self._fsp_quality_eval(sl_sd, cfg.fsp_gate_eval_deals)
+                med_len = gate_info['median_auction_len']
+                dbl_rate = gate_info['double_rate']
+                if not gate_ok:
+                    print(f"  [FSP] Quality gate REJECTED: "
+                          f"median_len={med_len:.1f} (max={cfg.fsp_gate_max_auction_len}), "
+                          f"dbl_rate={dbl_rate:.2f} (max={cfg.fsp_gate_max_double_rate:.2f}). "
+                          f"Snapshot NOT added to pool.")
+                    return
+                else:
+                    print(f"  [FSP] Quality gate PASSED: "
+                          f"median_len={med_len:.1f}, dbl_rate={dbl_rate:.2f}")
+
+        self.fsp_pool.add(self.agent, belief_net=self.belief_net)
+        print(f"  [FSP] Pool size: {len(self.fsp_pool)}")
+
+    def _fsp_quality_eval(self, sl_sd: dict, num_deals: int) -> tuple:
+        """
+        P126: Quick evaluation of current agent vs SL to check for chaos bidding.
+
+        Plays num_deals deals with current agent (NS) vs SL (sl_sd as EW opponent).
+        Measures auction length and doubled contract frequency.
+        Returns (passed: bool, info: dict).
+        """
+        auction_lengths = []
+        doubled_count = 0
+
+        # Collect episodes using current agent vs SL opponent
+        eps, _ = self._collect_episodes_batch(
+            num_deals, train_side='NS', fsp_sd=sl_sd,
+            batch_size=min(32, num_deals),
+            use_belief_prior=False)
+
+        for ep in eps:
+            # Each step in ep is one bid AFTER the fixed prefix (1H-1S).
+            # Auction length = prefix (2) + number of steps in episode.
+            auction_lengths.append(len(ep) + 2)
+
+            # Detect doubled contract: in bridge, auction ends with 3 consecutive
+            # passes. The contract is doubled if the last non-Pass action before
+            # the terminal passes was BID_DOUBLE (=1), and not followed by
+            # BID_REDOUBLE (=2).
+            actions = [step['action'] for step in ep]
+            # Strip trailing passes to find the last substantive bid
+            last_substantive = None
+            for a in reversed(actions):
+                if a != BID_PASS:
+                    last_substantive = a
+                    break
+            if last_substantive == 1 or last_substantive == 2:  # BID_DOUBLE or BID_REDOUBLE
+                doubled_count += 1
+
+        if not auction_lengths:
+            return True, {'median_auction_len': 0, 'double_rate': 0, 'num_deals': 0}
+
+        med_len = statistics.median(auction_lengths)
+        dbl_rate = doubled_count / len(auction_lengths)
+
+        cfg = self.config
+        passed = (med_len <= cfg.fsp_gate_max_auction_len
+                  and dbl_rate <= cfg.fsp_gate_max_double_rate)
+
+        return passed, {
+            'median_auction_len': med_len,
+            'double_rate': dbl_rate,
+            'num_deals': len(auction_lengths),
+        }
 
     def _apply_fsp_opponent(self):
         """
-        从 pool 中随机采样一个历史 checkpoint 作为 EW 对手.
+        P126: Weighted FSP sampling with SL minimum probability.
 
-        只在 rollout 时临时替换 EW actor；
-        训练时恢复为当前 agent（EW 不训练，只是采样对手）。
-        返回 sampled state_dict 或 None（pool 为空时用 self）。
+        With probability fsp_sl_sample_prob, always sample the SL permanent
+        member. Otherwise, uniform random from the full pool (permanent + FIFO).
+        This ensures the agent always trains against SL at least 30% of the time,
+        preventing overfitting to a static set of degenerate opponents.
         """
         if self.fsp_pool.is_empty():
             return None
+
+        cfg = self.config
+        # P126: weighted sampling — SL permanent member gets guaranteed floor
+        if (cfg.fsp_sl_sample_prob > 0
+                and self.fsp_pool._permanent
+                and np.random.rand() < cfg.fsp_sl_sample_prob):
+            # Sample from permanent members (typically just SL)
+            return random.choice(self.fsp_pool._permanent)
+
+        # Otherwise uniform from full pool
         return self.fsp_pool.sample()
 
     # ======================================================================
@@ -1125,8 +1231,9 @@ class SubgameTrainer:
         self._obs_cache.clear()
         self._obs_state_cache.clear()
 
-        import time as _t2
-        _dbg = {'encode': 0.0, 'belief': 0.0, 'forward': 0.0, 'step_exec': 0.0, 'n_ts': 0}
+        # P125: Full Disclosure — 取对手的 BeliefNet（convention card）
+        fsp_bn = self._get_fsp_belief_net(fsp_sd) if fsp_sd is not None else None
+
 
         # ── 初始化 batch_size 个独立环境 ────────────────────────────────
         envs = [CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
@@ -1170,7 +1277,6 @@ class SubgameTrainer:
             active = [i for i in range(batch_size) if not slot_done[i]]
             if not active:
                 break
-            _dbg['n_ts'] += 1
 
             # 按 actor 分组
             from collections import defaultdict
@@ -1214,7 +1320,6 @@ class SubgameTrainer:
                                      role.replace('actor','critic'))
 
                 # Step 1: 批量构造 571-dim base obs
-                _t2a = _t2.time()
                 obs571_batch = np.stack([
                     self._encode_for_actor(
                         slot_obs[i], slot_dealer[i], slot_hist[i],
@@ -1223,16 +1328,24 @@ class SubgameTrainer:
                         use_prior=True,
                         vulnerability=envs[i]._vulnerability)[:OBS_DIM]
                     for i in slots])
-                _dbg['encode'] += _t2.time() - _t2a
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
 
                 # Step 2: 一次批量 BeliefNet forward（BCA 模式且非 prior）
-                _t2b = _t2.time()
+                # P125: Full Disclosure — is_train决定own/opponent bn方向
+                #   训练方(is_train=True): own=self.belief_net, opponent=fsp_bn
+                #   FSP对手(is_train=False): own=fsp_bn, opponent=self.belief_net
                 if self.config.belief_conditioned and not use_belief_prior:
                     players_batch = [envs[i].current_player for i in slots]
+                    if is_train:
+                        _own_bn = self.belief_net
+                        _opp_bn = fsp_bn
+                    else:
+                        _own_bn = fsp_bn
+                        _opp_bn = self.belief_net
                     bf_batch = self._get_belief_features_batch(
-                        obs571_batch, players_batch)   # (B, 96)
+                        obs571_batch, players_batch,
+                        belief_net=_own_bn, opponent_bn=_opp_bn)   # (B, 96)
                     flat_batch = np.concatenate([obs571_batch, bf_batch], axis=1)  # (B, 667)
                 elif self.config.belief_conditioned:
                     prior = make_belief_features_prior()  # (96,)
@@ -1241,17 +1354,14 @@ class SubgameTrainer:
                          np.tile(prior, (len(slots), 1))], axis=1)   # (B, 667)
                 else:
                     flat_batch = obs571_batch  # (B, 571)
-                _dbg['belief'] += _t2.time() - _t2b
 
                 flat_t  = torch.tensor(flat_batch,  dtype=torch.float32).to(self.device)
                 legal_t = torch.tensor(legal_batch, dtype=torch.float32).to(self.device)
                 ah_t    = torch.tensor(ah_batch,    dtype=torch.float32).to(self.device)
 
-                _t2c = _t2.time()
                 with torch.no_grad():
                     actions, log_probs, _ = actor.get_action(flat_t, legal_t)
                     values = critic(flat_t, ah_t)
-                _dbg['forward'] += _t2.time() - _t2c
 
                 for j, i in enumerate(slots):
                     actions_map[i] = (actions[j].item(), log_probs[j].cpu(),
@@ -1315,9 +1425,7 @@ class SubgameTrainer:
                         all_hands[(player + 1) % 4])
 
                 # env.step() gives oracle reward; we overwrite with dual-table IMP after batch
-                _t2d = _t2.time()
                 obs_next, reward, done, info = envs[i].step(action)
-                _dbg['step_exec'] += _t2.time() - _t2d
                 step['reward'] = reward
                 step['done']   = done
                 slot_ep[i].append(step)
@@ -1338,13 +1446,7 @@ class SubgameTrainer:
                     if collected < num_deals:
                         slot_obs[i] = _reset(i)
 
-        _tot = sum(v for k,v in _dbg.items() if k != 'n_ts')
-        print(f"  [DBG rollout] timesteps={_dbg['n_ts']}  "
-              f"encode={_dbg['encode']:.1f}s  "
-              f"belief_fwd={_dbg['belief']:.1f}s  "
-              f"actor_fwd={_dbg['forward']:.1f}s  "
-              f"env_step={_dbg['step_exec']:.1f}s  "
-              f"other={max(0,_tot - _dbg['encode'] - _dbg['belief'] - _dbg['forward'] - _dbg['step_exec']):.1f}s")
+
 
         # ── P82: 每个player的最后一步都标记done=True并赋对应reward ────────
         # 旧逻辑只给env.step()返回done=True的那个step（最后行动者）赋reward，
@@ -1456,6 +1558,9 @@ class SubgameTrainer:
         if use_fsp_opponent and fsp_sd is None and not self.fsp_pool.is_empty():
             fsp_sd = self.fsp_pool.sample()
 
+        # P125: Full Disclosure — 取对手的 BeliefNet（convention card）
+        fsp_bn = self._get_fsp_belief_net(fsp_sd) if fsp_sd is not None else None
+
         for _ in range(num_deals):
             hands, dd_table = self.env.generate_deal()
             dealer = self.env.dealer   # set by generate_deal() via _sampled_dealer
@@ -1473,10 +1578,24 @@ class SubgameTrainer:
                 player    = self.env.current_player
                 all_hands = self.env._current_hands.copy()
 
+                overcaller_seats = {(dealer + 1) % 4, (dealer + 3) % 4}
+                is_opponent = (player in overcaller_seats)
+
+                # P125: Full Disclosure
+                # opener(训练方): partner=own_bn, RHO(overcaller)=fsp_bn
+                # overcaller(FSP对手): partner=fsp_bn, RHO(opener)=own_bn
+                if is_opponent and fsp_bn is not None:
+                    _own_bn = fsp_bn          # FSP对手自己的约定
+                    _opp_bn = self.belief_net  # opener的约定（训练agent）
+                else:
+                    _own_bn = self.belief_net  # 训练agent自己的约定
+                    _opp_bn = fsp_bn           # FSP对手的约定
+
                 # 编码 flat obs
                 flat_obs      = self._encode_for_actor(
                     obs, dealer, history_int, player,
-                    all_hands=all_hands)
+                    all_hands=all_hands,
+                    belief_net=_own_bn, opponent_bn=_opp_bn)
                 legal_actions = obs['legal_actions'].copy()
 
                 # 选 actor: FSP 对手 or 当前 agent
@@ -1487,8 +1606,6 @@ class SubgameTrainer:
                 ah_t    = torch.tensor(all_hands,      dtype=torch.float32
                                        ).unsqueeze(0).to(self.device)
 
-                overcaller_seats = {(dealer + 1) % 4, (dealer + 3) % 4}
-                is_opponent = (player in overcaller_seats)
                 if is_opponent and fsp_sd is not None:
                     # 临时加载 FSP snapshot 到 EW actor（只用于 get_action）
                     actor = self._get_fsp_actor(player, fsp_sd)
@@ -1573,6 +1690,33 @@ class SubgameTrainer:
             self._fsp_cache_key = cache_key
         return self._fsp_actor_cache[role]
 
+    def _get_fsp_belief_net(self, fsp_sd: dict) -> Optional[BeliefNetwork]:
+        """
+        P125: 从 FSP snapshot 中取出 BeliefNet（Full Disclosure convention card）.
+        缓存在 _fsp_bn_cache 避免每步重建。
+        返回 None 表示 snapshot 中无 BeliefNet（旧格式兼容，fallback 到 own）。
+        """
+        if fsp_sd is None:
+            return None
+        bn_sd = fsp_sd.get('belief_net', None)
+        if bn_sd is None:
+            return None  # 旧 snapshot 无 BeliefNet，fallback 到 own
+        cache_key = str(id(fsp_sd)) + '_bn'
+        if not hasattr(self, '_fsp_bn_cache'):
+            self._fsp_bn_cache = {}
+        if cache_key not in self._fsp_bn_cache:
+            from networks.belief_net import BeliefNetwork
+            hidden = self.belief_net.trunk[0].out_features if self.belief_net else 1024
+            bn = BeliefNetwork(hidden_dim=hidden).to(self.device)
+            bn.load_state_dict({k: v.to(self.device) for k, v in bn_sd.items()})
+            bn.eval()
+            self._fsp_bn_cache[cache_key] = bn
+            # 清理过期缓存，最多保留3个（FSP pool最多同时用到1个）
+            if len(self._fsp_bn_cache) > 3:
+                oldest = next(iter(self._fsp_bn_cache))
+                del self._fsp_bn_cache[oldest]
+        return self._fsp_bn_cache[cache_key]
+
     def _store_episodes(self, episodes: List[List[dict]]):
         """将 episode list 存入各 player 的 buffer."""
         for ep in episodes:
@@ -1609,29 +1753,24 @@ class SubgameTrainer:
         obs_571: np.ndarray,
         player: int,
         belief_net: Optional[BeliefNetwork] = None,
+        opponent_bn: Optional[BeliefNetwork] = None,
     ) -> np.ndarray:
         """
         P101: 获取单步 belief features (96,) 用于 actor 输入.
-
-        使用新版 BeliefNet API: get_probs(obs_571, target_pos).
-        obs_571 是 OpenSpiel observation_tensor()（公开叫牌历史）。
-
-        查询 belief_net 两次:
-          1. partner: target_pos = (player+2)%4
-          2. RHO:     target_pos = (player-1)%4
-
-        返回 partner (48) + RHO (48) = 96 维.
+        P125: Full Disclosure — partner 用自己的 BeliefNet，RHO 用对手的 BeliefNet。
 
         Args:
-            obs_571:    当前步的 571-dim OpenSpiel obs (np.ndarray)
-            player:     当前玩家 seat (0-3)
-            belief_net: 使用哪个 belief net (None=self.belief_net)
+            obs_571:     当前步的 571-dim OpenSpiel obs (np.ndarray)
+            player:      当前玩家 seat (0-3)
+            belief_net:  自己的 BeliefNet（理解 partner），None=self.belief_net
+            opponent_bn: 对手的 BeliefNet（理解 RHO，Full Disclosure），None=fallback到own
 
         Returns:
             belief_feats: (96,) float32 — [partner 48 | RHO 48]
         """
-        bn = belief_net or self.belief_net
-        if bn is None or not self.config.belief_conditioned:
+        own_bn = belief_net or self.belief_net
+        rho_bn = opponent_bn or own_bn  # P125: Full Disclosure fallback
+        if own_bn is None or not self.config.belief_conditioned:
             return make_belief_features_prior()
 
         partner = (player + 2) % 4
@@ -1642,8 +1781,8 @@ class SubgameTrainer:
             tp_partner = torch.tensor([partner], dtype=torch.long).to(self.device)
             tp_rho     = torch.tensor([rho],     dtype=torch.long).to(self.device)
 
-            partner_probs = bn.get_probs(obs_t, tp_partner)  # (1, 48)
-            rho_probs     = bn.get_probs(obs_t, tp_rho)      # (1, 48)
+            partner_probs = own_bn.get_probs(obs_t, tp_partner)  # (1, 48) own convention
+            rho_probs     = rho_bn.get_probs(obs_t, tp_rho)      # (1, 48) opponent convention card
 
         return torch.cat([partner_probs, rho_probs], dim=-1).squeeze(0).cpu().numpy()
 
@@ -1652,22 +1791,24 @@ class SubgameTrainer:
         obs_571_batch: np.ndarray,
         players: List[int],
         belief_net: Optional[BeliefNetwork] = None,
+        opponent_bn: Optional[BeliefNetwork] = None,
     ) -> np.ndarray:
         """
         P101: 批量获取 belief features (B, 96) 用于 actor 输入.
-
-        使用新版 BeliefNet API: get_probs(obs_571, target_pos).
+        P125: Full Disclosure — partner 用自己的 BeliefNet，RHO 用对手的 BeliefNet。
 
         Args:
             obs_571_batch: (B, 571) OpenSpiel obs batch
             players:       长度 B 的列表, 每个元素是当前玩家 seat
-            belief_net:    使用哪个 belief net (None=self.belief_net)
+            belief_net:    自己的 BeliefNet（partner），None=self.belief_net
+            opponent_bn:   对手的 BeliefNet（RHO，Full Disclosure），None=fallback到own
 
         Returns:
             belief_feats: (B, 96) float32 — [partner 48 | RHO 48]
         """
-        bn = belief_net or self.belief_net
-        if bn is None or not self.config.belief_conditioned:
+        own_bn = belief_net or self.belief_net
+        rho_bn = opponent_bn or own_bn  # P125: Full Disclosure fallback
+        if own_bn is None or not self.config.belief_conditioned:
             return np.tile(make_belief_features_prior(), (len(players), 1))
 
         partners = [(p + 2) % 4 for p in players]
@@ -1678,8 +1819,8 @@ class SubgameTrainer:
             tp_partner = torch.tensor(partners, dtype=torch.long).to(self.device)
             tp_rho     = torch.tensor(rhos,     dtype=torch.long).to(self.device)
 
-            partner_probs = bn.get_probs(obs_t, tp_partner)  # (B, 48)
-            rho_probs     = bn.get_probs(obs_t, tp_rho)      # (B, 48)
+            partner_probs = own_bn.get_probs(obs_t, tp_partner)  # (B, 48) own convention
+            rho_probs     = rho_bn.get_probs(obs_t, tp_rho)      # (B, 48) opponent convention card
 
         return torch.cat([partner_probs, rho_probs], dim=-1).cpu().numpy()
 
@@ -1691,6 +1832,7 @@ class SubgameTrainer:
         player: int,
         all_hands: Optional[np.ndarray] = None,
         belief_net: Optional[BeliefNetwork] = None,
+        opponent_bn: Optional[BeliefNetwork] = None,
         use_prior: bool = False,
         vulnerability: tuple = None,
     ) -> np.ndarray:
@@ -1777,9 +1919,11 @@ class SubgameTrainer:
             if use_prior:
                 bf = make_belief_features_prior()
             else:
-                # Pass the already-constructed 571-dim obs to BeliefNet (new API)
+                # P125: Full Disclosure — partner用own_bn，RHO用opponent_bn
                 bf = self._get_belief_features_single(
-                    flat, player, belief_net or self.belief_net)
+                    flat, player,
+                    belief_net=belief_net or self.belief_net,
+                    opponent_bn=opponent_bn)
             flat = append_belief_features(flat, bf)
         return flat
 
@@ -2046,7 +2190,7 @@ class SubgameTrainer:
 
         # P74: FSP Pool用BC checkpoint作为pool[0]
         if not self.config.self_play and not self._fsp_seeded and self.config.fsp_pool_size > 0:
-            self.fsp_pool.add_permanent(self.agent)  # P90: SL baseline永不淘汰
+            self.fsp_pool.add_permanent(self.agent, belief_net=self.belief_net)  # P90+P125: SL baseline永不淘汰，携带SAYC BeliefNet
             self._fsp_seeded = True
             print(f"  [FSP] Seeded pool with BC checkpoint as permanent (pool size: {len(self.fsp_pool)})")
         if self.config.self_play:
@@ -2079,7 +2223,6 @@ class SubgameTrainer:
             ns_eps, ns_rinfo = self._collect_episodes_batch(
                 n_deals, train_side='NS', fsp_sd=fsp_sd, batch_size=batch_sz,
                 use_belief_prior=_bw)
-            print(f"  [TIME] NS rollout:       {_time.time()-_t:6.1f}s")
 
             # 收集NS方的DDS regret用于reward_stats和日志（每局一个值）
             raw_ns_vals = []
@@ -2099,7 +2242,6 @@ class SubgameTrainer:
                     for step, b in zip(ep, bs):
                         step['reward'] += b
                         if b != 0.0: _ir_vals.append(b)
-            print(f"  [TIME] NS r_info bonus:  {_time.time()-_t:6.1f}s")
 
             # 存NS actors的数据并update
             _t = _time.time()
@@ -2114,7 +2256,6 @@ class SubgameTrainer:
             for p in (NORTH, SOUTH):
                 m = self._safe_update(p, rnd)
                 if m: ns_metrics[p] = m
-            print(f"  [TIME] NS PPO update:    {_time.time()-_t:6.1f}s")
 
             # ── 桌2: agent=EW, FSP=NS ──────────────────────────────────
             print(f"  [Table2/EW] Collecting {n_deals} deals (batch={batch_sz})...")
@@ -2122,7 +2263,6 @@ class SubgameTrainer:
             ew_eps, ew_rinfo = self._collect_episodes_batch(
                 n_deals, train_side='EW', fsp_sd=fsp_sd, batch_size=batch_sz,
                 use_belief_prior=_bw)
-            print(f"  [TIME] EW rollout:       {_time.time()-_t:6.1f}s")
 
             # 收集EW方的DDS regret（每局一个值）
             raw_ew_vals = []
@@ -2142,7 +2282,6 @@ class SubgameTrainer:
                     for step, b in zip(ep, bs):
                         step['reward'] += b
                         if b != 0.0: _ir_vals.append(b)
-            print(f"  [TIME] EW r_info bonus:  {_time.time()-_t:6.1f}s")
 
             # 存EW actors的数据并update
             _t = _time.time()
@@ -2157,14 +2296,12 @@ class SubgameTrainer:
             for p in (EAST, WEST):
                 m = self._safe_update(p, rnd)
                 if m: ew_metrics[p] = m
-            print(f"  [TIME] EW PPO update:    {_time.time()-_t:6.1f}s")
 
             # ── Belief Update: frozen (P96) or on-policy (P93/P95) ─────────
             _t = _time.time()
             if self.belief_net is not None and not self.config.freeze_belief:
                 bl = self.update_belief_on_policy(ns_eps + ew_eps)
                 if bl is not None: _bl_vals.append(bl)
-            print(f"  [TIME] belief update:    {_time.time()-_t:6.1f}s")
 
             # ── 日志 ────────────────────────────────────────────────────
             all_vals = raw_ns_vals + raw_ew_vals
@@ -2261,13 +2398,16 @@ class SubgameTrainer:
         if self.fsp_pool.is_empty():
             return None
 
-        fsp_sd = self.fsp_pool.latest()   # 最新的FSP checkpoint作为基准对手
-        env    = self.env
-        device = self.device
+        fsp_sd  = self.fsp_pool.latest()   # 最新的FSP checkpoint作为基准对手
+        fsp_bn  = self._get_fsp_belief_net(fsp_sd) if fsp_sd is not None else None
+        env     = self.env
+        device  = self.device
 
+        # P125: Full Disclosure — current用fsp_bn理解fsp叫品，fsp用self.belief_net理解current叫品
         def _current_policy(obs, player, history_int):
             flat   = self._encode_for_actor(obs, env.dealer, history_int, player,
-                                            env._current_hands)
+                                            env._current_hands,
+                                            belief_net=self.belief_net, opponent_bn=fsp_bn)
             flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
             legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(device)
             actor  = self.agent.get_actor(player)
@@ -2277,7 +2417,8 @@ class SubgameTrainer:
 
         def _fsp_policy(obs, player, history_int):
             flat   = self._encode_for_actor(obs, env.dealer, history_int, player,
-                                            env._current_hands)
+                                            env._current_hands,
+                                            belief_net=fsp_bn, opponent_bn=self.belief_net)
             flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
             legal  = torch.tensor(obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(device)
             role   = {0:'actor_n', 1:'actor_e', 2:'actor_s', 3:'actor_w'}[player]
@@ -2357,12 +2498,13 @@ class SubgameTrainer:
         num_deals: int = 500,
         label_self: str = "A",
         label_other: str = "B",
-        convention_sharing: bool = False,
+        convention_sharing: bool = True,   # P125: Full Disclosure by default
     ) -> dict:
         """
         A vs B 直接对战评估.
 
-        P98 Convention Card Protocol (convention_sharing=True):
+        P125: Full Disclosure enabled by default (convention_sharing=True).
+        Each side uses the opponent's BeliefNet to understand opponent bids.
           When self plays against other, each side's opponent gets access
           to the other's Belief Net — like reading the opponent's convention card.
           - self's NS uses other's Belief Net to understand other's EW bids
@@ -2373,27 +2515,20 @@ class SubgameTrainer:
 
         env = self.env; device = self.device
 
-        def _make_policy(trainer_, belief_net_for_opponents=None):
+        def _make_policy(trainer_, opponent_belief_net=None):
             """
-            Create a policy closure for an agent.
-
-            belief_net_for_opponents: if provided, this agent uses a DIFFERENT
-              belief net (the opponent's) to understand opponent bids.
-              In practice, in belief_conditioned mode:
-              - For understanding partner bids: use own belief_net (co-trained)
-              - For understanding opponent bids: use opponent's belief_net (convention card)
-
-              Simplification for now: use own belief_net for all obs encoding.
-              The convention card effect comes from the agent having been trained
-              WITH belief-conditioned input, making it naturally responsive to
-              belief quality. Full convention card sharing is a future extension.
+            P125: Full Disclosure policy closure.
+            - partner belief: trainer_自己的BeliefNet（共同约定）
+            - RHO belief: opponent_belief_net（对手的约定卡）
             """
-            bn = belief_net_for_opponents or trainer_.belief_net
+            own_bn = trainer_.belief_net
+            opp_bn = opponent_belief_net  # None时fallback到own（_get_belief_features_single内部处理）
             def _policy(obs, player, history_int):
                 _dealer = env.dealer
                 flat = trainer_._encode_for_actor(
                     obs, _dealer, history_int, player,
-                    env._current_hands, bn)
+                    env._current_hands,
+                    belief_net=own_bn, opponent_bn=opp_bn)
                 flat_t = torch.tensor(flat, dtype=torch.float32
                                       ).unsqueeze(0).to(device)
                 # P117: legal_mask from OpenSpiel state, actor by relative seat
@@ -2427,8 +2562,11 @@ class SubgameTrainer:
                 return action.item()
             return _policy
 
-        policy_self  = _make_policy(self)
-        policy_other = _make_policy(other_trainer)
+        # P125: Full Disclosure — convention_sharing=True时双方互传约定卡
+        _opp_bn_self  = other_trainer.belief_net if convention_sharing else None
+        _opp_bn_other = self.belief_net           if convention_sharing else None
+        policy_self  = _make_policy(self,          opponent_belief_net=_opp_bn_self)
+        policy_other = _make_policy(other_trainer, opponent_belief_net=_opp_bn_other)
 
         result = cross_evaluate(
             env,

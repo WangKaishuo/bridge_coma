@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Bidding Inspector — P105 (OpenSpiel-native observations)
 ==========================================================
@@ -42,6 +43,7 @@ Usage:
       --model1 results/agent_a.pt --type1 agent \
       --model2 results/sl_bca_refine_coevolved_a.pt --type2 sl \
       --data data/competitive_500k.npz --num_deals 5000 --ablate_belief
+"""
 
 from __future__ import annotations
 
@@ -164,10 +166,7 @@ def load_sl(path: str, device: str):
     if encoding == 'openspiel_667_refine':
         # ── ReFine mode: load frozen actor + adapter ──────────────────────────
         from networks.policy_net import OBS_DIM as _OD
-        try:
-            from sl_pretrain_bca import ReFineActor, BeliefAdapter
-        except ImportError:
-            from experiments.sl_pretrain_bca import ReFineActor, BeliefAdapter
+        from utils.sl_pretrain_bca import ReFineActor, BeliefAdapter
 
         hidden_dim  = ckpt.get('hidden_dim', 1024)
         bottleneck  = ckpt.get('bottleneck', 128)
@@ -319,6 +318,7 @@ def play_deal_sl_only(
 
 
 def _make_play_mixed_policy(model, hands_sm, dealer, device, belief_net=None,
+                            opponent_belief_net=None,
                             ablate_belief=False, vulnerability=None):
     """
     Build a (obs, player, history_int) -> action closure for play_mixed.
@@ -385,10 +385,11 @@ def _make_play_mixed_policy(model, hands_sm, dealer, device, belief_net=None,
                 else:
                     partner = (player + 2) % 4
                     rho     = (player - 1) % 4
+                    rho_bn  = opponent_belief_net or belief_net  # P125: Full Disclosure
                     with torch.no_grad():
                         bf_partner = belief_net.get_probs(
                             obs_t, torch.tensor([partner], dtype=torch.long, device=device))
-                        bf_rho     = belief_net.get_probs(
+                        bf_rho     = rho_bn.get_probs(
                             obs_t, torch.tensor([rho],     dtype=torch.long, device=device))
                     bf_t = torch.cat([bf_partner, bf_rho], dim=-1)  # (1, 96)
             else:
@@ -407,13 +408,15 @@ def _make_play_mixed_policy(model, hands_sm, dealer, device, belief_net=None,
                     bf = np.full(96, 0.25, dtype=np.float32)
                 else:
                     # P122: use ABSOLUTE seat for BeliefNet target_pos.
+                    # P125: Full Disclosure — RHO uses opponent's BeliefNet
                     partner = (player + 2) % 4
                     rho     = (player - 1) % 4
+                    rho_bn  = opponent_belief_net or belief_net  # P125
                     obs_t   = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(device)
                     with torch.no_grad():
                         bf_partner = belief_net.get_probs(
                             obs_t, torch.tensor([partner], dtype=torch.long, device=device))
-                        bf_rho     = belief_net.get_probs(
+                        bf_rho     = rho_bn.get_probs(
                             obs_t, torch.tensor([rho],     dtype=torch.long, device=device))
                     bf = torch.cat([bf_partner, bf_rho], dim=-1).squeeze(0).cpu().numpy()
                 flat = append_belief_features(flat, bf)  # (667,)
@@ -436,12 +439,14 @@ def play_deal(
     env,
     verbose=True,
     ablate_belief_model2=False,
+    no_full_disclosure=False,
 ):
     """
     真正的双桌对战:
-      桌1: Agent=NS(开叫方), SL=EW(争叫方) -> score_1
-      桌2: SL=NS(开叫方),    Agent=EW(争叫方) -> score_2
-      IMP = score_to_imp(score_1 - score_2)  (Agent 视角)
+      桌1: Agent=Opener(开叫方阵营), SL=Overcaller(争叫方阵营) -> score_1
+      桌2: SL=Opener(开叫方阵营),    Agent=Overcaller(争叫方阵营) -> score_2
+      IMP = score_to_imp(score_1 - score_2) (Dealer为NS时) 
+            或 score_to_imp(score_2 - score_1) (Dealer为EW时)
 
     和 cross_evaluate / evaluate_head_to_head 语义完全一致。
 
@@ -453,27 +458,39 @@ def play_deal(
                     (False, True),  (True, True)]
     vul = _vul_choices[np.random.randint(4)]
 
+    _agent_bn = getattr(agent, '_belief_net', None)
+    _sl_bn    = getattr(sl,    '_belief_net', None)
+    _opp_bn_agent = None if no_full_disclosure else _sl_bn
+    _opp_bn_sl    = None if no_full_disclosure else _agent_bn
     agent_policy = _make_play_mixed_policy(agent, hands_sm, dealer, device,
-                                           belief_net=getattr(agent, '_belief_net', None),
+                                           belief_net=_agent_bn,
+                                           opponent_belief_net=_opp_bn_agent,
                                            vulnerability=vul)
     sl_policy    = _make_play_mixed_policy(sl,    hands_sm, dealer, device,
-                                           belief_net=getattr(sl,    '_belief_net', None),
+                                           belief_net=_sl_bn,
+                                           opponent_belief_net=_opp_bn_sl,
                                            ablate_belief=ablate_belief_model2,
                                            vulnerability=vul)
 
-    # 桌1: Agent NS vs SL EW
+    # 桌1: Agent Opener vs SL Overcaller
     contract_1, score_1, hist_1 = env.play_mixed(
         hands_sm, dd_table,
-        ns_policy=agent_policy, ew_policy=sl_policy,
+        opener_policy=agent_policy, overcaller_policy=sl_policy,
         vulnerability=vul, dealer=dealer)
 
-    # 桌2: SL NS vs Agent EW
+    # 桌2: SL Opener vs Agent Overcaller
     contract_2, score_2, hist_2 = env.play_mixed(
         hands_sm, dd_table,
-        ns_policy=sl_policy, ew_policy=agent_policy,
+        opener_policy=sl_policy, overcaller_policy=agent_policy,
         vulnerability=vul, dealer=dealer)
 
-    imp = float(score_to_imp(score_1 - score_2))
+    # P123 修复：分数基于物理 NS。如果 Opener 在物理 EW（dealer 是 E 或 W），
+    # 那么 Agent 在桌 1 控制 EW 侧，Agent 打得好 -> EW 赢得多 -> NS 分数 score_1 越低。
+    # 此时应翻转 IMP 计算公式。
+    if dealer % 2 == 1:
+        imp = float(score_to_imp(score_2 - score_1))
+    else:
+        imp = float(score_to_imp(score_1 - score_2))
 
     opener_str     = f"{PLAYER_SHORT[dealer]}{PLAYER_SHORT[(dealer+2)%4]}"
     overcaller_str = f"{PLAYER_SHORT[(dealer+1)%4]}{PLAYER_SHORT[(dealer+3)%4]}"
@@ -501,12 +518,13 @@ def play_deal_ab(
     env,
     verbose=True,
     ablate_belief_model2=False,
+    no_full_disclosure=False,
 ):
     """
     Agent A vs Agent B 双桌对战:
-      桌1: A=NS,  B=EW  -> score_1  (NS视角)
-      桌2: B=NS,  A=EW  -> score_2  (NS视角)
-      IMP_A = score_to_imp(score_1 - score_2)  (A 视角)
+      桌1: A=Opener,  B=Overcaller  -> score_1  (NS视角)
+      桌2: B=Opener,  A=Overcaller  -> score_2  (NS视角)
+      IMP_A = 根据 dealer 翻转计算的真实 IMP_A
       IMP_B = -IMP_A                             (B 视角)
 
     与 evaluate_head_to_head 语义完全一致。
@@ -519,27 +537,37 @@ def play_deal_ab(
                     (False, True),  (True, True)]
     vul = _vul_choices[np.random.randint(4)]
 
+    _bn_a = getattr(agent_a, '_belief_net', None)
+    _bn_b = getattr(agent_b, '_belief_net', None)
+    _opp_bn_a = None if no_full_disclosure else _bn_b
+    _opp_bn_b = None if no_full_disclosure else _bn_a
     policy_a = _make_play_mixed_policy(agent_a, hands_sm, dealer, device,
-                                       belief_net=getattr(agent_a, '_belief_net', None),
+                                       belief_net=_bn_a,
+                                       opponent_belief_net=_opp_bn_a,
                                        vulnerability=vul)
     policy_b = _make_play_mixed_policy(agent_b, hands_sm, dealer, device,
-                                       belief_net=getattr(agent_b, '_belief_net', None),
+                                       belief_net=_bn_b,
+                                       opponent_belief_net=_opp_bn_b,
                                        ablate_belief=ablate_belief_model2,
                                        vulnerability=vul)
 
-    # 桌1: A=NS, B=EW
+    # 桌1: A=Opener, B=Overcaller
     contract_1, score_1, hist_1 = env.play_mixed(
         hands_sm, dd_table,
-        ns_policy=policy_a, ew_policy=policy_b,
+        opener_policy=policy_a, overcaller_policy=policy_b,
         vulnerability=vul, dealer=dealer)
 
-    # 桌2: B=NS, A=EW
+    # 桌2: B=Opener, A=Overcaller
     contract_2, score_2, hist_2 = env.play_mixed(
         hands_sm, dd_table,
-        ns_policy=policy_b, ew_policy=policy_a,
+        opener_policy=policy_b, overcaller_policy=policy_a,
         vulnerability=vul, dealer=dealer)
 
-    imp_a = float(score_to_imp(score_1 - score_2))
+    # P123 修复
+    if dealer % 2 == 1:
+        imp_a = float(score_to_imp(score_2 - score_1))
+    else:
+        imp_a = float(score_to_imp(score_1 - score_2))
 
     # Label reflects actual opener/overcaller seats (dealer-dependent)
     opener_str     = f"{PLAYER_SHORT[dealer]}{PLAYER_SHORT[(dealer+2)%4]}"
@@ -740,6 +768,9 @@ def main():
     parser.add_argument('--belief_checkpoint', default=None,
                         help='BeliefNet checkpoint (sl_base_bca.pt) for BCA models (667-dim). '
                              'Applied to all loaded models.')
+    parser.add_argument('--no_full_disclosure', action='store_true',
+                        help='Disable Full Disclosure (P125): each agent uses only own BeliefNet. '
+                             'Compare with default (Full Disclosure on) to quantify convention drift effect.')
     parser.add_argument('--ablate_belief', action='store_true',
                         help='Ablation: replace model2\'s BeliefNet output with uniform prior '
                              '(0.25). Model2 still uses 667-dim input but belief columns carry '
@@ -837,6 +868,8 @@ def main():
     print(f"[Bid Inspector] Loading deals: {args.data}")
     env = CompetitiveSubgameEnv(args.data)
     print(f"[Bid Inspector] Mode: {mode_str}")
+    if args.no_full_disclosure:
+        print(f"[Bid Inspector] ⚠️  NO FULL DISCLOSURE: each agent uses only own BeliefNet (convention drift measurement)")
     if args.ablate_belief:
         print(f"[Bid Inspector] ⚠️  ABLATION MODE: model2's belief features replaced with prior (0.25)")
     print()
@@ -875,7 +908,8 @@ def main():
             result = play_deal_ab(hands, dd_table, dealer,
                                   model1, model2, device, env,
                                   verbose=not args.quiet,
-                                  ablate_belief_model2=args.ablate_belief)
+                                  ablate_belief_model2=args.ablate_belief,
+                                  no_full_disclosure=args.no_full_disclosure)
             imps.append(result['imp_a'])
 
     # ── Summary ──────────────────────────────────────────────────────────────
@@ -892,6 +926,9 @@ def main():
     else:
         label1 = f"{args.type1.upper()}1"
         label2 = f"{args.type2.upper()}2"
+        if args.no_full_disclosure:
+            label1 += "(no-FD)"
+            label2 += "(no-FD)"
         if args.ablate_belief:
             label2 += "(ablated)"
         print(f"  {label1} vs {label2} CROSS-TABLE SUMMARY ({args.num_deals} deals)")

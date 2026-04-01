@@ -56,6 +56,15 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 41. **P124: SL_BCA(StageB) weakness diagnosed.** Stage B full fine-tune changes actor bidding pattern AND makes actor dependent on belief features. `SL vs SL_BCA = -1.1 IMP` is NOT convention card effect — it's negative transfer from Stage B training. The 4.1→1.8 IMP drop (Agent A vs SL → Agent A vs SL_BCA) is primarily pattern-change effect, confirmed by ablation (real vs prior ≈ 0 difference).
 42. **P124: SAYC BeliefNet belief output ≠ prior (L1 dist ≈ 0.137), and belief columns contribute ~24% of layer-0 activation.** Despite this, ablation has no effect on decisions. Investigation ongoing — likely related to cross-protocol OOD behavior during actual drifted-bid games (vs initial-position analysis).
 43. **P124: ReFine adapter gate converges to ≈0 on SAYC data.** Expected: plain SL already extracts all information from obs_571 that BeliefNet can provide. Belief features are redundant for SAYC SL. ReFine value appears only when co-evolved BeliefNet reads agent's own drifted protocol (see TODO).
+44. **P125 (CRITICAL): Full Disclosure implemented in training AND evaluation. ALL pre-P125 RL results are invalid.**
+    - **Core insight:** In bridge, Full Disclosure is mandatory — opponents have access to your convention card. Without it, measured IMP advantage conflates genuine strategy quality with hidden protocol advantage.
+    - **FSP pool now carries BeliefNet** (`fsp_pool.py`: `add/add_permanent/add_state_dict` all accept `belief_net=` param). Every snapshot stores actor weights + BeliefNet.
+    - **Rollout (training):** opener uses own BeliefNet for partner, FSP opponent's BeliefNet for RHO. Overcaller (FSP) uses own BeliefNet for partner, training agent's BeliefNet for RHO. Implemented via `_get_fsp_belief_net()` helper with LRU cache.
+    - **Evaluation:** `evaluate_head_to_head` default changed to `convention_sharing=True`. `bid_inspector.py` Full Disclosure on by default; use `--no_full_disclosure` to disable.
+    - **`[TIME]` and `[DBG rollout]` print statements removed** from `subgame_trainer.py`.
+    - **Convention drift measurement:** compare same agent matchup with/without `--no_full_disclosure`. Both agents trained under P125 → only evaluation condition changes → clean isolation of drift effect.
+    - **Agent vs SL IMP is NOT a clean drift measure.** SL actor was never trained with Full Disclosure; giving it agent's BeliefNet at eval time has no effect. Use agent vs agent + `--no_full_disclosure` instead.
+    - **571-dim baseline repositioned:** not for drift measurement, but to show convention drift is universal (agent exploits hidden protocol even without BCA framework).
 
 ---
 
@@ -77,15 +86,18 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 | P122: Vul randomization + BeliefNet save + target_pos fix | ✅ |
 | P123: `--agent_b_only` mode + `_sl_bc` bug fix | ✅ |
 | P124: Action encoding fix + ReFine adapter + SL_BCA diagnosis | ✅ |
+| P125: Full Disclosure in training + evaluation | ✅ |
 | 571-dim Agent A RL training (seed=100, 25 rounds) | ✅ Done |
-| 667-dim Agent A RL training (seed=100, 25 rounds) | ✅ Done |
-| 667-dim Agent B RL training (seed=100, 25 rounds, β=0.0) | ✅ Done |
-| Train `sl_base_bca_refine.pt` (ReFine, gate≈0) | ✅ Done |
+| 667-dim Agent A RL training (P125, seed=100, 25 rounds) | ✅ Done — +1.976 IMP vs SL |
+| 667-dim Agent B (β=0.05) RL training (P125, seed=100, 25 rounds) | ✅ Done — +0.637 IMP vs SL |
+| 667-dim Agent B (β=0.0) RL training (P125, seed=100) | ❌ TODO — needs rerun with P125 |
+| Train `sl_base_bca_refine.pt` (ReFine, gate≈0) | ✅ Done (negative result) |
 | **subgame_trainer.py performance optimization (P_OPT)** | ✅ Done |
-| **bid_inspector ReFine adapter support** | ⏳ TODO |
-| **Convention card with co-evolved BeliefNet (Route 2)** | ⏳ TODO |
+| **bid_inspector ReFine adapter support** | ⏳ Deprioritized (ReFine negative result) |
+| **Convention card with co-evolved BeliefNet (Route 2)** | ❌ Superseded by P125 |
+| **Convention drift measurement (`--no_full_disclosure`)** | ⏳ Pending |
 | **Multi-seed validation (5 seeds)** | ⏳ Pending |
-| **BCA core experiment (Agent A vs Agent B, r_info)** | ⏳ Pending |
+| **Complete P125 matchup table** | ⏳ Pending |
 
 ---
 
@@ -99,7 +111,7 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 | 667-dim Agent A | 25 | +1.491 ± 10.163 | 1.907 | — |
 | 667-dim Agent B (β=0.0) | 25 | +1.460 ± 10.204 | 1.940 | 2.505 |
 
-### Head-to-Head Results (bid_inspector, 5000 deals, seed=100)
+### Pre-P125 Results (invalid for paper, reference only)
 
 | Matchup | IMP (model1 perspective) | Wins/Losses/Ties |
 |---------|--------------------------|------------------|
@@ -107,17 +119,31 @@ $$r_{\text{info}} = I(\text{bid};\,\text{hand} \mid \text{partner}) - \beta \cdo
 | 667 Agent A vs SL | +4.105 ± 11.473 | 3003 / 1606 / 391 |
 | 667 Agent A vs SL_BCA(StageB) | +1.822 ± 10.557 | 2435 / 2322 / 243 |
 | 667 Agent A vs SL_BCA(ablated) | +1.864 ± 10.643 | 2423 / 2339 / 238 |
-| 667 Agent B vs SL | +3.753 ± 11.459 | 2942 / 1651 / 407 |
-| **667 Agent B vs Agent A** | **+0.678 ± 7.942** | **1110 / 833 / 3057** |
+| 667 Agent B (β=0) vs SL | +3.753 ± 11.459 | 2942 / 1651 / 407 |
+| 667 Agent B (β=0.05) vs SL | +3.651 ± 11.422 | 2904 / 1644 / 452 |
+| Agent B (β=0) vs Agent A | +0.678 ± 7.942 | 1110 / 833 / 3057 |
+| Agent B (β=0.05) vs Agent A | +0.692 ± 7.932 | 1138 / 840 / 3022 |
+| Agent B (β=0.05) vs Agent B (β=0) | +0.029 ± 7.376 | 870 / 814 / 3316 |
+| agentA vs SL_refine_A (real belief) | +3.551 ± 11.552 | 2912 / 1700 / 388 |
+| agentA vs SL_refine_A (ablated) | +4.652 ± 11.439 | 3091 / 1516 / 393 |
 | SL vs SL_BCA(StageB) | -1.105 ± 9.058 | 2077 / 2343 / 580 |
 
-### Key Findings
+### P125 Results (valid, seed=100)
 
-1. **r_info works: Agent B > Agent A (+0.678 IMP in direct H2H).** Information-theoretic reward shaping improves cooperative bidding quality.
-2. **Agent B vs SL (+3.753) < Agent A vs SL (+4.105).** B's more communicative bidding sacrifices some SL-exploit efficiency for partner coordination. This is expected: B optimizes for informativeness, not maximum exploitation of a fixed opponent.
-3. **SL_BCA(StageB) ablation ≈ 0 difference.** SAYC BeliefNet cannot interpret drifted bids (cross-protocol failure). The +4.1 → +1.8 drop is primarily pattern-change effect from Stage B full fine-tune, NOT convention card information.
-4. **SL_BCA(StageB) is weaker than plain SL (-1.1 IMP).** Stage B causes negative transfer.
-5. **ReFine adapter gate ≈ 0 on SAYC data.** Belief features are redundant when actor already sees full bidding history. ReFine correctly avoids negative transfer.
+| Matchup | IMP (model1 perspective) | Wins/Losses/Ties | Notes |
+|---------|--------------------------|------------------|-------|
+| Agent A (P125) vs SL | +1.976 ± 10.514 | — | Full Disclosure |
+| Agent A vs Agent B (β=0.05) | -1.070 ± 7.902 | 781 / 1254 / 2965 | Full Disclosure, B wins |
+| Agent A vs Agent B (β=0.05) no-FD | ⏳ TODO | — | Run with `--no_full_disclosure` |
+| Agent B (β=0) — all matchups | ❌ needs rerun | — | P125 rerun required |
+
+### Key Findings (P125)
+
+1. **Full Disclosure reduces agent vs SL advantage by ~2.1 IMP** (+4.1 → +2.0). This is the upper bound of convention drift effect when opponent has zero convention card capability.
+2. **Agent B (β=0.05) beats Agent A by 1.070 IMP under Full Disclosure.** Previously invisible under pre-P125 framework where β effect could not be measured.
+3. **β effect now measurable.** Pre-P125: agentB(β=0.05) vs agentB(β=0) = +0.029 (noise). P125 enables real measurement via `--no_full_disclosure` comparison.
+4. **571-dim baseline repositioned.** Not a drift measurement tool; demonstrates convention drift is universal — present even without BCA framework (+4.219 IMP with no convention card at all).
+5. **SL cannot benefit from opponent's convention card.** SL actor trained without Full Disclosure; giving it agent's BeliefNet at eval has no effect. Agent vs SL IMP is a secondary validity metric only.
 
 ---
 
@@ -299,6 +325,8 @@ python bid_inspector.py \
 - **Action encoding mismatch between sl_pretrain.py and sl_pretrain_bca.py (P124).** sl_base.pt uses `action-52` (Pass=0, 1C=1). sl_pretrain_bca.py used `openspiel_raw_to_ours` (Pass=0, Double=1, Redouble=2, 1C=3). Off by 2 for all non-pass bids. Stage B legacy masked the bug via full fine-tune; ReFine exposed it.
 - **Zero-init adapter trap (P124).** If both `up.weight=0` AND `gate=0`, gradient is zero everywhere (double dead zone). Fix: only zero-init gate; use Xavier for up. Gate=0 alone guarantees zero initial output.
 - **Belief features are redundant for SAYC SL.** ReFine gate converges to ≈0 on SAYC data: plain SL already extracts all useful information from obs_571 (full bidding history). Belief features add value only when BeliefNet reads a protocol that obs alone cannot decode.
+- **Full Disclosure must be part of training, not just evaluation.** Giving a trained agent an opponent's BeliefNet at eval time only works if the agent was trained expecting that information. SL actors trained without Full Disclosure cannot utilise opponent's convention card. This is why ReFine failed as a convention card mechanism.
+- **Convention drift measurement requires agent vs agent, not agent vs SL.** SL cannot utilise the convention card, so agent vs SL IMP is not sensitive to Full Disclosure. Use agent vs agent with `--no_full_disclosure` flag instead.
 - **r_info trades SL-exploit for partner coordination.** Agent B > Agent A in H2H (+0.678), but Agent B < Agent A vs SL (-0.35). Communicative bidding helps partners but is "wasted" on an SL opponent that can't interpret the signals.
 - **Dealing order matters for obs.** OpenSpiel SAYC trajectories use interleaved dealing, not consecutive per-player.
 - **Always use `game(dealer=0)` for inference.** SL trained on dealer=0 only. P122 adds `dealer_vul`/`non_dealer_vul` params to the game instance.
@@ -337,35 +365,46 @@ for i in range(13):
 
 ## ⏳ TODO (Next Session)
 
-### TODO 1: bid_inspector ReFine adapter support
-`bid_inspector.py` 的 `_make_play_mixed_policy` 需要支持 ReFine 模式的 SL 对手。当前逻辑把 belief features 拼接到 571-dim obs 构成 667-dim 输入喂给 `MLPPolicyNetwork`。ReFine 模式需要分开传 obs_571 和 belief_96 给 `ReFineActor`。
+### TODO 1: Re-run Agent B (β=0) with P125
+```bash
+# Set β=0 in subgame_validation.py first, then:
+python drift_sweep.py \
+    --mode 667 \
+    --sl_checkpoint results/sl_base.pt \
+    --belief_checkpoint results/sl_base_bca.pt \
+    --data data/competitive_500k.npz \
+    --agent_b_only \
+    --lambdas 0.0 --seeds 100 --rounds 25 --verbose
+```
 
-需要改的地方：
-- `_make_play_mixed_policy`: 检测 model 是否为 `ReFineActor`，走不同的 forward path
-- `load_sl`: 支持加载 `sl_base_bca_refine.pt`（`encoding='openspiel_667_refine'`），构建 `ReFineActor` 而不是 `MLPPolicyNetwork`
-- 消融模式：`--ablate_belief` 在 ReFine 模式下把 belief_96 替换为 prior
+### TODO 2: Convention drift measurement
+```bash
+# Full Disclosure (already done): Agent A vs Agent B (β=0.05) = -1.070
+# No Full Disclosure:
+python bid_inspector.py \
+    --model1 results/drift_sweep_667/lambda0.0_seed100/agent_a_seed100.pt \
+    --model2 results/drift_sweep_667/lambda0.0_seed100/agent_b_seed100.pt \
+    --data data/competitive_500k.npz \
+    --num_deals 3000 --seed 42 --quiet \
+    --no_full_disclosure
+# Δ(Full Disclosure - no-FD) = convention drift effect on agent vs agent matchup
+```
 
-### TODO 2: Convention Card with Co-evolved BeliefNet (Route 2)
-**核心实验：证明 convention card 确实减少了密约优势。**
-
-步骤：
-1. 从 Agent A checkpoint (`agent_a_seed100.pt`) 提取 co-evolved BeliefNet（belief_loss=1.91，能读懂 Agent A 的 drifted protocol）
-2. 用这个 BeliefNet 重跑 ReFine adapter 训练：`python sl_pretrain_bca.py --mode refine --init_from results/sl_base.pt --load_belief results/drift_sweep_667/lambda0.0_seed100/agent_a_seed100.pt --out results/sl_bca_refine_coevolved_a.pt`
-3. 如果 gate > 0 且 non_pass_acc > baseline：co-evolved BeliefNet 为 SL 提供了有用信息
-4. 在 bid_inspector 中对战：Agent A vs SL_ReFine_coevolved(real) vs Agent A vs SL_ReFine_coevolved(ablated)
-5. 如果 real < ablated（agent 更难赢）：convention card 有效
-
-**预期结果：** gate > 0（co-evolved BeliefNet 有边际信息价值），消融实验显示 real belief 使 agent 优势减少。
-
-**科学合理性：** 不是在测 "某个 NN 训练方案是否有效"，而是在测 "如果对手拥有能读懂 agent protocol 的 convention card，agent 的信息不对称优势是否减少"。ReFine 冻结 SL actor 确保 bidding pattern 不变，唯一变量是 belief features 的信息内容。
-
-### TODO 3: Stage 3 eval 对手统一
-当前 667-dim 模式的 Stage 3 自动使用 SL_BCA(StageB) 作为 eval 对手，导致 Stage 3 得分与 bid_inspector（用 plain SL）不一致。加 `--sl_eval_plain` 参数让 Stage 3 也用 plain SL。
+### TODO 3: Complete P125 matchup table
+After TODO 1, run all combinations with same seed (42) for comparability:
+- Agent A vs Agent B (β=0): FD + no-FD
+- Agent A vs Agent B (β=0.05): FD ✅ (-1.070) + no-FD (TODO 2)
+- Agent B (β=0) vs Agent B (β=0.05): FD + no-FD
+- All three agents vs SL (FD only, secondary metric)
 
 ### TODO 4: Multi-seed validation
-5 seeds × Agent A + Agent B，确认 B > A 的稳定性。当前只有 seed=100 的单次结果。
+5 seeds × Agent A + Agent B (β=0) + Agent B (β=0.05). Current results are seed=100 only.
+
+### TODO 5: Partner Info Gain comparison (information-theoretic metrics)
+Collect I(bid;hand|partner) and I(bid;hand|opponent) for all three agents under P125.
+Agent A baseline value missing from current logs — needed for primary paper claim.
 
 ---
 
-*README version: P124*
-*Last updated: 2026-03-31*
+*README version: P125*
+*Last updated: 2026-04-01*

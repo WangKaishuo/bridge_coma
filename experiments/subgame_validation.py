@@ -18,25 +18,25 @@ Experiment design:
   - Only difference between A and B: r_info reward shaping
 
 Training mode (default):
-    python experiments/subgame_validation.py \\
-        --data path/to/competitive_500k.npz \\
-        --sl_checkpoint results/sl_base_bca.pt \\
+    python experiments/subgame_validation.py \
+        --data path/to/competitive_500k.npz \
+        --sl_checkpoint results/sl_base_bca.pt \
         --seed 42 --rounds 10
 
 Eval-only mode (paired evaluation on saved checkpoints):
-    python experiments/subgame_validation.py \\
-        --eval-only \\
-        --data data/competitive_500k.npz \\
-        --sl_checkpoint results/sl_base_bca.pt \\
-        --agent_a results/competitive/agent_a_seed42.pt \\
-        --agent_b results/competitive/agent_b_seed42.pt \\
+    python experiments/subgame_validation.py \
+        --eval-only \
+        --data data/competitive_500k.npz \
+        --sl_checkpoint results/sl_base_bca.pt \
+        --agent_a results/competitive/agent_a_seed42.pt \
+        --agent_b results/competitive/agent_b_seed42.pt \
         --num_deals 2000 --seed 42
 
 Legacy 301-dim mode (backward compatible):
-    python experiments/subgame_validation.py \\
-        --no_belief_conditioned \\
-        --sl_checkpoint results/sl_base.pt \\
-        --data data/competitive_500k.npz \\
+    python experiments/subgame_validation.py \
+        --no_belief_conditioned \
+        --sl_checkpoint results/sl_base.pt \
+        --data data/competitive_500k.npz \
         --seed 42
 
 Training diagnostics (README §Phase 1):
@@ -134,9 +134,12 @@ def run_competitive(args):
             use_info_bonus   = False,
             beta             = 0.0,
             info_reward_weight = 0.0,
-            fsp_pool_size    = 10,
+            fsp_pool_size    = 0,             # P126: unlimited
             fsp_add_interval = 1,
             self_play        = False,
+            fsp_quality_gate = True,          # P126: quality gate
+            fsp_gate_eval_deals = 100 if args.quick else 200,
+            fsp_sl_sample_prob = 0.30,        # P126: 30% SL minimum
             kl_lambda_start  = _kl_start,
             kl_lambda_end    = _kl_end,
             kl_anneal_frac   = _kl_anneal,
@@ -173,9 +176,12 @@ def run_competitive(args):
             use_info_bonus   = True,
             beta             = args.beta,
             info_reward_weight = args.info_weight,
-            fsp_pool_size    = 10,
+            fsp_pool_size    = 0,             # P126: unlimited
             fsp_add_interval = 1,
             self_play        = False,
+            fsp_quality_gate = True,          # P126: quality gate
+            fsp_gate_eval_deals = 100 if args.quick else 200,
+            fsp_sl_sample_prob = 0.30,        # P126: 30% SL minimum
             kl_lambda_start  = _kl_start,
             kl_lambda_end    = _kl_end,
             kl_anneal_frac   = _kl_anneal,
@@ -213,9 +219,12 @@ def run_competitive(args):
             use_info_bonus   = True,
             beta             = _beta_c,
             info_reward_weight = args.info_weight,
-            fsp_pool_size    = 10,
+            fsp_pool_size    = 0,             # P126: unlimited
             fsp_add_interval = 1,
             self_play        = False,
+            fsp_quality_gate = True,          # P126: quality gate
+            fsp_gate_eval_deals = 100 if args.quick else 200,
+            fsp_sl_sample_prob = 0.30,        # P126: 30% SL minimum
             kl_lambda_start  = _kl_start,
             kl_lambda_end    = _kl_end,
             kl_anneal_frac   = _kl_anneal,
@@ -953,9 +962,9 @@ def _cross_eval_fixed_deals(env, deals, pol_a, pol_b):
     """
     Paired double-dummy evaluation on a fixed set of deals.
 
-    Table 1: A = opener (NS), B = overcaller (EW)
-    Table 2: B = opener (NS), A = overcaller (EW)
-    IMP = score_to_imp(score_1 − score_2)  — positive means A wins.
+    Table 1: A = Opener, B = Overcaller
+    Table 2: B = Opener, A = Overcaller
+    IMP = score_to_imp(score_1 − score_2) (或翻转，取决于 dealer)
 
     P105: env._eval_hands_rm must be set for OpenSpiel observation generation.
     env.dealer must be set before each play_mixed call.
@@ -968,13 +977,17 @@ def _cross_eval_fixed_deals(env, deals, pol_a, pol_b):
         env._eval_hands_rm = convert_hands_suit_to_rank(hands)
         _, score_1, _ = env.play_mixed(
             hands, dd_table,
-            ns_policy=pol_a, ew_policy=pol_b,
+            opener_policy=pol_a, overcaller_policy=pol_b,
             vulnerability=vul, dealer=dealer)
         _, score_2, _ = env.play_mixed(
             hands, dd_table,
-            ns_policy=pol_b, ew_policy=pol_a,
+            opener_policy=pol_b, overcaller_policy=pol_a,
             vulnerability=vul, dealer=dealer)
-        imps.append(float(score_to_imp(score_1 - score_2)))
+            
+        if dealer % 2 == 1:
+            imps.append(float(score_to_imp(score_2 - score_1)))
+        else:
+            imps.append(float(score_to_imp(score_1 - score_2)))
     return np.array(imps)
 
 
