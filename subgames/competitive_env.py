@@ -1,36 +1,13 @@
-"""
-Competitive Subgame Environment  (重构版)
-=========================================
+"""Competitive bridge-bidding subgame with a fixed 1H-1S prefix.
 
-合作-对抗子博弈，固定前缀 1H(N) – 1S(E)。
-
-关键修复（vs 旧版）:
-1. _play_swapped_table 不再用随机策略.
-   双桌 IMP 的第二桌改用 *传入的 agent policy* 叫牌，
-   这样 reward = 真实双桌 IMP，而非"比随机好多少"。
-
-2. cross_evaluate 改用 Wilcoxon signed-rank test（IMP 重尾分布，非参）。
-
-3. 加入 dds_oracle_evaluate：用 DDS oracle 计算 IMP regret 作为绝对基准，
-   与对手无关，是论文主要指标。
-
-4. rule_based_bc_data：生成 ~5k 局 competitive 规则牌数据用于 BC 预热，
-   不依赖外部 WBridge5 数据集。
-
-5. (P123 修复) play_mixed 的策略命名由 ns_policy / ew_policy 更名为
-   opener_policy / overcaller_policy 彻底消除语义误导。并在 cross_evaluate
-   增加了 dealer % 2 的物理座位纠正逻辑。
-
-环境特点:
-    - 四方都参与决策（竞争激烈）
-    - 1S 争叫（非跳叫），双方牌力接近
-    - 支持 play_mixed：Opener / Overcaller 阵营由不同 agent 控制
+All four seats continue the auction.  Dealer rotation preserves the constrained
+opener/overcaller deal distribution.  ``play_mixed`` assigns the opener and
+overcaller partnerships to independent black-box policies.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from env import (
@@ -42,36 +19,20 @@ from env import (
 from utils.scoring import Contract, calculate_score
 from utils.imp import score_to_imp
 from utils.dds_data import create_loader
-from subgames.action_mask import count_hcp, count_suit_length
+from utils.bridge_features import count_hcp, count_suit_length
 
 
-# ── 常量 ──────────────────────────────────────────────────────────────────────
-FIXED_PREFIX = ["1H", "1S"]   # N 开叫 1H，E 争叫 1S，之后 S/W/N/... 自由叫
+FIXED_PREFIX = ["1H", "1S"]
 _SUIT_H = 2   # hearts index
 _SUIT_S = 3   # spades index
 
 
 # ==============================================================================
-# Rule-based 策略（用于 BC 预热和双桌第二桌）
 # ==============================================================================
 
 def _rule_based_action(obs: Dict[str, np.ndarray], player: int,
                         history: list, dealer: int) -> int:
-    """
-    极简 rule-based 策略，仅用于:
-        1. BC 预热数据生成（~5k 局）
-        2. competitive_env 内部双桌第二桌（如果未提供 agent）
-
-    规则（非常保守，只保证叫牌不崩溃）:
-        - S (partner of N): 支持 2H (有 3+H)，或报副花色，否则 Pass
-        - W (partner of E): 支持 2S / 3S (有 3+S)，否则 Pass
-        - N (rebid): 简单 rebid
-        - E (rebid): 简单 rebid
-        - 其他情况: Pass
-
-    产生的叫牌序列不是最优的，但足以提供有意义的初始策略分布。
-    合法性由 legal_actions mask 兜底。
-    """
+    """Return a conservative legal action for fallback BC initialization."""
     hand         = obs['hand']             # (52,) float
     legal        = obs['legal_actions']    # (38,) float
 
@@ -85,21 +46,17 @@ def _rule_based_action(obs: Dict[str, np.ndarray], player: int,
     h    = int(count_suit_length(hand, _SUIT_H))
     s    = int(count_suit_length(hand, _SUIT_S))
 
-    # 叫牌历史长度（从前缀结束后算起，这里直接用 history 总长）
     hist_len = len(history)
 
-    # ── S 方（第 3 叫，hist_len == 2）──────────────────────────────────────
     if player == SOUTH and hist_len == 2:
-        # 有 3+H → 支持 2H
         bid_2h = string_to_bid("2H")
-        bid_2s = string_to_bid("2S")   # cue-bid，表示牌力强
+        bid_2s = string_to_bid("2S")
         bid_2c = string_to_bid("2C")
         bid_2d = string_to_bid("2D")
 
         if h >= 3 and hcp >= 8:
             return _bid_if_legal(bid_2h)
         elif hcp >= 10:
-            # 报最长副花色
             d = int(count_suit_length(hand, 1))
             c = int(count_suit_length(hand, 0))
             if d >= 4 and _legal(bid_2d):
@@ -110,7 +67,6 @@ def _rule_based_action(obs: Dict[str, np.ndarray], player: int,
         else:
             return BID_PASS
 
-    # ── W 方（第 4 叫，hist_len == 3）──────────────────────────────────────
     elif player == WEST and hist_len == 3:
         bid_2s = string_to_bid("2S")
         bid_3s = string_to_bid("3S")
@@ -149,7 +105,6 @@ def _rule_based_action(obs: Dict[str, np.ndarray], player: int,
             return _bid_if_legal(bid_2s)
         return BID_PASS
 
-    # ── 其他：Pass ──────────────────────────────────────────────────────────
     return BID_PASS
 
 
@@ -157,12 +112,7 @@ def generate_rule_based_bc_data(
     env: "CompetitiveSubgameEnv",
     num_samples: int = 5000,
 ) -> List[Dict]:
-    """
-    生成 rule-based BC 训练数据，用于 Phase 1 轻量预热.
-
-    P105: Uses OpenSpiel state.observation_tensor() for 571-dim observations.
-    dealer 由 env.generate_deal() 动态决定（dealer rotation 已支持）.
-    """
+    """See the formal README for the current behavior contract."""
     from networks.policy_net import (
         convert_hands_suit_to_rank, hands_to_openspiel_state,
         get_openspiel_obs, ours_to_openspiel_raw,
@@ -184,7 +134,6 @@ def generate_rule_based_bc_data(
         done = False
         history_ours = []
 
-        # 执行固定前缀 1H-1S
         prefix_ok = True
         for bid_str in FIXED_PREFIX:
             bid = string_to_bid(bid_str)
@@ -199,7 +148,6 @@ def generate_rule_based_bc_data(
         if not prefix_ok or done:
             continue
 
-        # rule-based 走完整局
         while not done:
             player  = inner_env.state.current_player
             history = inner_env.state.history[:]
@@ -208,7 +156,6 @@ def generate_rule_based_bc_data(
             if not inner_env._is_valid_action(action):
                 action = BID_PASS
 
-            # P105: 用 OpenSpiel 获取 571 维 observation
             os_state = hands_to_openspiel_state(hands_rm, dealer)
             for a in history_ours:
                 os_state.apply_action(ours_to_openspiel_raw(a))
@@ -228,24 +175,7 @@ def generate_rule_based_bc_data(
 # ==============================================================================
 
 class CompetitiveSubgameEnv:
-    """
-    竞叫子博弈环境.
-
-    固定前缀: 1H(N) – 1S(E)
-    约束:   N 5+H 12-21 HCP,  E 5+S 8-16 HCP
-
-    关键接口:
-        reset(hands, dd_table)   → obs (含 dealer / history_int 供编码用)
-        step(action)             → obs, reward, done, info
-        generate_deal()          → (hands, dd_table)
-        play_mixed(...)          → (contract, score_ns, history)
-
-    内部状态:
-        self._current_hands  : (4, 52) float32
-        self._current_dd     : (5, 4)  int8  tricks[suit, player]
-        self.dealer          : int (固定为 NORTH)
-        self.history_int     : list[int] (包含前缀 + 后续)
-    """
+    """See the formal README for the current behavior contract."""
 
     def __init__(self, data_path: str, max_history_len: int = 60):
         self.loader          = create_loader(data_path)
@@ -254,7 +184,6 @@ class CompetitiveSubgameEnv:
         self.dealer          = NORTH
         self._sampled_dealer: int = NORTH  # set by generate_deal(), used by reset()
 
-        # 检查数据是否已经是 constrained（10万副预生成数据）
         self._is_constrained_data = self._check_if_constrained()
         if not self._is_constrained_data:
             self._filtered_deals: list = []
@@ -264,14 +193,12 @@ class CompetitiveSubgameEnv:
             print(f"[CompetitiveEnv] Pre-generated constrained data: "
                   f"{len(self.loader)} samples")
 
-        # 当前局信息（由 reset 填充）
         self._current_hands: Optional[np.ndarray] = None
         self._current_dd:    Optional[np.ndarray] = None
         self._vulnerability: Tuple[bool, bool]    = (False, False)
         self.history_int:    list                 = []
 
     # ------------------------------------------------------------------
-    # 初始化辅助
     # ------------------------------------------------------------------
 
     def _check_if_constrained(self, sample_size: int = 20) -> bool:
@@ -299,7 +226,6 @@ class CompetitiveSubgameEnv:
               f"({rate:.1%} acceptance rate)")
 
     # ------------------------------------------------------------------
-    # 约束判断
     # ------------------------------------------------------------------
 
     def _satisfies_constraints(self, hands: np.ndarray,
@@ -320,17 +246,10 @@ class CompetitiveSubgameEnv:
         return 8 <= count_hcp(hand) <= 16 and count_suit_length(hand, _SUIT_S) >= 5
 
     # ------------------------------------------------------------------
-    # 发牌
     # ------------------------------------------------------------------
 
     def generate_deal(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        返回 (hands, dd_table)，同时设置 self._sampled_dealer 供 reset() 使用.
-
-        对于预生成的约束数据（dealer=NORTH 固定），从 4 个旋转中随机选一个，
-        并把 hands 按 dealer 轮换，使约束始终对应 (dealer, dealer+1)。
-        对于 prefetch 数据，dealer 已经在 _prefetch 时确定。
-        """
+        """See the formal README for the current behavior contract."""
         if self._is_constrained_data:
             # Pre-generated data: N(pos0)=opener, E(pos1)=overcaller.
             # To make dealer=rotation be the opener, we need opener(pos0) → pos(rotation).
@@ -364,7 +283,6 @@ class CompetitiveSubgameEnv:
         raise RuntimeError("Cannot generate valid competitive deal after 10000 attempts")
 
     # ------------------------------------------------------------------
-    # 环境核心接口
     # ------------------------------------------------------------------
 
     def reset(
@@ -373,15 +291,7 @@ class CompetitiveSubgameEnv:
         dd_table:      Optional[np.ndarray]   = None,
         vulnerability: Tuple[bool, bool]       = (False, False),
     ) -> Dict[str, np.ndarray]:
-        """
-        重置环境，执行固定前缀 [1H, 1S].
-
-        dealer 由 generate_deal() 的最后一次调用决定（self._sampled_dealer）。
-        如果 hands/dd_table 是外部传入的，dealer 默认为 NORTH（保持兼容）。
-
-        Returns:
-            obs: 前缀后下一决策者（dealer+2, i.e. partner of opener）的观测
-        """
+        """See the formal README for the current behavior contract."""
         if hands is None or dd_table is None:
             hands, dd_table = self.generate_deal()
             dealer = self._sampled_dealer
@@ -407,7 +317,7 @@ class CompetitiveSubgameEnv:
         return obs
 
     def step(self, action: int) -> Tuple[Dict, float, bool, Dict]:
-        """执行动作，四方都参与决策."""
+        """See the formal README for the current behavior contract."""
         self.history_int.append(action)
         obs, _, done, info = self.env.step(action)
 
@@ -419,17 +329,10 @@ class CompetitiveSubgameEnv:
         return obs, reward, done, info
 
     # ------------------------------------------------------------------
-    # 奖励计算（关键修复）
     # ------------------------------------------------------------------
 
     def _compute_terminal_reward(self) -> float:
-        """
-        IMP regret（NS 视角，越高越好，≤ 0）.
-
-            regret = score_to_imp(score_ns − optimal_score_ns)
-
-        注意: IMP 是非线性的，必须先做差再转换。
-        """
+        """See the formal README for the current behavior contract."""
         contract = self.env.state.final_contract
         score_ns = self._compute_score_ns(
             contract, self._current_dd, self._vulnerability)
@@ -444,32 +347,13 @@ class CompetitiveSubgameEnv:
         dd_table:      np.ndarray,
         vulnerability: Tuple[bool, bool],
     ) -> int:
-        """
-        DDS oracle: NS 视角的双明手博弈均衡得分（P77修复）.
-
-        正确语义：双明手均衡是双方都知道所有手牌时的博弈平衡点——
-        任何一方再叫牌都只会得到更差的结果，因此停叫。
-        1H-1S之后流局不可能发生。
-
-        正确算法：对每个花色，只考虑能叫成的定约：
-            - NS在该花色能叫成的最高级数 → NS视角正分
-            - EW在该花色能叫成的最高级数 → NS视角负分
-            - 两者取对NS更好的结果
-        跨所有花色取全局最大值。
-
-        错误的旧逻辑：
-            - best_score=0预设流局可选（竞争叫牌中不成立）
-            - EW作庄分支全pass
-            - 误把EW宕牌的负分（NS视角正数）当作可选结果
-              （EW永远不会自愿叫宕牌的定约）
-        """
+        """See the formal README for the current behavior contract."""
         from utils.scoring import Contract as C_
 
         ns_vul, ew_vul = vulnerability
         best_score = None
 
         for suit in range(5):
-            # NS 在该花色能叫成的最高级数（叫成才有正分）
             ns_best = None
             for level in range(7, 0, -1):
                 for declarer in (NORTH, SOUTH):
@@ -481,9 +365,6 @@ class CompetitiveSubgameEnv:
                         if ns_best is None or score > ns_best:
                             ns_best = score
 
-            # EW 在该花色能叫成的最高级数（NS视角取负）
-            # EW会选对自己最有利的定约（叫最高能成的级数），
-            # 对NS而言这是最坏情况（NS视角取min）
             ew_best_ns_view = None
             for level in range(7, 0, -1):
                 for declarer in (EAST, WEST):
@@ -493,11 +374,9 @@ class CompetitiveSubgameEnv:
                         tricks, ew_vul)
                     if ew_score > 0:
                         ns_view = -ew_score
-                        # EW叫最高能成的级数对NS最不利：取NS视角最小值
                         if ew_best_ns_view is None or ns_view < ew_best_ns_view:
                             ew_best_ns_view = ns_view
 
-            # 该花色对NS最好的结果（NS打 vs 让EW打，取较优者）
             candidates = [x for x in (ns_best, ew_best_ns_view) if x is not None]
             if candidates:
                 suit_best = max(candidates)
@@ -512,18 +391,17 @@ class CompetitiveSubgameEnv:
         dd_table:      np.ndarray,
         vulnerability: Tuple[bool, bool],
     ) -> int:
-        """计算 NS 视角实际得分."""
+        """See the formal README for the current behavior contract."""
         if contract is None:
             return 0
         tricks = int(dd_table[contract.suit, contract.declarer])
         vul    = vulnerability[contract.declarer % 2]
         score  = calculate_score(contract, tricks, vul)
-        if contract.declarer % 2 == 1:   # EW 庄家 → NS 得负分
+        if contract.declarer % 2 == 1:
             score = -score
         return score
 
     # ------------------------------------------------------------------
-    # 属性
     # ------------------------------------------------------------------
 
     @property
@@ -535,7 +413,6 @@ class CompetitiveSubgameEnv:
         return self.env.state.history.copy()
 
     # ------------------------------------------------------------------
-    # 混合对抗（用于 cross_evaluate）
     # ------------------------------------------------------------------
 
     def play_mixed(
@@ -548,13 +425,7 @@ class CompetitiveSubgameEnv:
         dealer:        Optional[int] = None,
         **kwargs
     ) -> Tuple[Optional[Contract], int, List[int]]:
-        """
-        混合对抗: Opener / Overcaller 阵营由不同策略控制.
-
-        opener_seats  = {dealer, (dealer+2)%4}  (开叫方阵营)
-        overcall_seats= {(dealer+1)%4, (dealer+3)%4}
-        """
-        # 向下兼容旧的 kwargs: ns_policy / ew_policy 以防外部如 subgame_trainer 仍在使用
+        """See the formal README for the current behavior contract."""
         if opener_policy is None:
             opener_policy = kwargs.get('ns_policy')
         if overcaller_policy is None:
@@ -573,7 +444,6 @@ class CompetitiveSubgameEnv:
         hist  = []
         done  = False
 
-        # 执行固定前缀
         for bid_str in FIXED_PREFIX:
             bid = string_to_bid(bid_str)
             hist.append(bid)
@@ -600,240 +470,10 @@ class CompetitiveSubgameEnv:
 
 
 # ==============================================================================
-# 评估函数
 # ==============================================================================
-
-@dataclass
-class CrossEvalResult:
-    mean_imp:    float
-    std_imp:     float
-    win_rate:    float     # agent_a 赢的比例（IMP > 0）
-    p_value:     float     # Wilcoxon signed-rank test
-    significant: bool      # p < 0.05
-    n_deals:     int
-    all_imps:    List[float]
-
-
-def cross_evaluate(
-    env:               "CompetitiveSubgameEnv",
-    agent_a_opener_policy:     Optional[Callable] = None,
-    agent_a_overcaller_policy: Optional[Callable] = None,
-    agent_b_opener_policy:     Optional[Callable] = None,
-    agent_b_overcaller_policy: Optional[Callable] = None,
-    num_deals:         int = 500,
-    **kwargs
-) -> CrossEvalResult:
-    """
-    交叉对抗评估（双桌 IMP，A 视角）.
-
-    桌1: A=开叫方阵营, B=争叫方阵营 → score_1
-    桌2: B=开叫方阵营, A=争叫方阵营 → score_2
-    IMP = 根据 dealer 座位自动判断并进行翻转（保证 A 视角为正向）
-
-    统计检验: Wilcoxon signed-rank（IMP 重尾非参）.
-    dealer 轮换：每局 generate_deal() 后从 env._sampled_dealer 读取。
-    """
-    # 兼容通过 kwargs 传入旧版本 ns_policy/ew_policy 的代码
-    if agent_a_opener_policy is None:
-        agent_a_opener_policy = kwargs.get('agent_a_ns_policy')
-    if agent_a_overcaller_policy is None:
-        agent_a_overcaller_policy = kwargs.get('agent_a_ew_policy')
-    if agent_b_opener_policy is None:
-        agent_b_opener_policy = kwargs.get('agent_b_ns_policy')
-    if agent_b_overcaller_policy is None:
-        agent_b_overcaller_policy = kwargs.get('agent_b_ew_policy')
-
-    from scipy.stats import wilcoxon
-    from networks.policy_net import convert_hands_suit_to_rank
-
-    imps = []
-    for _ in range(num_deals):
-        hands, dd_table = env.generate_deal()
-        dealer = env._sampled_dealer
-        vul = [(False, False), (True, False),
-               (False, True),  (True, True)][np.random.randint(4)]
-
-        # P109: sync hands into env so policy closures can read env._current_hands
-        env._current_hands  = hands
-        env._eval_hands_rm  = convert_hands_suit_to_rank(hands)
-        # P122: sync vul so _encode_for_actor can read env._vulnerability
-        env._vulnerability  = vul
-        env.dealer          = dealer
-
-        _, score_1, _ = env.play_mixed(
-            hands, dd_table,
-            opener_policy=agent_a_opener_policy,
-            overcaller_policy=agent_b_overcaller_policy,
-            vulnerability=vul, dealer=dealer)
-        _, score_2, _ = env.play_mixed(
-            hands, dd_table,
-            opener_policy=agent_b_opener_policy,
-            overcaller_policy=agent_a_overcaller_policy,
-            vulnerability=vul, dealer=dealer)
-
-        # P123 修复: score_1/score_2 永远返回物理 NS 视角
-        # 当 dealer 是 E 或 W 时，开叫方在物理 EW，A (桌1开叫方) 打得好会导致
-        # 桌 1 物理 EW 分数高 -> 物理 NS 分数低 -> score_1 为负或更小。
-        # 此时需要将公式翻转。
-        if dealer % 2 == 1:
-            imps.append(float(score_to_imp(score_2 - score_1)))
-        else:
-            imps.append(float(score_to_imp(score_1 - score_2)))
-
-    arr = np.array(imps)
-    try:
-        _, p_val = wilcoxon(arr)
-    except Exception:
-        p_val = 1.0
-
-    return CrossEvalResult(
-        mean_imp=float(arr.mean()), std_imp=float(arr.std()),
-        win_rate=float((arr > 0).mean()), p_value=float(p_val),
-        significant=bool(p_val < 0.05), n_deals=num_deals, all_imps=imps,
-    )
-
-
-def dds_oracle_evaluate(
-    env:     "CompetitiveSubgameEnv",
-    policy:  Callable,
-    num_deals: int = 1000,
-) -> dict:
-    """
-    DDS oracle 评估: IMP regret（绝对基准，主要指标）.
-
-    对每副牌计算:
-        regret = actual_imp - dds_optimal_imp  (≤ 0)
-
-    此评估与对手强度完全无关，是论文 RQ1 的核心证据。
-
-    Args:
-        policy: (obs, player, history_int) → action_int
-
-    Returns:
-        dict 含 mean_regret, std_regret, bootstrap_ci_95
-    """
-    regrets = []
-    inner = BridgeBiddingEnv(max_history_len=60)
-
-    for _ in range(num_deals):
-        hands, dd_table = env.generate_deal()
-        dealer = env._sampled_dealer
-        env.dealer = dealer  # P93 fix: policy closures read env.dealer for encode_obs_flat
-        vul = (False, False)
-
-        obs  = inner.reset(hands, dealer=dealer, vulnerability=vul)
-        hist = []
-        done = False
-
-        # 固定前缀
-        for bid_str in FIXED_PREFIX:
-            bid = string_to_bid(bid_str)
-            hist.append(bid)
-            obs, _, done, _ = inner.step(bid)
-            if done:
-                break
-
-        while not done:
-            player = inner.state.current_player
-            action = policy(obs, player, hist[:])
-            if not inner._is_valid_action(action):
-                action = BID_PASS
-            hist.append(action)
-            obs, _, done, _ = inner.step(action)
-
-        contract = inner.state.final_contract
-        score_ns = env._compute_score_ns(contract, dd_table, vul)
-        opt_ns   = env._compute_dds_optimal_score_ns(dd_table, vul)
-
-        regret = float(score_to_imp(score_ns - opt_ns))
-        regrets.append(regret)
-
-    arr = np.array(regrets)
-
-    # Bootstrap 95% CI
-    bs_means = [
-        np.random.choice(arr, size=len(arr), replace=True).mean()
-        for _ in range(1000)
-    ]
-    ci_lo, ci_hi = np.percentile(bs_means, [2.5, 97.5])
-
-    return {
-        'mean_regret':      float(arr.mean()),
-        'std_regret':       float(arr.std()),
-        'ci_lo':            float(ci_lo),
-        'ci_hi':            float(ci_hi),
-        'n_deals':          num_deals,
-        'pct_pass_out':     float((arr == arr.min()).mean()),
-    }
-
-
-# ==============================================================================
-# Policy 工厂函数
-# ==============================================================================
-
-def make_agent_policy(
-    agent,
-    deterministic: bool = True,
-    dealer: int = NORTH,
-    hands_sm: np.ndarray = None,
-    vulnerability: tuple = None,
-) -> Callable[[Dict, int, list], int]:
-    """
-    从 MAPPOAgent 创建 competitive policy 函数.
-
-    policy 签名: (obs, player, history_int) → action_int
-
-    P105: Uses OpenSpiel state.observation_tensor() for 571-dim observations.
-    Reconstructs OpenSpiel state from (hands, dealer, history) each step.
-    P122: vulnerability passed through for vul-aware obs.
-
-    Args:
-        agent: MAPPOAgent with loaded actors
-        deterministic: if True, use argmax
-        dealer: dealer seat for this deal
-        hands_sm: (4, 52) suit-major hands — REQUIRED for OpenSpiel obs.
-        vulnerability: (ns_vul, ew_vul) or None for (False, False)
-    """
-    import torch
-    from networks.policy_net import (
-        convert_hands_suit_to_rank, hands_to_openspiel_state,
-        get_openspiel_obs, ours_to_openspiel_raw,
-    )
-
-    if hands_sm is None:
-        raise ValueError(
-            "P105: make_agent_policy requires hands_sm for OpenSpiel observations.")
-
-    if vulnerability is None:
-        vulnerability = (False, False)
-
-    # Pre-convert hands (done once per deal)
-    hands_rm = convert_hands_suit_to_rank(hands_sm)
-
-    def policy(obs: Dict, player: int, history_int: list) -> int:
-        # Reconstruct OpenSpiel state and replay history
-        os_state = hands_to_openspiel_state(hands_rm, dealer,
-                                            vulnerability=vulnerability)
-        for our_action in history_int:
-            os_action = ours_to_openspiel_raw(our_action)
-            if os_action >= 0:
-                os_state.apply_action(os_action)
-
-        flat = get_openspiel_obs(os_state)
-        flat_t = torch.tensor(flat, dtype=torch.float32).unsqueeze(0).to(agent.device)
-        legal  = torch.tensor(
-            obs['legal_actions'], dtype=torch.float32).unsqueeze(0).to(agent.device)
-
-        actor = agent.get_actor(player)
-        with torch.no_grad():
-            action, _, _ = actor.get_action(flat_t, legal, deterministic=deterministic)
-        return action.item()
-
-    return policy
-
 
 def make_rule_policy() -> Callable[[Dict, int, list], int]:
-    """创建 rule-based policy（用于 BC 数据生成和 baseline 对比）."""
+    """See the formal README for the current behavior contract."""
     def policy(obs: Dict, player: int, history_int: list) -> int:
         return _rule_based_action(obs, player, history_int, NORTH)
     return policy

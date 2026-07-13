@@ -1,14 +1,7 @@
-"""
-Behavioral Cloning
-==================
+"""Behavioral-cloning helpers for the competitive bidding experiment.
 
-BC 预热 — 用于 Stayman 和 Competitive 子博弈。
-
-- BCDataset / behavioral_cloning_warmup: 通用 BC 训练组件 (两个子博弈共用)
-- create_bc_dataset_for_competitive: 生成 Competitive 子博弈 BC 数据
-  (Stayman BC 数据由 stayman_env.create_bc_dataset_for_stayman 生成)
-- 开叫规则 + 竞叫应叫规则 (启发式, 偏简单保守)
-- evaluate_pass_rate: 用于诊断 agent 是否退化为全 Pass
+The rule policy is a fallback for smoke tests.  Formal runs should initialize
+actors from the reproducible OpenSpiel/SAYC supervised checkpoint.
 """
 
 import numpy as np
@@ -24,7 +17,7 @@ from env import (
     bid_to_string, string_to_bid,
     NORTH, EAST, SOUTH, WEST,
 )
-from subgames.action_mask import count_hcp, count_suit_length, is_balanced, suit_lengths
+from utils.bridge_features import count_hcp, count_suit_length, is_balanced, suit_lengths
 
 
 # ============================================================================
@@ -32,17 +25,7 @@ from subgames.action_mask import count_hcp, count_suit_length, is_balanced, suit
 # ============================================================================
 
 def select_simple_opening(hand: np.ndarray) -> int:
-    """
-    简单开叫选择 → bid index.
-
-    规则 (偏保守, 不要太完美):
-      22+ HCP           → 2C
-      15-17 HCP 均型    → 1NT
-      12+ 5+ S          → 1S
-      12+ 5+ H          → 1H
-      12+ longest minor → 1D / 1C
-      < 12              → Pass
-    """
+    """See the formal README for the current behavior contract."""
     hcp = count_hcp(hand)
 
     if hcp < 12:
@@ -70,23 +53,7 @@ def select_simple_opening(hand: np.ndarray) -> int:
 # ============================================================================
 
 def competitive_response_after_1h_1s(hand: np.ndarray) -> int:
-    """
-    南家应叫规则: 进程 1H - 1S - ?
-
-    规则:
-      X  (负加倍)     : 11+ HCP, 0-2 张 H
-      1NT             : 8-10 HCP, 3 张 H
-      2C              : 8-11 HCP, 5+ C
-      2D              : 8-11 HCP, 5+ D
-      2H              : 5-7 HCP, 3 张 H
-      2S (强争叫)     : 11+ HCP, 3 张 H
-      2NT             : 11+ HCP, 4+ 张 H
-      3H (阻击加叫)   : 5-10 HCP, 4 张 H  ← 弱牌 4H
-      3C              : 12+ HCP, 6+ C
-      3D              : 12+ HCP, 6+ D
-      3NT             : 12-15 HCP, 均型, S有止张 (2+S)
-      Pass            : default (太弱或不符合以上)
-    """
+    """See the formal README for the current behavior contract."""
     hcp = count_hcp(hand)
     c, d, h, s = suit_lengths(hand)
 
@@ -102,15 +69,12 @@ def competitive_response_after_1h_1s(hand: np.ndarray) -> int:
     if hcp >= 12 and d >= 6:
         return string_to_bid("3D")
 
-    # 12-15 HCP, 均型, S有止张 → 3NT
     if 12 <= hcp <= 15 and is_balanced(hand) and s >= 2:
         return string_to_bid("3NT")
 
-    # 11+ HCP, 3 H → 2S (强争叫)
     if hcp >= 11 and h == 3:
         return string_to_bid("2S")
 
-    # 11+ HCP, 0-2 H → X (负加倍)
     if hcp >= 11 and h <= 2:
         return BID_DOUBLE
 
@@ -126,7 +90,6 @@ def competitive_response_after_1h_1s(hand: np.ndarray) -> int:
     if 8 <= hcp <= 11 and d >= 5:
         return string_to_bid("2D")
 
-    # 5-10 HCP, 4 H → 3H (阻击加叫, 弱牌 4H)
     if 5 <= hcp <= 10 and h >= 4:
         return string_to_bid("3H")
 
@@ -138,21 +101,10 @@ def competitive_response_after_1h_1s(hand: np.ndarray) -> int:
 
 
 def responder_rebid_after_1h_1s(hand: np.ndarray, history: list) -> int:
-    """
-    北家续叫规则: 1H - 1S - (应叫) - ?
-
-    仅处理应叫人叫品低于 2S 的情况:
-      X  (负加倍)     : 11+ HCP, 0-2 S
-      2S              : 6-10 HCP, 3 S
-      2NT             : 11+ HCP, 4+ S
-      3S              : 6-10 HCP, 4+ S
-    其他              : Pass (简化)
-    """
+    """See the formal README for the current behavior contract."""
     hcp = count_hcp(hand)
     _, _, h, s = suit_lengths(hand)
 
-    # 仅当存在需要支持 S 的情况才续叫
-    # 简化: 如果有 4+S 或 3S 考虑加叫
     if hcp >= 11 and s >= 4:
         return string_to_bid("2NT")
     if hcp >= 11 and s <= 2:
@@ -170,12 +122,7 @@ def responder_rebid_after_1h_1s(hand: np.ndarray, history: list) -> int:
 # ============================================================================
 
 class BCDataset(Dataset):
-    """
-    BC 训练数据集.
-
-    每条数据: (obs_dict, target_action_idx)
-    obs_dict 与 BridgeBiddingEnv._get_observation 格式一致。
-    """
+    """See the formal README for the current behavior contract."""
 
     def __init__(self, data: List[Dict]):
         """data: list of {'obs': {hand, history, legal_actions, position, vulnerability}, 'action': int}"""
@@ -196,28 +143,19 @@ def create_bc_dataset_for_competitive(
     num_samples: int = 50000,
     max_history_len: int = 60,
 ) -> BCDataset:
-    """
-    为 Competitive 子博弈 (1H-1S) 生成 BC 数据.
-
-    流程:
-    1. 从 DDS loader 采样牌
-    2. 筛选符合 1H-1S 约束的 (N: 5+H 12+ HCP, E: 5+S 8+ HCP)
-    3. 对开叫后的每一步, 用启发式规则标注目标叫品
-    4. 构造 obs → target_action 对
-    """
+    """See the formal README for the current behavior contract."""
     from utils.dds_data import create_loader
 
     loader = create_loader(data_path)
     env = BridgeBiddingEnv(max_history_len)
     data = []
     attempts = 0
-    max_attempts = num_samples * 20  # 筛选率 ~5-10%
+    max_attempts = num_samples * 20
 
     while len(data) < num_samples and attempts < max_attempts:
         attempts += 1
         hands, dd_table = loader.sample_one()
 
-        # 约束: N(0) 5+H 12-21 HCP, E(1) 5+S 8-16 HCP
         n_hand, e_hand = hands[0], hands[1]
         n_hcp = count_hcp(n_hand)
         e_hcp = count_hcp(e_hand)
@@ -229,8 +167,7 @@ def create_bc_dataset_for_competitive(
         if not (8 <= e_hcp <= 16 and e_s >= 5):
             continue
 
-        # 模拟 1H - 1S 前缀 + 启发式续叫
-        dealer = NORTH  # N 开叫
+        dealer = NORTH
         obs = env.reset(hands, dealer=dealer, vulnerability=(False, False))
 
         # Step 1: N opens 1H
@@ -309,31 +246,10 @@ def behavioral_cloning_warmup(
     early_stop_acc: float = 0.98,
     early_stop_patience: int = 3,
 ) -> dict:
-    """
-    对 agent 的 policy network 做交叉熵监督训练.
-
-    Args:
-        agent: MAPPOAgent or IPPOAgent
-        dataset: BCDataset
-        epochs: 训练轮数
-        lr: 学习率
-        batch_size: batch 大小
-        minority_weight: 少数类 (非 4H/4S 动作) 的 loss 权重
-        player: 指定训练哪个 player 的 actor (NORTH/SOUTH/EAST/WEST).
-                None = 向后兼容, 使用 model.actor (actor_s 别名).
-        early_stop_acc: 提前停止的准确率阈值 (默认 0.98)
-        early_stop_patience: 连续达标 epoch 数才停止
-
-    Returns:
-        训练统计: {'final_loss', 'final_acc', 'epochs_trained', 'stopped_early'}
-    """
+    """See the formal README for the current behavior contract."""
     from env import string_to_bid, NORTH as _NORTH
-    # 高花成局叫品 — 多数类, 权重 1.0
     majority_actions = {string_to_bid("4H"), string_to_bid("4S")}
 
-    # HAPPO: 按 player 选对应 actor; None 向后兼容
-    # P52: PolicyNetwork 已换成 MLP+全局拼接, obs['history'] 仍为 (B, max_len, 38)
-    # encode_history_flat 在 PolicyNetwork.forward 内部调用, BC 无需改动
     if player is not None and hasattr(agent, 'get_actor'):
         model = agent.get_actor(player)
     else:
@@ -358,8 +274,6 @@ def behavioral_cloning_warmup(
             obs_d = {k: v.to(device) for k, v in obs_batch.items()}
             targets = action_batch.to(device)
 
-            # BC 阶段无 belief 特征: 若 actor 有 belief_dim > 0, 填零向量
-            # 保持网络结构与 Stage 2 一致, 让 belief 层从零开始学
             if hasattr(model, 'belief_dim') and model.belief_dim > 0:
                 if 'belief' not in obs_d:
                     obs_d['belief'] = torch.zeros(
@@ -373,16 +287,10 @@ def behavioral_cloning_warmup(
             logits = logits - 1e9 * (1 - mask)
 
             # ========================================================
-            # Per-sample 权重:
-            # 动作加权: 非 4H/4S 少数类 → minority_weight
-            # 迫使网络不能靠猜多数派过关.
             #
-            # P52 注: 移除旧的"玩家加权×3" (原因: N/S 共享 LSTM → S 梯度被
-            # N 稀释). P52 中 N/S 完全独立 MLP, 此问题不存在.
             # ========================================================
             weights = torch.ones(targets.shape[0], device=device)
 
-            # 动作加权
             is_minority = torch.ones(targets.shape[0], dtype=torch.bool, device=device)
             for maj_act in majority_actions:
                 is_minority = is_minority & (targets != maj_act)
@@ -443,12 +351,7 @@ def _collate_bc(batch):
 # ============================================================================
 
 def evaluate_pass_rate(agent, env: BridgeBiddingEnv, num_deals: int = 200) -> float:
-    """
-    评估 agent 在随机牌中的 pass rate.
-
-    如果开叫位全部 Pass, pass_rate → 1.0.
-    BC 成功后应该 < 0.5.
-    """
+    """See the formal README for the current behavior contract."""
     total_bids = 0
     pass_bids = 0
 

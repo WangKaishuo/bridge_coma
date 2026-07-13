@@ -244,9 +244,18 @@ def hands_to_openspiel_state(hands_rm: np.ndarray, dealer: int = 0,
 _deal_action_cache: dict = {}
 
 
-def get_openspiel_obs(state) -> np.ndarray:
-    """Get 571-dim observation from an OpenSpiel state."""
-    return np.array(state.observation_tensor(), dtype=np.float32)
+def get_openspiel_obs(state, player: int | None = None) -> np.ndarray:
+    """Return the 571-dimensional observation for a specific player.
+
+    Passing the observer explicitly is essential for belief modelling: the
+    public auction is shared, but each receiver conditions on a different
+    private hand.  Policy calls may omit ``player`` when it is the current turn.
+    """
+    if player is None:
+        tensor = state.observation_tensor()
+    else:
+        tensor = state.observation_tensor(player)
+    return np.array(tensor, dtype=np.float32)
 
 
 def advance_openspiel_state(state, our_action: int):

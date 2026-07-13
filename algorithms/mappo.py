@@ -1,36 +1,4 @@
-"""
-MAPPO (Multi-Agent PPO) — HAPPO: 独立 Actor + 独立 Centralized Critic
-======================================================================
-
-新架构变更（对齐 480 维 MLP (P104 OpenSpiel标准) policy_net.py）:
-
-1. MAPPOConfig 新增 hidden_dim=1024（旧的 hand_dim/history_dim/lstm_layers
-   已废弃但保留，避免旧代码 dataclass 初始化报错）。
-
-2. _make_actor() 改用 MLPPolicyNetwork(obs_dim=480, hidden_dim)；
-   _make_critic() 改用 MLPValueNetwork(obs_dim=480, hidden_dim, centralized=True)。
-   两者接口从 (obs_dict, all_hands) 改为 (flat_obs, legal_actions, all_hands)。
-
-3. _HAPPOModel.get_action_and_value 签名对应更新，
-   接受 (flat_obs, legal_actions, all_hands, player)。
-
-4. get_action_for_player / _get_action_for_player 接受 flat_obs + legal_actions
-   而非 obs_dict；向后兼容旧 get_action() 接口已移除（新代码全用
-   SubgameTrainer.FlatRolloutBuffer，不再走 agent.buffers）。
-
-5. MAPPORolloutBuffer 保留（供 agent.update() 向后兼容），但新 SubgameTrainer
-   使用自己的 FlatRolloutBuffer，不依赖 agent.buffers。
-
-6. save() / load() 格式不变（actor_n/actor_s/critic_n/critic_s keys）。
-
-7. FSP 相关逻辑移到 utils/fsp_pool.py，此文件不负责 FSP。
-
-兼容性:
-    - 旧的 MAPPORolloutBuffer / agent.buffers 保留，不影响已有测试。
-    - state_dict() / load_state_dict() 格式向后兼容。
-    - MAPPOConfig 中的 hand_dim / history_dim / lstm_layers 保留，
-      只是在网络构建时被忽略（无副作用）。
-"""
+"""See the formal README for the current behavior contract."""
 
 import torch
 import torch.nn as nn
@@ -41,7 +9,7 @@ from typing import Dict, Optional, Tuple
 
 from env import NUM_PLAYERS, NORTH, SOUTH
 from networks.policy_net import MLPPolicyNetwork, MLPValueNetwork, OBS_DIM, BELIEF_OBS_DIM
-from algorithms.ippo import PPOConfig, RolloutBuffer
+from algorithms.ppo import PPOConfig, RolloutBuffer
 
 
 # ==============================================================================
@@ -50,25 +18,14 @@ from algorithms.ippo import PPOConfig, RolloutBuffer
 
 @dataclass
 class MAPPOConfig(PPOConfig):
-    """
-    MAPPO / HAPPO 配置.
-
-    新字段:
-        hidden_dim : 4×1024 MLP 的隐藏层宽度（覆盖 PPOConfig 的 hidden_dim=256）
-
-    保留旧字段（不再使用，仅防止旧代码 dataclass 报错）:
-        hand_dim, history_dim, lstm_layers — deprecated, ignored in network construction
-        belief_dims, fsp_pool_size         — deprecated, managed externally
-    """
-    # ── 网络 ────────────────────────────────────────────────────────────────
-    hidden_dim:         int   = 1024      # 覆盖 PPOConfig.hidden_dim=256
+    """See the formal README for the current behavior contract."""
+    hidden_dim:         int   = 1024
     obs_dim:            int   = OBS_DIM   # 480 (P104)
 
     # ── Critic ──────────────────────────────────────────────────────────────
     centralized_critic: bool  = True
     critic_lr_ratio:    float = 3.0
 
-    # ── 向后兼容（不再使用）────────────────────────────────────────────────
     hand_dim:           int   = 256       # deprecated
     history_dim:        int   = 256       # deprecated
     lstm_layers:        int   = 2         # deprecated
@@ -77,15 +34,10 @@ class MAPPOConfig(PPOConfig):
 
 
 # ==============================================================================
-# MAPPORolloutBuffer（向后兼容，新 SubgameTrainer 不使用此类）
 # ==============================================================================
 
 class MAPPORolloutBuffer(RolloutBuffer):
-    """
-    向后兼容 Buffer（存旧格式 obs_dict）.
-
-    新的 SubgameTrainer 使用 FlatRolloutBuffer，此类仅供旧代码和测试使用.
-    """
+    """See the formal README for the current behavior contract."""
 
     def reset(self):
         super().reset()
@@ -123,12 +75,7 @@ class MAPPORolloutBuffer(RolloutBuffer):
 # ==============================================================================
 
 class _HAPPOModel(nn.Module):
-    """
-    HAPPO 模型容器: actor_n/s/e/w + critic_n/s/e/w 八个独立子网络.
-
-    NS 和 EW 各自独立，competitive 子博弈中叫牌语义完全不同。
-    向后兼容: model.actor → actor_s, model.critic → critic_s
-    """
+    """See the formal README for the current behavior contract."""
 
     def __init__(
         self,
@@ -142,7 +89,6 @@ class _HAPPOModel(nn.Module):
         self.actor_e  = actor_e;  self.actor_w  = actor_w
         self.critic_n = critic_n; self.critic_s = critic_s
         self.critic_e = critic_e; self.critic_w = critic_w
-        # 向后兼容别名
         self.actor  = actor_s
         self.critic = critic_s
 
@@ -174,17 +120,7 @@ class _HAPPOModel(nn.Module):
 # ==============================================================================
 
 class MAPPOAgent:
-    """
-    HAPPO Multi-Agent PPO: 独立 Actor + 独立 Centralized Critic.
-
-    N-phase: 只更新 actor_n + critic_n; actor_s + critic_s 完全冻结.
-    S-phase: 只更新 actor_s + critic_s; actor_n + critic_n 完全冻结.
-
-    对 competitive 子博弈的扩展:
-        EW 方在竞叫中也参与决策，但通常由 FSP pool 中的 frozen snapshot 控制,
-        不需要为 EW 单独维护 critic（FSP actor only）.
-        若需要训练 EW，直接用 get_actor(EAST/WEST) 映射到 actor_n/actor_s.
-    """
+    """See the formal README for the current behavior contract."""
 
     def __init__(self, config: MAPPOConfig):
         self.config = config
@@ -223,16 +159,13 @@ class MAPPOAgent:
         self.critic_e_optimizer = torch.optim.Adam(self.model.critic_e.parameters(), lr=clr)
         self.critic_w_optimizer = torch.optim.Adam(self.model.critic_w.parameters(), lr=clr)
 
-        # 向后兼容别名
         self.actor_optimizer  = self.actor_s_optimizer
         self.critic_optimizer = self.critic_s_optimizer
         self.optimizer        = self.actor_s_optimizer
 
-        # 向后兼容旧 buffer（新代码不使用）
         self.buffers = {p: MAPPORolloutBuffer(self.device) for p in range(NUM_PLAYERS)}
 
     # ------------------------------------------------------------------
-    # Per-player 接口
     # ------------------------------------------------------------------
 
     def get_actor(self, player: int) -> MLPPolicyNetwork:
@@ -250,7 +183,6 @@ class MAPPOAgent:
                 2: self.critic_s_optimizer, 3: self.critic_w_optimizer}[player]
 
     # ------------------------------------------------------------------
-    # Action sampling（新 API：接受 flat_obs + legal_actions）
     # ------------------------------------------------------------------
 
     def get_action_for_player(
@@ -261,11 +193,7 @@ class MAPPOAgent:
         all_hands:     Optional[np.ndarray] = None,
         deterministic: bool = False,
     ) -> Tuple[int, Dict]:
-        """
-        给定 flat_obs (480,) 和 legal_actions (38,)，返回 (action_int, extras).
-
-        extras: {'log_prob': Tensor, 'value': Tensor}
-        """
+        """See the formal README for the current behavior contract."""
         flat_t  = torch.tensor(flat_obs,      dtype=torch.float32
                                ).unsqueeze(0).to(self.device)
         legal_t = torch.tensor(legal_actions, dtype=torch.float32
@@ -288,12 +216,7 @@ class MAPPOAgent:
 
     def store_transition(self, player, flat_obs, legal_actions, action,
                          log_prob, reward, value, done, all_hands=None):
-        """
-        向后兼容接口：存入旧版 MAPPORolloutBuffer.
-
-        新代码（SubgameTrainer）使用 FlatRolloutBuffer，不调此方法.
-        """
-        # 旧 buffer 存的是 obs_dict，这里做最小兼容：存 flat_obs 的伪装字典
+        """See the formal README for the current behavior contract."""
         obs_compat = {
             'flat_obs':      torch.tensor(flat_obs,      dtype=torch.float32),
             'legal_actions': torch.tensor(legal_actions, dtype=torch.float32),
@@ -302,16 +225,10 @@ class MAPPOAgent:
             obs_compat, torch.tensor(action), log_prob, reward, value, done, all_hands)
 
     # ------------------------------------------------------------------
-    # Standard update（向后兼容，新 SubgameTrainer 不调此方法）
     # ------------------------------------------------------------------
 
     def update(self) -> Dict[str, float]:
-        """
-        标准 PPO update（旧接口，新代码用 SubgameTrainer._safe_update）.
-
-        注: 旧 buffer 里存的是 obs_dict，这里直接取 flat_obs / legal_actions.
-        若 buffer 里没有这两个 key，会 KeyError — 这是预期行为（提醒切换新接口）.
-        """
+        """See the formal README for the current behavior contract."""
         total_loss = total_policy = total_value = total_entropy = num_updates = 0
         for player in range(NUM_PLAYERS):
             buffer = self.buffers[player]
@@ -390,7 +307,6 @@ class MAPPOAgent:
         }
 
     # ------------------------------------------------------------------
-    # Serialization（格式与旧版兼容）
     # ------------------------------------------------------------------
 
     def save(self, path: str):

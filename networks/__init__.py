@@ -1,16 +1,11 @@
-"""
-Networks package (P52)
- 
-P52 变更: 删除 HandEncoder, HistoryEncoder, ActorCritic (LSTM架构已废弃).
-保留: MLPPolicyNetwork (alias: PolicyNetwork), MLPValueNetwork (alias: ValueNetwork),
-      BeliefNetwork, DualInfoComputer.
-"""
+"""Policy, value, and belief networks used by Bridge-COMA."""
  
 from networks.policy_net import (
     MLPPolicyNetwork,
     MLPValueNetwork,
     PolicyNetwork,       # alias for MLPPolicyNetwork
     ValueNetwork,        # alias for MLPValueNetwork
+    ActorCritic,
     BASE_INPUT_DIM,
     OBS_DIM,
 )

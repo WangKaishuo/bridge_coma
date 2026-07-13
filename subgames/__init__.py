@@ -1,24 +1,9 @@
-"""
-Subgame Environments for Phase 2 Validation
+"""Competitive bridge-bidding subgame components.
 
-Note: SubgameTrainer and torch-dependent modules are imported lazily.
-Use direct imports when needed:
-    from subgames.subgame_trainer import SubgameTrainer, SubgameConfig
+Training modules are intentionally not imported here so importing an environment
+does not initialize PyTorch.
 """
 
-from subgames.action_mask import (
-    count_hcp,
-    count_suit_length,
-    suit_lengths,
-    is_balanced,
-    get_legal_mask,
-    get_soft_mask,
-    get_combined_mask,
-)
-
-# Env classes only import numpy, not torch
-from subgames.stayman_env import StaymanSubgameEnv
 from subgames.competitive_env import (
     CompetitiveSubgameEnv,
-    CrossEvalResult,
 )

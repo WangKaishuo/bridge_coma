@@ -1,12 +1,6 @@
-"""
-MARL Algorithms for Bridge-COMA
-"""
+"""PPO components used by Bridge-COMA."""
 
-from algorithms.ippo import (
-    IPPOAgent,
-    PPOConfig,
-    RolloutBuffer,
-)
+from algorithms.ppo import PPOConfig, RolloutBuffer
 
 from algorithms.mappo import (
     MAPPOAgent,

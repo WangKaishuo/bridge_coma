@@ -527,60 +527,58 @@ def test_networks():
     from env import NUM_BIDS
 
     batch = 4
-    obs = {
-        'hand': torch.rand(batch, 52),
-        'history': torch.rand(batch, 10, NUM_BIDS),
-        'legal_actions': torch.ones(batch, NUM_BIDS),
-        'position': torch.eye(4)[:batch],
-        'vulnerability': torch.zeros(batch, 2),
-    }
+    flat_obs = torch.rand(batch, 571)
+    legal_actions = torch.ones(batch, NUM_BIDS)
 
     def _policy_net():
         net = PolicyNetwork()
-        logits = net(obs)
+        logits = net(flat_obs, legal_actions)
         assert logits.shape == (batch, NUM_BIDS)
-        action, log_prob, entropy = net.get_action(obs)
+        action, log_prob, entropy = net.get_action(flat_obs, legal_actions)
         assert action.shape == (batch,)
         assert log_prob.shape == (batch,)
 
     def _value_net_local():
         net = ValueNetwork(centralized=False)
-        val = net(obs)
+        val = net(flat_obs)
         assert val.shape == (batch,)
 
     def _value_net_centralized():
         net = ValueNetwork(centralized=True)
         all_hands = torch.rand(batch, 4, 52)
-        val = net(obs, all_hands)
+        val = net(flat_obs, all_hands)
         assert val.shape == (batch,)
 
     def _actor_critic():
         ac = ActorCritic(centralized_critic=False)
-        action, log_prob, entropy, value = ac.get_action_and_value(obs)
+        action, log_prob, entropy, value = ac.get_action_and_value(
+            flat_obs, legal_actions)
         assert action.shape == (batch,)
         assert value.shape == (batch,)
 
     def _actor_critic_centralized():
         ac = ActorCritic(centralized_critic=True)
         all_hands = torch.rand(batch, 4, 52)
-        action, log_prob, entropy, value = ac.get_action_and_value(obs, all_hands)
+        action, log_prob, entropy, value = ac.get_action_and_value(
+            flat_obs, legal_actions, all_hands)
         assert action.shape == (batch,)
         assert value.shape == (batch,)
 
     def _belief_net():
         net = BeliefNetwork()
-        belief = net(obs['hand'], obs['history'],
-                     torch.tensor([0, 1, 2, 3]), torch.tensor([2, 3, 0, 1]))
-        assert belief.shape == (batch, 52)
-        assert (belief >= 0).all() and (belief <= 1).all(), "Belief should be in [0,1]"
+        belief = net.get_probs(flat_obs, torch.tensor([2, 3, 0, 1]))
+        assert belief.shape == (batch, 48)
+        assert (belief >= 0).all() and (belief <= 1).all()
 
     def _belief_loss():
         net = BeliefNetwork()
-        target = torch.rand(batch, 52).round()  # binary target
-        loss = net.compute_loss(obs['hand'], obs['history'],
-                                torch.tensor([0, 1, 2, 3]),
-                                torch.tensor([2, 3, 0, 1]),
-                                target)
+        target = torch.zeros(batch, 48)
+        target[:, 16 + 3] = 1
+        target[:, 24 + 3] = 1
+        target[:, 32 + 3] = 1
+        target[:, 40 + 3] = 1
+        loss = net.compute_loss(
+            flat_obs, torch.tensor([2, 3, 0, 1]), target)
         assert loss.dim() == 0  # scalar
         assert loss.item() > 0
 
@@ -600,61 +598,37 @@ def test_networks():
 def test_agents():
     print("\n[9] Agents")
     import torch
-    from algorithms import IPPOAgent, PPOConfig, MAPPOAgent, MAPPOConfig
+    from algorithms import MAPPOAgent, MAPPOConfig
 
     def _make_obs():
-        obs = {k: np.random.rand(*s).astype(np.float32) for k, s in [
-            ('hand', (52,)), ('history', (60, 38)),
-            ('legal_actions', (38,)), ('position', (4,)), ('vulnerability', (2,))
-        ]}
-        obs['legal_actions'][:] = 1
-        obs['position'][:] = 0
-        obs['position'][0] = 1
-        return obs
-
-    def _ippo_action():
-        agent = IPPOAgent(PPOConfig(device='cpu'))
-        obs = _make_obs()
-        action, extra = agent.get_action(obs)
-        assert 0 <= action < 38
-        assert 'log_prob' in extra
-        assert 'value' in extra
-
-    def _ippo_store_and_update():
-        agent = IPPOAgent(PPOConfig(device='cpu'))
-        obs = _make_obs()
-        for _ in range(10):
-            action, extra = agent.get_action(obs)
-            agent.store_transition(0, obs, action, extra['log_prob'], 1.0, extra['value'], False)
-        action, extra = agent.get_action(obs)
-        agent.store_transition(0, obs, action, extra['log_prob'], 5.0, extra['value'], True)
-        stats = agent.update()
-        assert 'loss' in stats
-        assert 'policy_loss' in stats
+        return (
+            np.random.rand(571).astype(np.float32),
+            np.ones(38, dtype=np.float32),
+        )
 
     def _mappo_action():
-        agent = MAPPOAgent(MAPPOConfig(device='cpu'))
-        obs = _make_obs()
+        agent = MAPPOAgent(MAPPOConfig(device='cpu', hidden_dim=64))
+        flat_obs, legal = _make_obs()
         all_hands = np.random.rand(4, 52).astype(np.float32)
-        action, extra = agent.get_action(obs, all_hands=all_hands)
+        action, extra = agent.get_action_for_player(
+            flat_obs, legal, player=0, all_hands=all_hands)
         assert 0 <= action < 38
 
     def _mappo_store_and_update():
-        agent = MAPPOAgent(MAPPOConfig(device='cpu'))
-        obs = _make_obs()
+        agent = MAPPOAgent(MAPPOConfig(
+            device='cpu', hidden_dim=64, batch_size=4, num_epochs=1))
+        flat_obs, legal = _make_obs()
         all_hands = np.random.rand(4, 52).astype(np.float32)
-        for _ in range(10):
-            action, extra = agent.get_action(obs, all_hands=all_hands)
-            agent.store_transition(0, obs, action, extra['log_prob'], 1.0,
-                                   extra['value'], False, all_hands=all_hands)
-        action, extra = agent.get_action(obs, all_hands=all_hands)
-        agent.store_transition(0, obs, action, extra['log_prob'], 5.0,
-                               extra['value'], True, all_hands=all_hands)
+        for index in range(8):
+            action, extra = agent.get_action_for_player(
+                flat_obs, legal, player=0, all_hands=all_hands)
+            agent.store_transition(
+                0, flat_obs, legal, action, extra['log_prob'],
+                5.0 if index == 7 else 1.0, extra['value'], index == 7,
+                all_hands=all_hands)
         stats = agent.update()
         assert 'loss' in stats
 
-    run_test("IPPO get_action", _ippo_action)
-    run_test("IPPO store + update", _ippo_store_and_update)
     run_test("MAPPO get_action", _mappo_action)
     run_test("MAPPO store + update", _mappo_store_and_update)
 
