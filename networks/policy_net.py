@@ -15,7 +15,7 @@ BCA extension (667-dim):
 
 Action mapping (our ordering ↔ OpenSpiel):
     Our:      Pass=0, Dbl=1, Rdbl=2, 1C=3, 1D=4, ..., 7NT=37
-    OpenSpiel: Pass=52, 1C=53, ..., 7NT=87, Dbl=88, Rdbl=89
+    OpenSpiel: Pass=52, Dbl=53, Rdbl=54, 1C=55, ..., 7NT=89
 
 Card encoding:
     OpenSpiel/SAYC data: rank-major (card_id = rank * 4 + suit)
@@ -45,6 +45,7 @@ from env import NUM_BIDS, NUM_PLAYERS, BID_PASS, BID_DOUBLE, BID_REDOUBLE, BID_1
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 BASE_INPUT_DIM = OBS_DIM
+ACTION_MAPPING_VERSION = "openspiel_native_52_89_v1"
 
 # P101: Belief-conditioned Actor
 BELIEF_FEAT_DIM = 96                            # 48 (partner) + 48 (RHO)
@@ -53,9 +54,10 @@ BELIEF_OBS_DIM  = OBS_DIM + BELIEF_FEAT_DIM     # 571 + 96 = 667
 # OpenSpiel action constants
 OS_MIN_ACTION = 52
 OS_PASS       = 52
-OS_DOUBLE     = 88
-OS_REDOUBLE   = 89
-OS_1C         = 53
+OS_DOUBLE     = 53
+OS_REDOUBLE   = 54
+OS_1C         = 55
+OS_7NT        = 89
 
 # Legacy aliases (for code that references old dims — will fail loudly if misused)
 OBS_DIM_OLD    = 301
@@ -71,7 +73,8 @@ def openspiel_raw_to_ours(os_action: int) -> int:
     if os_action == OS_PASS:      return BID_PASS        # 0
     if os_action == OS_DOUBLE:    return BID_DOUBLE       # 1
     if os_action == OS_REDOUBLE:  return BID_REDOUBLE     # 2
-    if OS_1C <= os_action <= 87:  return BID_1C + (os_action - OS_1C)  # 3..37
+    if OS_1C <= os_action <= OS_7NT:
+        return BID_1C + (os_action - OS_1C)  # 3..37
     return -1
 
 
@@ -82,6 +85,11 @@ def ours_to_openspiel_raw(our_action: int) -> int:
     if our_action == BID_REDOUBLE:  return OS_REDOUBLE
     if BID_1C <= our_action <= 37:  return OS_1C + (our_action - BID_1C)
     return -1
+
+
+def physical_to_openspiel_player(player: int, dealer: int) -> int:
+    """Map a physical N/E/S/W seat to the dealer-relative rolled state."""
+    return (int(player) - int(dealer)) % NUM_PLAYERS
 
 
 # ==============================================================================

@@ -22,6 +22,7 @@ from networks.policy_net import (
     hands_to_openspiel_state,
     openspiel_raw_to_ours,
     ours_to_openspiel_raw,
+    physical_to_openspiel_player,
     make_belief_features_prior,
 )
 from utils.imp import score_to_imp
@@ -102,7 +103,8 @@ class MAPPOPolicy:
             if raw_action in state.legal_actions():
                 state.apply_action(raw_action)
 
-        flat_obs = get_openspiel_obs(state, player)
+        observer = physical_to_openspiel_player(player, self.dealer)
+        flat_obs = get_openspiel_obs(state, observer)
         legal_mask = np.zeros(NUM_BIDS, dtype=np.float32)
         for raw_action in state.legal_actions():
             action = openspiel_raw_to_ours(raw_action)
@@ -152,7 +154,8 @@ class BeliefConditionedPolicy(MAPPOPolicy):
             if raw_action in state.legal_actions():
                 state.apply_action(raw_action)
 
-        base_obs = get_openspiel_obs(state, player)
+        observer = physical_to_openspiel_player(player, self.dealer)
+        base_obs = get_openspiel_obs(state, observer)
         if self.use_prior:
             belief_features = make_belief_features_prior()
         else:
@@ -160,10 +163,14 @@ class BeliefConditionedPolicy(MAPPOPolicy):
                 base_obs, dtype=torch.float32, device=self.agent.device
             ).unsqueeze(0)
             partner = torch.tensor(
-                [(player + 2) % 4], dtype=torch.long, device=self.agent.device
+                [physical_to_openspiel_player((player + 2) % 4, self.dealer)],
+                dtype=torch.long,
+                device=self.agent.device,
             )
             rho = torch.tensor(
-                [(player - 1) % 4], dtype=torch.long, device=self.agent.device
+                [physical_to_openspiel_player((player - 1) % 4, self.dealer)],
+                dtype=torch.long,
+                device=self.agent.device,
             )
             with torch.no_grad():
                 partner_probs = self.belief_net.get_probs(obs_t, partner)

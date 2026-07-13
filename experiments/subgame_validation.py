@@ -36,7 +36,7 @@ from experiments.evaluation import (
     sample_evaluation_deals,
 )
 from networks.belief_net import BeliefNetwork
-from networks.policy_net import OBS_DIM
+from networks.policy_net import ACTION_MAPPING_VERSION, OBS_DIM
 from subgames.competitive_env import CompetitiveSubgameEnv
 from subgames.subgame_trainer import SubgameConfig, SubgameTrainer
 from utils.running_stats import RunningStats
@@ -135,6 +135,7 @@ def save_training_checkpoint(trainer: SubgameTrainer, path: Path, label: str) ->
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     checkpoint["agent_label"] = label
     checkpoint["execution_uses_belief"] = False
+    checkpoint["action_mapping_version"] = ACTION_MAPPING_VERSION
     if trainer.belief_net is not None:
         checkpoint["belief_net"] = {
             key: value.detach().cpu()
@@ -149,6 +150,12 @@ def load_deployment_agent(path: Path, device: str) -> MAPPOAgent:
     obs_dim = checkpoint.get("obs_dim", OBS_DIM)
     if obs_dim != OBS_DIM:
         raise ValueError(f"Expected {OBS_DIM}-dimensional agent, got {obs_dim}: {path}")
+    mapping_version = checkpoint.get("action_mapping_version")
+    if mapping_version != ACTION_MAPPING_VERSION:
+        raise ValueError(
+            f"Checkpoint uses an unknown or legacy action mapping: {path}. "
+            "Retrain it with the corrected OpenSpiel 52..89 mapping."
+        )
     agent = MAPPOAgent(MAPPOConfig(
         device=device,
         obs_dim=OBS_DIM,

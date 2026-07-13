@@ -161,6 +161,8 @@ diagnostics, but it is not loaded by the evaluator.
 - Policy input is always the standard 571-dimensional OpenSpiel observation.
 - Card conversion is explicit: datasets use suit-major order and OpenSpiel uses
   rank-major order.
+- Bidding actions use OpenSpiel's native offset ordering: Pass/Dbl/RDbl/1C..7NT
+  are raw actions 52/53/54/55..89 and map to policy outputs 0..37.
 - Deals are interleaved when reconstructed in OpenSpiel.
 - Dealer rotation and vulnerability are applied to both training and evaluation.
 - In the controlled subexperiment, the constrained opener hand, dealer, DDS

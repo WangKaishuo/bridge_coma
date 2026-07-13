@@ -24,6 +24,7 @@ from networks.policy_net import (
     MLPPolicyNetwork, MLPValueNetwork, OBS_DIM,
     convert_hands_suit_to_rank, hands_to_openspiel_state,
     get_openspiel_obs, ours_to_openspiel_raw,
+    physical_to_openspiel_player,
 )
 from algorithms.mappo import MAPPOAgent, MAPPOConfig
 from utils.running_stats import RunningStats
@@ -975,7 +976,9 @@ class SubgameTrainer:
                     opponent = (player + 1) % 4
                     step.update({
                         '_rinfo': True,
-                        'target_pos': player,
+                        'target_pos': physical_to_openspiel_player(
+                            player, _dealer_i
+                        ),
                         'belief_target': hand_to_belief_target(all_hands[player]),
                         'partner_pos': partner,
                         'opponent_pos': opponent,
@@ -1179,7 +1182,8 @@ class SubgameTrainer:
                                 os_action = ours_to_openspiel_raw(last_a)
                                 if os_action >= 0 and os_action in legal:
                                     os_state.apply_action(os_action)
-                        flat = get_openspiel_obs(os_state, player)
+                        observer = physical_to_openspiel_player(player, dealer)
+                        flat = get_openspiel_obs(os_state, observer)
                         # Store new state for future extension
                         if len(self._obs_state_cache) >= _OBS_CACHE_MAX:
                             self._obs_state_cache.pop(next(iter(self._obs_state_cache)))
@@ -1200,7 +1204,8 @@ class SubgameTrainer:
                         os_action = ours_to_openspiel_raw(a)
                         if os_action >= 0 and os_action in legal:
                             os_state.apply_action(os_action)
-                    flat = get_openspiel_obs(os_state, player)
+                    observer = physical_to_openspiel_player(player, dealer)
+                    flat = get_openspiel_obs(os_state, observer)
                     if len(self._obs_cache) >= _OBS_CACHE_MAX:
                         self._obs_cache.pop(next(iter(self._obs_cache)))
                     if len(self._obs_state_cache) >= _OBS_CACHE_MAX:

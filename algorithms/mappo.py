@@ -8,7 +8,13 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 from env import NUM_PLAYERS, NORTH, SOUTH
-from networks.policy_net import MLPPolicyNetwork, MLPValueNetwork, OBS_DIM, BELIEF_OBS_DIM
+from networks.policy_net import (
+    ACTION_MAPPING_VERSION,
+    MLPPolicyNetwork,
+    MLPValueNetwork,
+    OBS_DIM,
+    BELIEF_OBS_DIM,
+)
 from algorithms.ppo import PPOConfig, RolloutBuffer
 
 
@@ -329,6 +335,7 @@ class MAPPOAgent:
             'critic_w_optimizer': self.critic_w_optimizer.state_dict(),
             'obs_dim':    getattr(self.config, 'obs_dim', OBS_DIM),
             'hidden_dim': getattr(self.config, 'hidden_dim', 1024),
+            'action_mapping_version': ACTION_MAPPING_VERSION,
         }, path)
 
     def load(self, path: str):
