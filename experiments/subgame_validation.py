@@ -143,6 +143,21 @@ def save_training_checkpoint(trainer: SubgameTrainer, path: Path, label: str) ->
     torch.save(checkpoint, path)
 
 
+def load_deployment_agent(path: Path, device: str) -> MAPPOAgent:
+    """Load a trained 571-dimensional agent without constructing a trainer."""
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    obs_dim = checkpoint.get("obs_dim", OBS_DIM)
+    if obs_dim != OBS_DIM:
+        raise ValueError(f"Expected {OBS_DIM}-dimensional agent, got {obs_dim}: {path}")
+    agent = MAPPOAgent(MAPPOConfig(
+        device=device,
+        obs_dim=OBS_DIM,
+        hidden_dim=checkpoint.get("hidden_dim", 1024),
+    ))
+    agent.load(str(path))
+    return agent
+
+
 def format_result(row: str, column: str, result) -> str:
     return (
         f"{row} vs {column}: {result.mean_imp:+.3f} ± {result.std_imp:.3f} IMP "
@@ -158,7 +173,11 @@ def run(args) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    labels = [label for label in "ABC" if label not in args.skip_agent]
+    labels = [] if args.eval_only else [
+        label for label in args.train_agents if label not in args.skip_agent
+    ]
+    if not args.eval_only and not labels:
+        raise ValueError("At least one training agent is required")
     trainers: dict[str, SubgameTrainer] = {}
     for label in labels:
         config = build_config(args, label, device)
@@ -168,27 +187,28 @@ def run(args) -> None:
     print(f"Policy observation: {OBS_DIM} dimensions")
     print("BeliefNet at execution: disabled")
 
-    reference_label = labels[0]
-    reference = trainers[reference_label]
-    if args.sl_checkpoint and os.path.exists(args.sl_checkpoint):
-        load_policy_checkpoint(reference.agent, args.sl_checkpoint, device)
-    else:
-        print(
-            f"Agent {reference_label}: no SL checkpoint; running one shared "
-            "rule-based warmup"
-        )
-        reference.run_bc_warmup()
+    if labels:
+        reference_label = labels[0]
+        reference = trainers[reference_label]
+        if args.sl_checkpoint and os.path.exists(args.sl_checkpoint):
+            load_policy_checkpoint(reference.agent, args.sl_checkpoint, device)
+        else:
+            print(
+                f"Agent {reference_label}: no SL checkpoint; running one shared "
+                "rule-based warmup"
+            )
+            reference.run_bc_warmup()
 
-    shared_initial_state = {
-        key: value.detach().clone()
-        for key, value in reference.agent.state_dict().items()
-    }
-    for label, trainer in trainers.items():
-        if label != reference_label:
-            trainer.agent.load_state_dict(shared_initial_state)
-        if args.kl_lambda > 0:
-            trainer.set_bc_anchor(trainer.agent)
-    print(f"Shared initial Actor+Critic parameters copied to: {', '.join(labels)}")
+        shared_initial_state = {
+            key: value.detach().clone()
+            for key, value in reference.agent.state_dict().items()
+        }
+        for label, trainer in trainers.items():
+            if label != reference_label:
+                trainer.agent.load_state_dict(shared_initial_state)
+            if args.kl_lambda > 0:
+                trainer.set_bc_anchor(trainer.agent)
+        print(f"Shared initial Actor+Critic parameters copied to: {', '.join(labels)}")
 
     info_trainers = [trainers[label] for label in ("B", "C") if label in trainers]
     if info_trainers:
@@ -222,10 +242,37 @@ def run(args) -> None:
             trainer, output_dir / f"agent_{label.lower()}_seed{args.seed}.pt", label
         )
 
+    should_evaluate = (
+        args.eval_only or args.evaluate or set(labels) == set("ABC")
+    )
+    if not should_evaluate:
+        print("Training complete. Cross-agent evaluation deferred to an eval-only run.")
+        return
+
+    checkpoint_overrides = {
+        "A": args.agent_a,
+        "B": args.agent_b,
+        "C": args.agent_c,
+    }
+    deployment_agents = {
+        label: trainer.agent for label, trainer in trainers.items()
+    }
+    for label in "ABC":
+        if label in deployment_agents:
+            continue
+        path = Path(checkpoint_overrides[label]) if checkpoint_overrides[label] else (
+            output_dir / f"agent_{label.lower()}_seed{args.seed}.pt"
+        )
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Missing Agent {label} checkpoint for evaluation: {path}"
+            )
+        deployment_agents[label] = load_deployment_agent(path, device)
+
     deals = sample_evaluation_deals(env, args.eval_deals, args.eval_seed)
     factories = {
-        label: make_mappo_factory(trainer.agent)
-        for label, trainer in trainers.items()
+        label: make_mappo_factory(agent)
+        for label, agent in deployment_agents.items()
     }
     results = {}
     for row, column in (("B", "A"), ("C", "A"), ("C", "B")):
@@ -270,7 +317,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--belief-pretrain-max-epochs", type=int, default=50)
     parser.add_argument("--fsp-sl-sample-prob", type=float, default=0.30)
     parser.add_argument("--fsp-quality-gate", action="store_true")
+    parser.add_argument(
+        "--train-agents", nargs="+", choices=list("ABC"), default=list("ABC"),
+        help="Agents to train in this Colab session, e.g. --train-agents B",
+    )
     parser.add_argument("--skip-agent", choices=list("ABC"), action="append", default=[])
+    parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument(
+        "--evaluate", action="store_true",
+        help="Evaluate after a partial training run by loading missing checkpoints",
+    )
+    parser.add_argument("--agent-a", help="Agent A checkpoint for evaluation")
+    parser.add_argument("--agent-b", help="Agent B checkpoint for evaluation")
+    parser.add_argument("--agent-c", help="Agent C checkpoint for evaluation")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     return parser.parse_args()

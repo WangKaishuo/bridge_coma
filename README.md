@@ -107,6 +107,38 @@ python experiments/subgame_validation.py \
   --seed 42
 ```
 
+### Split Colab sessions
+
+Agents can be trained independently to fit Colab runtime limits. Use the same
+seed, SL checkpoint, BeliefNet checkpoint, data, and hyperparameters in every
+session:
+
+```bash
+# Session 1
+python experiments/subgame_validation.py --train-agents A --seed 42 \
+  --data data/competitive_500k.npz --output-dir results/competitive_v2
+
+# Session 2
+python experiments/subgame_validation.py --train-agents B --seed 42 \
+  --data data/competitive_500k.npz --output-dir results/competitive_v2
+
+# Session 3
+python experiments/subgame_validation.py --train-agents C --seed 42 \
+  --data data/competitive_500k.npz --output-dir results/competitive_v2
+```
+
+After copying all three checkpoints into the same output directory, evaluate
+without training:
+
+```bash
+python experiments/subgame_validation.py --eval-only --seed 42 \
+  --data data/competitive_500k.npz \
+  --output-dir results/competitive_v2 --eval-deals 5000
+```
+
+`--agent-a`, `--agent-b`, and `--agent-c` may be used when the checkpoints are
+stored in different directories.
+
 Outputs are written to `results/competitive_v2/`.  Every policy checkpoint is
 self-contained for execution; a BeliefNet state may also be stored for research
 diagnostics, but it is not loaded by the evaluator.
