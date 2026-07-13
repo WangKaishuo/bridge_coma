@@ -516,10 +516,10 @@ class SubgameTrainer:
         print(f"[Critic Warmup] Collecting {num_deals} deals (NS:{half} + EW:{half}, batch={self.config.deals_per_step})...")
         ns_eps, _ = self._collect_episodes_batch(half, train_side='NS', fsp_sd=None,
                                                batch_size=self.config.deals_per_step,
-                                               skip_dual_table=True)
+                                               skip_dual_table=False)
         ew_eps, _ = self._collect_episodes_batch(half, train_side='EW', fsp_sd=None,
                                                batch_size=self.config.deals_per_step,
-                                               skip_dual_table=True)
+                                               skip_dual_table=False)
         self._store_episodes(ns_eps)
         self._store_episodes(ew_eps)
 
@@ -865,9 +865,15 @@ class SubgameTrainer:
                             (False, True),  (True, True)]
             _vul = _vul_choices[np.random.randint(4)]
             hands, dd_table = envs[i].generate_deal()
-            obs = envs[i].reset(hands, dd_table, vulnerability=_vul)
+            dealer = envs[i]._sampled_dealer
+            obs = envs[i].reset(
+                hands,
+                dd_table,
+                vulnerability=_vul,
+                dealer=dealer,
+            )
             slot_hist[i]   = list(envs[i].history_int)
-            slot_dealer[i] = envs[i].dealer   # dealer chosen by generate_deal()
+            slot_dealer[i] = envs[i].dealer
             slot_ep[i]     = []
             slot_done[i]   = False
             return obs
@@ -1036,7 +1042,6 @@ class SubgameTrainer:
                 score_opt   = self.env._compute_dds_optimal_score_ns(dd, vul)
                 imp_ns      = float(score_to_imp(score_ns  - score_opt))
                 imp_ew      = float(score_to_imp(score_opt - score_ns))
-                opener_seats = {dealer, (dealer + 2) % 4}
 
                 last_step_idx: Dict[int, int] = {}
                 for s_idx, s in enumerate(all_episodes[ep_idx]):
@@ -1045,7 +1050,7 @@ class SubgameTrainer:
                 for player, s_idx in last_step_idx.items():
                     s = all_episodes[ep_idx][s_idx]
                     s['done']   = True
-                    s['reward'] = imp_ns if player in opener_seats else imp_ew
+                    s['reward'] = imp_ns if player in (NORTH, SOUTH) else imp_ew
 
         # Build contiguous arrays for batched information-reward inference.
         result_eps = all_episodes[:num_deals]

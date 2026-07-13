@@ -68,7 +68,7 @@ def build_config(args, label: str, device: str) -> SubgameConfig:
         batch_size=16 if args.quick else args.batch_size,
         num_epochs=1 if args.quick else 4,
         entropy_coef=args.entropy_coef,
-        hidden_dim=64 if args.quick else 1024,
+        hidden_dim=1024,
         use_info_bonus=use_info_bonus,
         beta=beta,
         info_reward_weight=args.info_weight if use_info_bonus else 0.0,

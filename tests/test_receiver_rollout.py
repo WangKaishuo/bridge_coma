@@ -19,6 +19,36 @@ from utils.running_stats import RunningStats
 
 @unittest.skipUnless(HAS_OPEN_SPIEL, "OpenSpiel is not installed")
 class ReceiverRolloutTests(unittest.TestCase):
+    def test_rotated_dealer_preserves_fixed_prefix_semantics(self):
+        data = Path(__file__).resolve().parents[1] / "data" / "competitive_100k.npz"
+        env = CompetitiveSubgameEnv(str(data))
+        config = SubgameConfig(
+            hidden_dim=32,
+            deals_per_step=8,
+            steps_per_phase=1,
+            batch_size=8,
+            device="cpu",
+        )
+        trainer = SubgameTrainer(env, config, RunningStats())
+        np.random.seed(2026)
+        episodes, _ = trainer._collect_episodes_batch(
+            64,
+            train_side="NS",
+            fsp_sd=None,
+            batch_size=8,
+            skip_dual_table=True,
+        )
+        rollout_dealers = set()
+        for episode in episodes:
+            first = episode[0]
+            dealer = first["dealer"]
+            hands = first["all_hands"]
+            rollout_dealers.add(dealer)
+            self.assertTrue(env._satisfies_opener(hands[dealer]))
+            self.assertTrue(env._satisfies_overcaller(hands[(dealer + 1) % 4]))
+            self.assertEqual(first["player"], (dealer + 2) % 4)
+        self.assertEqual(rollout_dealers, {0, 1, 2, 3})
+
     def test_bidder_target_and_receiver_views(self):
         data = Path(__file__).resolve().parents[1] / "data" / "competitive_100k.npz"
         env = CompetitiveSubgameEnv(str(data))

@@ -290,13 +290,24 @@ class CompetitiveSubgameEnv:
         hands:         Optional[np.ndarray]   = None,
         dd_table:      Optional[np.ndarray]   = None,
         vulnerability: Tuple[bool, bool]       = (False, False),
+        dealer:        Optional[int]           = None,
     ) -> Dict[str, np.ndarray]:
-        """See the formal README for the current behavior contract."""
+        """Reset the constrained auction and apply the fixed ``1H-1S`` prefix.
+
+        Generated deals carry a sampled dealer so that the constrained N/E
+        dataset can be rotated without changing its relative roles.  External
+        callers remain backward compatible: when no dealer is supplied, an
+        explicitly provided deal is interpreted using North as dealer.
+        """
         if hands is None or dd_table is None:
             hands, dd_table = self.generate_deal()
-            dealer = self._sampled_dealer
+            generated_dealer = self._sampled_dealer
         else:
-            dealer = NORTH   # external caller: assume N-opener convention
+            generated_dealer = NORTH
+
+        if dealer is None:
+            dealer = generated_dealer
+        dealer = int(dealer)
 
         self._current_hands = hands
         self._current_dd    = dd_table

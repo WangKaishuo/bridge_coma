@@ -113,8 +113,7 @@ class MAPPOPolicy:
         legal_t = torch.as_tensor(
             legal_mask, dtype=torch.float32, device=self.agent.device
         )
-        relative_seat = (player - self.dealer) % 4
-        actor = self.agent.get_actor(relative_seat)
+        actor = self.agent.get_actor(player)
         with torch.no_grad():
             action, _, _ = actor.get_action(
                 obs_t.unsqueeze(0), legal_t.unsqueeze(0), self.deterministic
@@ -185,8 +184,7 @@ class BeliefConditionedPolicy(MAPPOPolicy):
         legal_t = torch.as_tensor(
             legal_mask, dtype=torch.float32, device=self.agent.device
         )
-        relative_seat = (player - self.dealer) % 4
-        actor = self.agent.get_actor(relative_seat)
+        actor = self.agent.get_actor(player)
         with torch.no_grad():
             action, _, _ = actor.get_action(
                 obs_t.unsqueeze(0), legal_t.unsqueeze(0), self.deterministic

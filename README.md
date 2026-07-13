@@ -5,9 +5,22 @@ bridge bidding.  A public bid can improve a partner's hidden-hand inference
 while also leaking information to an opponent.  The project adds a dense,
 belief-based communication reward to MAPPO with fictitious self-play (FSP).
 
+## Current handoff
+
+- `experiments/subgame_validation.py` is a controlled **subexperiment** on
+  constrained deals with the relative prefix `dealer:1H, dealer+1:1S`.
+- The planned **main experiment** uses unrestricted random deals and complete
+  auctions; the fixed prefix must not shape its environment or interfaces.
+- Policies, critics, buffers, and FSP checkpoints use physical N/E/S/W seats.
+  Random dealer rotation exposes every seat to different auction roles.
+- Agent A/B/C may be trained in separate Colab sessions.  The July Agent A run
+  logged in `agentA.txt` predates the synchronized-dealer fix and must be rerun.
+- After the controlled A/B/C rerun, the next task is the unrestricted main
+  environment and black-box published-agent baseline adapters.
+
 ## Research design
 
-The formal experiment uses three agents with identical 571-dimensional
+Both the controlled validation and main experiment use three agents with identical 571-dimensional
 OpenSpiel policies:
 
 | Agent | Task reward | Partner information | Opponent leakage penalty |
@@ -150,6 +163,9 @@ diagnostics, but it is not loaded by the evaluator.
   rank-major order.
 - Deals are interleaved when reconstructed in OpenSpiel.
 - Dealer rotation and vulnerability are applied to both training and evaluation.
+- In the controlled subexperiment, the constrained opener hand, dealer, DDS
+  declarer axis, and fixed `1H-1S` callers rotate together.
+- Actor selection and task-reward attribution use physical N/E/S/W seats.
 - Information gain uses the state immediately after the attributed bid; it must
   not include intervening actions from other players.
 - Partner and opponent gains use receiver-specific observations but the same
@@ -165,6 +181,7 @@ diagnostics, but it is not loaded by the evaluator.
 
 ```bash
 python tests/test_all.py
+python -m unittest tests.test_information_reward tests.test_receiver_rollout
 ```
 
 The preliminary report is available as `paper.pdf`.  It documents the earlier
