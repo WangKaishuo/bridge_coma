@@ -173,10 +173,13 @@ class FlatRolloutBuffer:
 
         for t in reversed(range(n)):
             next_val  = last_value if t == n - 1 else values_np[t + 1]
-            next_done = self.dones[t + 1] if t < n - 1 else True
-            delta     = (self.rewards[t] + gamma * next_val * (1.0 - float(next_done))
+            # dones[t] belongs to the transition stored at t.  Looking at
+            # dones[t + 1] leaks the first value of the next episode across a
+            # terminal boundary and cuts off the terminal reward one step early.
+            non_terminal = 1.0 - float(self.dones[t])
+            delta     = (self.rewards[t] + gamma * next_val * non_terminal
                          - values_np[t])
-            last_gae  = delta + gamma * gae_lambda * (1.0 - float(next_done)) * last_gae
+            last_gae  = delta + gamma * gae_lambda * non_terminal * last_gae
             advantages[t] = last_gae
 
         returns = advantages + values_np
@@ -200,6 +203,7 @@ class FlatRolloutBuffer:
                 'legal_actions': torch.stack([self.legal_actions[i] for i in idx]).to(device),
                 'actions':       torch.stack([self.actions[i]       for i in idx]).to(device),
                 'old_log_probs': torch.stack([self.log_probs[i]     for i in idx]).to(device),
+                'old_values':    torch.stack([self.values[i]        for i in idx]).to(device),
                 'advantages':    self.advantages[idx].to(device),
                 'returns':       self.returns[idx].to(device),
             }
@@ -272,7 +276,7 @@ class SubgameTrainer:
         self.bc_actors: Optional[Dict[int, MLPPolicyNetwork]] = None
 
         self._fsp_actor_cache: dict = {}  # role -> MLPPolicyNetwork
-        self._fsp_cache_key: Optional[str] = None
+        self._fsp_cache_source: Optional[dict] = None
 
         # Keyed on (hands_rm.tobytes(), dealer, history_tuple) → flat obs array
         # Cleared at the start of each collect_episodes_batch call.
@@ -283,6 +287,14 @@ class SubgameTrainer:
         self._global_step = 0
         self._vl_history: List[float] = []
         self._fsp_seeded: bool = False
+
+    def _prepare_fsp_cache(self, fsp_sd: Optional[dict]) -> None:
+        """Make cached role actors belong to one and only one snapshot."""
+        if self._fsp_cache_source is not fsp_sd:
+            self._fsp_actor_cache.clear()
+            # Keep the source alive as well as comparing by identity, so Python
+            # cannot recycle an id and make a new snapshot look like the old one.
+            self._fsp_cache_source = fsp_sd
 
     # ======================================================================
     # ======================================================================
@@ -837,6 +849,7 @@ class SubgameTrainer:
         # P109: clear obs cache at start of each batch to bound memory usage
         self._obs_cache.clear()
         self._obs_state_cache.clear()
+        self._prepare_fsp_cache(fsp_sd)
 
         envs = [CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
                 for _ in range(batch_size)]
@@ -857,7 +870,7 @@ class SubgameTrainer:
         slot_ep     = [[]   for _ in range(batch_size)]
         slot_done   = [True] * batch_size
         all_episodes: List[List[dict]] = []
-        _pending_rewards: List[Tuple]   = []   # P76: single-table DDS IMP reward queue
+        _pending_rewards: List[Tuple]   = []
         collected = 0
 
         def _reset(i):
@@ -909,8 +922,7 @@ class SubgameTrainer:
                                      role.replace('actor','critic'))
                 else:
                     if fsp_sd and role in fsp_sd:
-                        ck = str(id(fsp_sd))
-                        if self._fsp_cache_key != ck or role not in self._fsp_actor_cache:
+                        if role not in self._fsp_actor_cache:
                             net = MLPPolicyNetwork(
                                 obs_dim=OBS_DIM,
                                 hidden_dim=self.config.hidden_dim).to(self.device)
@@ -918,7 +930,6 @@ class SubgameTrainer:
                                 {k: v.to(self.device) for k, v in fsp_sd[role].items()})
                             net.eval()
                             self._fsp_actor_cache[role] = net
-                            self._fsp_cache_key = ck
                         actor = self._fsp_actor_cache[role]
                     else:
                         actor = getattr(self.agent.model, role)
@@ -1028,6 +1039,7 @@ class SubgameTrainer:
                         _pending_rewards.append((
                             len(all_episodes) - 1,
                             envs[i]._current_dd.copy(),
+                            envs[i]._current_hands.copy(),
                             slot_dealer[i],
                             envs[i]._vulnerability,
                             envs[i].env.state.final_contract,
@@ -1040,11 +1052,20 @@ class SubgameTrainer:
 
 
         if not skip_dual_table and _pending_rewards:
-            for (ep_idx, dd, dealer, vul, contract) in _pending_rewards:
-                score_ns    = self.env._compute_score_ns(contract, dd, vul)
-                score_opt   = self.env._compute_dds_optimal_score_ns(dd, vul)
-                imp_ns      = float(score_to_imp(score_ns  - score_opt))
-                imp_ew      = float(score_to_imp(score_opt - score_ns))
+            reference_scores = self._play_role_swapped_tables_batch(
+                _pending_rewards, train_side, fsp_sd, batch_size
+            )
+            for pending, reference_score in zip(_pending_rewards, reference_scores):
+                ep_idx, dd, hands, dealer, vul, contract = pending
+                primary_score = self.env._compute_score_ns(contract, dd, vul)
+                # Both scores use the NS viewpoint.  The current policy controls
+                # train_side at the primary table and the opposite partnership
+                # at the reference table, exactly matching evaluate_match's
+                # opener/overcaller role exchange on the same deal.
+                signed_diff = (primary_score - reference_score
+                               if train_side == 'NS'
+                               else reference_score - primary_score)
+                task_imp = float(score_to_imp(signed_diff))
 
                 last_step_idx: Dict[int, int] = {}
                 for s_idx, s in enumerate(all_episodes[ep_idx]):
@@ -1053,7 +1074,9 @@ class SubgameTrainer:
                 for player, s_idx in last_step_idx.items():
                     s = all_episodes[ep_idx][s_idx]
                     s['done']   = True
-                    s['reward'] = imp_ns if player in (NORTH, SOUTH) else imp_ew
+                    is_train_player = ((train_side == 'NS' and player in (NORTH, SOUTH)) or
+                                       (train_side == 'EW' and player in (EAST, WEST)))
+                    s['reward'] = task_imp if is_train_player else -task_imp
 
         # Build contiguous arrays for batched information-reward inference.
         result_eps = all_episodes[:num_deals]
@@ -1100,20 +1123,119 @@ class SubgameTrainer:
 
         return result_eps, _rinfo_data
 
+    def _play_role_swapped_tables_batch(
+        self,
+        pending: List[Tuple],
+        train_side: str,
+        fsp_sd: Optional[dict],
+        batch_size: int,
+    ) -> List[int]:
+        """Play the paired table used by the duplicate-IMP task reward.
+
+        Hands, dealer and vulnerability stay fixed.  Current and FSP policies
+        exchange partnership roles, which is the same pairing used by the
+        formal evaluator.  Only final NS-view scores are retained.
+        """
+        from subgames.competitive_env import CompetitiveSubgameEnv
+
+        self._prepare_fsp_cache(fsp_sd)
+        scores: List[int] = []
+        for start in range(0, len(pending), batch_size):
+            chunk = pending[start:start + batch_size]
+            envs = []
+            observations = []
+            histories = []
+            done = []
+
+            for _, dd, hands, dealer, vul, _ in chunk:
+                env = CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
+                env.loader = self.env.loader
+                env.env = __import__('env', fromlist=['BridgeBiddingEnv']).BridgeBiddingEnv(60)
+                env.max_history_len = 60
+                env.dealer = NORTH
+                env._sampled_dealer = NORTH
+                env._is_constrained_data = self.env._is_constrained_data
+                env._filtered_deals = self.env._filtered_deals
+                env._current_hands = None
+                env._current_dd = None
+                env._vulnerability = (False, False)
+                env.history_int = []
+                observations.append(env.reset(hands, dd, vulnerability=vul, dealer=dealer))
+                histories.append(list(env.history_int))
+                done.append(False)
+                envs.append(env)
+
+            while not all(done):
+                from collections import defaultdict
+                groups = defaultdict(list)
+                for i, env in enumerate(envs):
+                    if done[i]:
+                        continue
+                    player = env.current_player
+                    primary_train = ((train_side == 'NS' and player in (NORTH, SOUTH)) or
+                                     (train_side == 'EW' and player in (EAST, WEST)))
+                    # Paired table: policies exchange partnership roles.
+                    use_current = not primary_train
+                    role = {NORTH:'actor_n', EAST:'actor_e',
+                            SOUTH:'actor_s', WEST:'actor_w'}[player]
+                    groups[(use_current, role)].append(i)
+
+                action_map = {}
+                for (use_current, role), slots in groups.items():
+                    if use_current or not fsp_sd or role not in fsp_sd:
+                        actor = getattr(self.agent.model, role)
+                    else:
+                        player = {'actor_n': NORTH, 'actor_e': EAST,
+                                  'actor_s': SOUTH, 'actor_w': WEST}[role]
+                        actor = self._get_fsp_actor(player, fsp_sd)
+
+                    flat = np.stack([
+                        self._encode_for_actor(
+                            observations[i], envs[i].dealer, histories[i],
+                            envs[i].current_player,
+                            all_hands=envs[i]._current_hands,
+                            use_prior=True,
+                            vulnerability=envs[i]._vulnerability,
+                        )[:OBS_DIM]
+                        for i in slots
+                    ])
+                    legal = np.stack([observations[i]['legal_actions'] for i in slots])
+                    flat_t = torch.as_tensor(flat, dtype=torch.float32, device=self.device)
+                    legal_t = torch.as_tensor(legal, dtype=torch.float32, device=self.device)
+                    with torch.no_grad():
+                        actions, _, _ = actor.get_action(flat_t, legal_t)
+                    for j, i in enumerate(slots):
+                        action_map[i] = int(actions[j].item())
+
+                for i, env in enumerate(envs):
+                    if done[i]:
+                        continue
+                    action = action_map[i]
+                    histories[i].append(action)
+                    observations[i], _, done[i], _ = env.step(action)
+
+            for env in envs:
+                scores.append(self.env._compute_score_ns(
+                    env.env.state.final_contract,
+                    env._current_dd,
+                    env._vulnerability,
+                ))
+
+        return scores
+
     def _get_fsp_actor(self, player: int, fsp_sd: dict) -> MLPPolicyNetwork:
         """See the formal README for the current behavior contract."""
         role = {NORTH:'actor_n', EAST:'actor_e',
                 SOUTH:'actor_s', WEST:'actor_w'}[player]
         if role not in fsp_sd:
             return self.agent.get_actor(player)
-        cache_key = str(id(fsp_sd))
-        if self._fsp_cache_key != cache_key or role not in self._fsp_actor_cache:
+        self._prepare_fsp_cache(fsp_sd)
+        if role not in self._fsp_actor_cache:
             net = MLPPolicyNetwork(obs_dim=OBS_DIM,
                                    hidden_dim=self.config.hidden_dim).to(self.device)
             net.load_state_dict({k: v.to(self.device) for k, v in fsp_sd[role].items()})
             net.eval()
             self._fsp_actor_cache[role] = net
-            self._fsp_cache_key = cache_key
         return self._fsp_actor_cache[role]
 
     def _store_episodes(self, episodes: List[List[dict]]):
@@ -1351,6 +1473,7 @@ class SubgameTrainer:
                 b_legal  = batch['legal_actions']
                 b_act    = batch['actions']
                 b_old_lp = batch['old_log_probs']
+                b_old_v  = batch['old_values']
                 b_ret    = batch['returns']
                 b_adv    = batch['advantages']
                 b_ah     = batch.get('all_hands')
@@ -1396,11 +1519,12 @@ class SubgameTrainer:
 
                 # Critic loss
                 vals    = critic(b_flat, b_ah)
-                old_v   = vals.detach()
-                v_clip  = old_v + (vals - old_v).clamp(
+                v_clip  = b_old_v + (vals - b_old_v).clamp(
                     -self.config.clip_ratio, self.config.clip_ratio)
-                value_loss = torch.max(F.mse_loss(vals, b_ret),
-                                       F.mse_loss(v_clip, b_ret))
+                value_loss = torch.max(
+                    F.mse_loss(vals, b_ret, reduction='none'),
+                    F.mse_loss(v_clip, b_ret, reduction='none'),
+                ).mean()
                 critic_opt.zero_grad()
                 value_loss.backward()
                 nn.utils.clip_grad_norm_(critic.parameters(), self.config.max_grad_norm)
@@ -1563,7 +1687,8 @@ class SubgameTrainer:
 
             log_entry = {
                 'round': rnd+1, 'mean_reward': mean_r, 'std_reward': std_r,
-                'mean_ns_regret': mean_ns, 'mean_ew_regret': mean_ew,
+                'mean_task_imp': mean_r,
+                'mean_ns_task_imp': mean_ns, 'mean_ew_task_imp': mean_ew,
                 'ns_metrics': ns_metrics, 'ew_metrics': ew_metrics,
                 'fsp_pool_size': len(self.fsp_pool),
                 'mean_ir':    float(np.mean(_ir_vals)) if _ir_vals else None,
@@ -1598,10 +1723,10 @@ class SubgameTrainer:
         fsp = entry['fsp_pool_size']
         mr  = entry['mean_reward']
         sr  = entry['std_reward']
-        ns_r = entry.get('mean_ns_regret', 0.0)
-        ew_r = entry.get('mean_ew_regret', 0.0)
+        ns_r = entry.get('mean_ns_task_imp', 0.0)
+        ew_r = entry.get('mean_ew_task_imp', 0.0)
 
-        print(f"  [Round {rnd}] regret={mr:+.3f}±{sr:.3f}  (NS={ns_r:+.3f} EW={ew_r:+.3f})  fsp={fsp}")
+        print(f"  [Round {rnd}] rollout_task_IMP={mr:+.3f}±{sr:.3f}  (NS={ns_r:+.3f} EW={ew_r:+.3f})  fsp={fsp}")
 
         ns = entry.get('ns_metrics', {})
         ns_n = ns.get(NORTH, {}); ns_s = ns.get(SOUTH, {})
