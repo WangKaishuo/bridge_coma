@@ -95,10 +95,20 @@ class ActorPolicy:
         self.label = label
         self.device = torch.device(device)
         self.actors = []
+        belief_conditioned = bool(
+            checkpoint.get("actor_belief_conditioned", False)
+        )
         for seat, key in enumerate(("actor_n", "actor_e", "actor_s", "actor_w")):
             if key not in checkpoint:
                 raise KeyError(f"{checkpoint_path} does not contain {key}")
-            actor = MLPPolicyNetwork(obs_dim=obs_dim, hidden_dim=hidden_dim)
+            actor = MLPPolicyNetwork(
+                obs_dim=obs_dim,
+                hidden_dim=hidden_dim,
+                belief_conditioned=belief_conditioned,
+                belief_hidden_dim=checkpoint.get(
+                    "actor_belief_hidden_dim", hidden_dim
+                ),
+            )
             actor.load_state_dict(checkpoint[key])
             actor.to(self.device).eval()
             self.actors.append(actor)

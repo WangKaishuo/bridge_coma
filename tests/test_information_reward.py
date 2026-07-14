@@ -63,7 +63,7 @@ class DualInformationRewardTests(unittest.TestCase):
         gain = computer.compute_info_gain(before, after, target)
         self.assertGreater(float(gain.item()), 0.0)
 
-    def test_worse_posterior_is_clipped_to_zero(self):
+    def test_worse_posterior_has_negative_gain(self):
         target = target_with_length()
         good = torch.full((1, BELIEF_DIM), 0.25)
         bad = good.clone()
@@ -76,7 +76,7 @@ class DualInformationRewardTests(unittest.TestCase):
 
         computer = DualInfoComputer(belief_net=None, beta=0.05)
         gain = computer.compute_info_gain(good, bad, target)
-        self.assertEqual(float(gain.item()), 0.0)
+        self.assertLess(float(gain.item()), 0.0)
 
     def test_opponent_leakage_is_subtracted(self):
         computer = DualInfoComputer(belief_net=None, beta=0.25)

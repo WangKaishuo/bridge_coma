@@ -1,10 +1,10 @@
 """MAPPO/FSP trainer for the competitive bridge-bidding subgame.
 
-Actors always consume the standard 571-dimensional OpenSpiel observation.
-BeliefNet is a training-only communication critic.  For a bid by player ``i``,
-both receiver views predict ``i``'s hand: the partner view conditions on the
-partner's private hand and the opponent view conditions on the next opponent's
-private hand.  Evaluation is implemented separately in ``experiments/evaluation``.
+Actors expose the standard 571-dimensional OpenSpiel observation API and build
+partner/RHO belief features internally.  A separate frozen BeliefNet is the
+training-only Judge.  For a bid by player ``i``, both Judge receiver views
+predict ``i``'s hand: the partner view conditions on the partner's private hand
+and the opponent view conditions on the next opponent's private hand.
 """
 
 from __future__ import annotations
@@ -28,7 +28,10 @@ from networks.policy_net import (
 )
 from algorithms.mappo import MAPPOAgent, MAPPOConfig
 from utils.running_stats import RunningStats
-from utils.hand_features import hand_to_belief_target, belief_accuracy, BELIEF_DIM
+from utils.hand_features import (
+    hand_to_belief_target, batch_hand_to_belief_target,
+    belief_accuracy, BELIEF_DIM,
+)
 from utils.fsp_pool import FSPPool
 from utils.imp import score_to_imp
 
@@ -77,7 +80,12 @@ class SubgameConfig:
     # Dual-information reward
     use_info_bonus:      bool  = False
     beta:                float = 0.05
-    info_reward_weight:  float = 0.2
+    info_reward_weight:  float = 0.05
+    info_scale_calibration_deals: int = 2048
+
+    # Deployed actor: 571 external observation -> internal 96-dim belief head.
+    belief_conditioned: bool = True
+    actor_belief_coef:  float = 0.1
 
     # Fictitious self-play
     fsp_pool_size:    int   = 0
@@ -244,6 +252,8 @@ class SubgameTrainer:
             critic_lr_ratio = config.critic_lr_ratio,
             hidden_dim      = config.hidden_dim,
             obs_dim         = _obs_dim,
+            actor_belief_conditioned = config.belief_conditioned,
+            actor_belief_hidden_dim  = config.hidden_dim,
         )
         self.agent = MAPPOAgent(mappo_cfg)
 
@@ -257,14 +267,22 @@ class SubgameTrainer:
         self.dual_info:      Optional[DualInfoComputer]  = None
         self.belief_optimizer = None
 
-        _need_belief = config.use_info_bonus
+        _need_belief = config.use_info_bonus or config.belief_conditioned
         if _need_belief:
             self.belief_net  = BeliefNetwork(hidden_dim=config.hidden_dim).to(self.device)
             if config.use_info_bonus:
                 self.dual_info = DualInfoComputer(self.belief_net, beta=config.beta)
-            self.belief_optimizer = torch.optim.Adam(
-                self.belief_net.parameters(), lr=config.belief_update_lr)
-            self.partner_stats  = RunningStats()
+            if not config.freeze_belief:
+                self.belief_optimizer = torch.optim.Adam(
+                    self.belief_net.parameters(), lr=config.belief_update_lr)
+            self.belief_net.eval()
+            for parameter in self.belief_net.parameters():
+                parameter.requires_grad_(False)
+
+        # A single calibration constant is computed before training and then
+        # shared by B/C.  It never follows the policy during training.
+        self.info_scale_factor: Optional[float] = None
+        self.info_scale_metadata: Optional[dict] = None
 
         self.reward_stats: RunningStats = reward_stats or RunningStats()
 
@@ -287,6 +305,15 @@ class SubgameTrainer:
         self._global_step = 0
         self._vl_history: List[float] = []
         self._fsp_seeded: bool = False
+
+    def initialize_actor_beliefs_from_judge(self) -> None:
+        """Warm-start every deployed decoder from the separate frozen Judge."""
+        if self.belief_net is None or not self.config.belief_conditioned:
+            return
+        for player in range(NUM_PLAYERS):
+            self.agent.get_actor(player).initialize_belief_from_judge(
+                self.belief_net
+            )
 
     def _prepare_fsp_cache(self, fsp_sd: Optional[dict]) -> None:
         """Make cached role actors belong to one and only one snapshot."""
@@ -366,7 +393,9 @@ class SubgameTrainer:
         """See the formal README for the current behavior contract."""
         def _frozen_copy(state_dict):
             net = MLPPolicyNetwork(obs_dim=OBS_DIM,
-                                   hidden_dim=self.config.hidden_dim).to(self.device)
+                                   hidden_dim=self.config.hidden_dim,
+                                   belief_conditioned=self.config.belief_conditioned,
+                                   belief_hidden_dim=self.config.hidden_dim).to(self.device)
             net.load_state_dict(state_dict)
             net.eval()
             for p in net.parameters():
@@ -615,6 +644,9 @@ class SubgameTrainer:
         if self.belief_net is None:
             return
 
+        for parameter in self.belief_net.parameters():
+            parameter.requires_grad_(True)
+
         total_deals = num_rounds * deals_per_round
         print(f"\n[Belief Pretrain] Collecting {total_deals} deals (1 pass)...")
 
@@ -626,6 +658,9 @@ class SubgameTrainer:
         tensors = self._extract_receiver_belief_data(all_episodes)
         if tensors is None:
             print("[Belief Pretrain] No belief data collected, skipping.")
+            self.belief_net.eval()
+            for parameter in self.belief_net.parameters():
+                parameter.requires_grad_(False)
             return
         obs_all, tp_all, tgt_all = tensors
         N = len(obs_all)
@@ -697,7 +732,9 @@ class SubgameTrainer:
                           f"(no improve for {patience} epochs)")
                     break
 
-        self.belief_net.train()
+        self.belief_net.eval()
+        for parameter in self.belief_net.parameters():
+            parameter.requires_grad_(False)
         print(f"[Belief Pretrain] Done. best_val_loss={best_val:.4f}")
 
         # ── P97: Compute Fisher Information Matrix for EWC ────────────
@@ -925,7 +962,9 @@ class SubgameTrainer:
                         if role not in self._fsp_actor_cache:
                             net = MLPPolicyNetwork(
                                 obs_dim=OBS_DIM,
-                                hidden_dim=self.config.hidden_dim).to(self.device)
+                                hidden_dim=self.config.hidden_dim,
+                                belief_conditioned=self.config.belief_conditioned,
+                                belief_hidden_dim=self.config.hidden_dim).to(self.device)
                             net.load_state_dict(
                                 {k: v.to(self.device) for k, v in fsp_sd[role].items()})
                             net.eval()
@@ -1120,7 +1159,9 @@ class SubgameTrainer:
         self._prepare_fsp_cache(fsp_sd)
         if role not in self._fsp_actor_cache:
             net = MLPPolicyNetwork(obs_dim=OBS_DIM,
-                                   hidden_dim=self.config.hidden_dim).to(self.device)
+                                   hidden_dim=self.config.hidden_dim,
+                                   belief_conditioned=self.config.belief_conditioned,
+                                   belief_hidden_dim=self.config.hidden_dim).to(self.device)
             net.load_state_dict({k: v.to(self.device) for k, v in fsp_sd[role].items()})
             net.eval()
             self._fsp_actor_cache[role] = net
@@ -1230,9 +1271,13 @@ class SubgameTrainer:
     # ======================================================================
     # ======================================================================
 
-    def _compute_info_bonus(self, episodes: List[List[dict]],
-                             rinfo_data: Optional[dict] = None) -> List[List[float]]:
-        """See the formal README for the current behavior contract."""
+    def _compute_raw_info_bonus(
+        self,
+        episodes: List[List[dict]],
+        rinfo_data: Optional[dict] = None,
+        beta_override: Optional[float] = None,
+    ) -> List[List[float]]:
+        """Compute unscaled signed Judge deltas for every actor transition."""
         if self.dual_info is None:
             return [[0.0] * len(ep) for ep in episodes]
 
@@ -1305,22 +1350,94 @@ class SubgameTrainer:
                 opp_leak = self.dual_info.compute_info_gain(
                     b_before_o, b_after_o, target_t[sl]
                 )
-                bonus, _     = self.dual_info.compute_dual_info_bonus(partner_gain, opp_leak)
+                beta = self.config.beta if beta_override is None else beta_override
+                bonus = partner_gain - beta * opp_leak
                 bonuses_flat[start:start + CHUNK] = bonus.cpu().numpy()
 
         for i, (ep_idx, s_idx) in enumerate(ep_step_idx):
             raw_ep_bonuses[ep_idx][s_idx] = float(bonuses_flat[i])
 
-        ep_totals = [sum(bs) for bs in raw_ep_bonuses]
-        for v in ep_totals:
-            self.partner_stats.update(v)
-        imp_std   = max(self.reward_stats.std, 1.0)
-        rinfo_std = max(self.partner_stats.std, 1e-6)
-        scale_factor = min(imp_std / rinfo_std, 1000.0) * self.config.info_reward_weight
+        return raw_ep_bonuses
+
+    def _compute_info_bonus(self, episodes: List[List[dict]],
+                             rinfo_data: Optional[dict] = None) -> List[List[float]]:
+        """Apply the single frozen pre-training scale to signed Judge deltas."""
+        raw_ep_bonuses = self._compute_raw_info_bonus(episodes, rinfo_data)
+        if self.dual_info is None:
+            return raw_ep_bonuses
+        if self.info_scale_factor is None:
+            raise RuntimeError(
+                "Information scale is unset. Calibrate it once before training."
+            )
         return [
-            [bonus * scale_factor for bonus in episode]
+            [bonus * self.info_scale_factor for bonus in episode]
             for episode in raw_ep_bonuses
         ]
+
+    @staticmethod
+    def _episode_task_rewards(episodes: List[List[dict]]) -> List[float]:
+        rewards = []
+        for episode in episodes:
+            for step in episode:
+                if step.get('done') and step.get('is_training_side'):
+                    rewards.append(float(step['reward']))
+                    break
+        return rewards
+
+    def calibrate_info_scale(self, num_deals: Optional[int] = None) -> dict:
+        """Pre-sample one fixed B/C scale from partner-only episode totals.
+
+        Calibration deliberately forces beta=0.  Agent B and Agent C therefore
+        share exactly the same units and differ only by C's leakage penalty.
+        """
+        if self.dual_info is None:
+            raise RuntimeError("Information calibration requires an info trainer")
+        num_deals = num_deals or self.config.info_scale_calibration_deals
+        half = max(1, num_deals // 2)
+        ns_eps, ns_data = self._collect_episodes_batch(
+            half, train_side='NS', fsp_sd=None,
+            batch_size=min(self.config.deals_per_step, half),
+            skip_dual_table=False,
+        )
+        ew_eps, ew_data = self._collect_episodes_batch(
+            num_deals - half, train_side='EW', fsp_sd=None,
+            batch_size=min(self.config.deals_per_step, max(1, num_deals - half)),
+            skip_dual_table=False,
+        )
+        raw = (
+            self._compute_raw_info_bonus(ns_eps, ns_data, beta_override=0.0)
+            + self._compute_raw_info_bonus(ew_eps, ew_data, beta_override=0.0)
+        )
+        info_totals = np.asarray([sum(episode) for episode in raw], dtype=np.float64)
+        task_rewards = np.asarray(
+            self._episode_task_rewards(ns_eps) + self._episode_task_rewards(ew_eps),
+            dtype=np.float64,
+        )
+        if len(info_totals) < 2 or len(task_rewards) < 2:
+            raise RuntimeError("Too few calibration episodes to estimate a fixed scale")
+        info_std = max(float(info_totals.std(ddof=1)), 1e-6)
+        imp_std = max(float(task_rewards.std(ddof=1)), 1.0)
+        self.info_scale_factor = min(imp_std / info_std, 1000.0) * self.config.info_reward_weight
+        self.info_scale_metadata = {
+            'num_deals': int(len(info_totals)),
+            'info_weight': float(self.config.info_reward_weight),
+            'partner_only_info_std': info_std,
+            'task_imp_std': imp_std,
+            'scale_factor': float(self.info_scale_factor),
+        }
+        print(
+            "[Info Scale] frozen partner-only calibration: "
+            f"deals={len(info_totals)} info_std={info_std:.6f} "
+            f"imp_std={imp_std:.6f} weight={self.config.info_reward_weight:.3f} "
+            f"scale={self.info_scale_factor:.6f}"
+        )
+        return dict(self.info_scale_metadata)
+
+    def copy_info_scale_from(self, other: "SubgameTrainer") -> None:
+        if other.info_scale_factor is None:
+            raise RuntimeError("Source trainer has no calibrated information scale")
+        self.info_scale_factor = float(other.info_scale_factor)
+        self.info_scale_metadata = dict(other.info_scale_metadata or {})
 
     # ======================================================================
     # PPO Update
@@ -1350,6 +1467,7 @@ class SubgameTrainer:
             last_val, self.agent.config.gamma, self.agent.config.gae_lambda)
 
         total_policy = total_value = total_entropy = total_kl = 0.0
+        total_actor_belief = 0.0
         n_updates = 0
 
         for epoch in range(self.config.num_epochs):
@@ -1393,9 +1511,30 @@ class SubgameTrainer:
                     kl_loss    = F.kl_div(
                         cur_probs.log(), bc_probs, reduction='batchmean')
 
+                actor_belief_loss = torch.tensor(0.0, device=self.device)
+                if (self.config.belief_conditioned
+                        and self.config.actor_belief_coef > 0
+                        and b_ah is not None):
+                    hands_np = b_ah.detach().cpu().numpy()
+                    partner_targets = batch_hand_to_belief_target(
+                        hands_np[:, (player + 2) % 4]
+                    )
+                    rho_targets = batch_hand_to_belief_target(
+                        hands_np[:, (player - 1) % 4]
+                    )
+                    belief_targets = torch.as_tensor(
+                        np.stack([partner_targets, rho_targets], axis=1),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    actor_belief_loss = actor.compute_belief_loss(
+                        b_flat, belief_targets
+                    )
+
                 actor_loss = (policy_loss
                               - self.config.entropy_coef * entropy.mean()
-                              + kl_lambda * kl_loss)
+                              + kl_lambda * kl_loss
+                              + self.config.actor_belief_coef * actor_belief_loss)
 
                 if torch.isnan(actor_loss):
                     continue   # skip batch — NaN loss would corrupt weights
@@ -1428,6 +1567,7 @@ class SubgameTrainer:
                 total_value   += value_loss.item()
                 total_entropy += entropy.mean().item()
                 total_kl      += kl_loss.item()
+                total_actor_belief += actor_belief_loss.item()
                 n_updates     += 1
 
             # Epoch-level KL early stopping
@@ -1447,6 +1587,7 @@ class SubgameTrainer:
             'entropy':     total_entropy / n_updates,
             'kl_loss':     total_kl      / n_updates,
             'kl_lambda':   kl_lambda,
+            'actor_belief_loss': total_actor_belief / n_updates,
         }
 
     # ======================================================================
@@ -1572,6 +1713,11 @@ class SubgameTrainer:
             std_r  = float(np.std(all_vals))  if all_vals else 0.0
             mean_ns = float(np.mean(raw_ns_vals)) if raw_ns_vals else 0.0
             mean_ew = float(np.mean(raw_ew_vals)) if raw_ew_vals else 0.0
+            _actor_belief_vals = [
+                metrics['actor_belief_loss']
+                for metrics in list(ns_metrics.values()) + list(ew_metrics.values())
+                if 'actor_belief_loss' in metrics
+            ]
 
             log_entry = {
                 'round': rnd+1, 'mean_reward': mean_r, 'std_reward': std_r,
@@ -1581,6 +1727,10 @@ class SubgameTrainer:
                 'fsp_pool_size': len(self.fsp_pool),
                 'mean_ir':    float(np.mean(_ir_vals)) if _ir_vals else None,
                 'belief_loss': float(np.mean(_bl_vals)) if _bl_vals else None,
+                'actor_belief_loss': (
+                    float(np.mean(_actor_belief_vals))
+                    if _actor_belief_vals else None
+                ),
                 'imp_std_running': float(self.reward_stats.std),
             }
             self.log.append(log_entry)
@@ -1640,6 +1790,9 @@ class SubgameTrainer:
 
         ir = entry.get('mean_ir')
         bl = entry.get('belief_loss')
+        actor_bl = entry.get('actor_belief_loss')
+        if actor_bl is not None:
+            print(f"    actor_belief_loss={actor_bl:.4f}")
         if ir is not None:
             bl_str = f"{bl:.4f}" if bl is not None else "N/A"
             print(f"    r_info │ step_ir={ir:.4f}  belief_loss={bl_str}")

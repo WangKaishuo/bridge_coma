@@ -6,9 +6,9 @@ Agent A: MAPPO + FSP, task reward only.
 Agent B: MAPPO + FSP, task reward + partner information gain.
 Agent C: MAPPO + FSP, task reward + partner gain - beta * opponent leakage.
 
-All three agents use the same 571-dimensional policy at training and execution.
-Belief networks are training-only communication critics for B and C.  Evaluation
-is black-box and never shares an internal model between agents.
+All three agents expose the same 571-dimensional interface and contain the same
+trainable partner/RHO belief decoder.  A separate frozen Judge exists only to
+measure information reward during training; it is never shared at execution.
 """
 
 from __future__ import annotations
@@ -72,7 +72,10 @@ def build_config(args, label: str, device: str) -> SubgameConfig:
         use_info_bonus=use_info_bonus,
         beta=beta,
         info_reward_weight=args.info_weight if use_info_bonus else 0.0,
-        freeze_belief=not use_info_bonus,
+        info_scale_calibration_deals=(64 if args.quick else args.info_calibration_deals),
+        belief_conditioned=True,
+        actor_belief_coef=args.actor_belief_coef,
+        freeze_belief=True,
         belief_update_epochs=1,
         belief_update_lr=args.belief_learning_rate,
         # KL is an optional baseline regularizer, not part of the main method.
@@ -103,15 +106,37 @@ def load_policy_checkpoint(agent: MAPPOAgent, path: str, device: str) -> dict:
             "not accepted by the formal experiment."
         )
 
+    def _load_actor(actor, state):
+        target = actor.state_dict()
+        for key, value in state.items():
+            if key not in target:
+                continue
+            if target[key].shape == value.shape:
+                target[key] = value.to(target[key].device)
+            elif (key == "net.0.weight"
+                  and target[key].ndim == 2
+                  and value.ndim == 2
+                  and target[key].shape[0] == value.shape[0]
+                  and target[key].shape[1] > value.shape[1]):
+                expanded = torch.zeros_like(target[key])
+                expanded[:, :value.shape[1]] = value.to(expanded.device)
+                target[key] = expanded
+            else:
+                raise ValueError(
+                    f"Unsupported actor tensor shape for {key}: "
+                    f"checkpoint={tuple(value.shape)} target={tuple(target[key].shape)}"
+                )
+        actor.load_state_dict(target)
+
     if "model_state" in checkpoint:
         state = checkpoint["model_state"]
         for player in range(NUM_PLAYERS):
-            agent.get_actor(player).load_state_dict(state)
+            _load_actor(agent.get_actor(player), state)
     else:
         keys = ("actor_n", "actor_e", "actor_s", "actor_w")
         for player, key in enumerate(keys):
             if key in checkpoint:
-                agent.get_actor(player).load_state_dict(checkpoint[key])
+                _load_actor(agent.get_actor(player), checkpoint[key])
     return checkpoint
 
 
@@ -123,19 +148,23 @@ def load_belief_checkpoint(trainer: SubgameTrainer, path: str, device: str) -> N
     hidden_dim = state["trunk.0.weight"].shape[0]
     if trainer.belief_net.trunk[0].out_features != hidden_dim:
         trainer.belief_net = BeliefNetwork(hidden_dim=hidden_dim).to(device)
-        trainer.dual_info.belief_net = trainer.belief_net
-        trainer.belief_optimizer = torch.optim.Adam(
-            trainer.belief_net.parameters(), lr=trainer.config.belief_update_lr
-        )
+        if trainer.dual_info is not None:
+            trainer.dual_info.belief_net = trainer.belief_net
     trainer.belief_net.load_state_dict(state)
+    trainer.belief_net.eval()
+    for parameter in trainer.belief_net.parameters():
+        parameter.requires_grad_(False)
 
 
 def save_training_checkpoint(trainer: SubgameTrainer, path: Path, label: str) -> None:
     trainer.agent.save(str(path))
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     checkpoint["agent_label"] = label
-    checkpoint["execution_uses_belief"] = False
+    checkpoint["execution_uses_belief"] = True
+    checkpoint["belief_interface"] = "571_external_internal_partner_rho_v1"
     checkpoint["action_mapping_version"] = ACTION_MAPPING_VERSION
+    checkpoint["info_scale_factor"] = trainer.info_scale_factor
+    checkpoint["info_scale_metadata"] = trainer.info_scale_metadata
     if trainer.belief_net is not None:
         checkpoint["belief_net"] = {
             key: value.detach().cpu()
@@ -160,6 +189,12 @@ def load_deployment_agent(path: Path, device: str) -> MAPPOAgent:
         device=device,
         obs_dim=OBS_DIM,
         hidden_dim=checkpoint.get("hidden_dim", 1024),
+        actor_belief_conditioned=checkpoint.get(
+            "actor_belief_conditioned", False
+        ),
+        actor_belief_hidden_dim=checkpoint.get(
+            "actor_belief_hidden_dim", checkpoint.get("hidden_dim", 1024)
+        ),
     ))
     agent.load(str(path))
     return agent
@@ -192,7 +227,8 @@ def run(args) -> None:
 
     print(f"Device: {device}")
     print(f"Policy observation: {OBS_DIM} dimensions")
-    print("BeliefNet at execution: disabled")
+    print("Policy interface: 571 dimensions; internal partner/RHO belief head enabled")
+    print("Frozen Judge at execution: disabled")
 
     if labels:
         reference_label = labels[0]
@@ -217,12 +253,17 @@ def run(args) -> None:
                 trainer.set_bc_anchor(trainer.agent)
         print(f"Shared initial Actor+Critic parameters copied to: {', '.join(labels)}")
 
+    belief_trainers = [trainers[label] for label in labels]
     info_trainers = [trainers[label] for label in ("B", "C") if label in trainers]
-    if info_trainers:
+    if belief_trainers:
         if args.belief_checkpoint and os.path.exists(args.belief_checkpoint):
-            for trainer in info_trainers:
+            for trainer in belief_trainers:
                 load_belief_checkpoint(trainer, args.belief_checkpoint, device)
         elif args.belief_pretrain_rounds > 0:
+            if not info_trainers:
+                raise RuntimeError(
+                    "Belief pretraining without a checkpoint requires Agent B or C"
+                )
             set_seed(args.seed + 10_000)
             source = info_trainers[0]
             source.pretrain_belief(
@@ -231,13 +272,34 @@ def run(args) -> None:
                 epochs_per_round=2 if args.quick else 5,
                 max_epochs=args.belief_pretrain_max_epochs,
             )
-            for trainer in info_trainers[1:]:
+            for trainer in belief_trainers:
+                if trainer is source:
+                    continue
                 trainer.belief_net.load_state_dict(source.belief_net.state_dict())
                 if hasattr(source, "_pretrain_replay"):
                     trainer._pretrain_replay = {
                         key: value.clone()
                         for key, value in source._pretrain_replay.items()
                     }
+        else:
+            raise FileNotFoundError(
+                "A frozen Judge checkpoint is required for the internal belief "
+                "architecture and information calibration"
+            )
+
+        for trainer in belief_trainers:
+            trainer.initialize_actor_beliefs_from_judge()
+
+    if info_trainers:
+        # The calibration seed is independent of training and is identical in
+        # split B/C Colab runs.  Calibration always uses partner-only deltas.
+        set_seed(args.seed + 20_000)
+        scale_source = info_trainers[0]
+        scale_source.calibrate_info_scale(
+            scale_source.config.info_scale_calibration_deals
+        )
+        for trainer in info_trainers[1:]:
+            trainer.copy_info_scale_from(scale_source)
 
     logs = {}
     for label, trainer in trainers.items():
@@ -294,7 +356,13 @@ def run(args) -> None:
     summary = {
         "seed": args.seed,
         "eval_seed": args.eval_seed,
-        "execution_uses_belief": False,
+        "execution_uses_belief": True,
+        "belief_interface": "571_external_internal_partner_rho_v1",
+        "info_scales": {
+            label: trainer.info_scale_metadata
+            for label, trainer in trainers.items()
+            if trainer.info_scale_metadata is not None
+        },
         "config": vars(args),
         "matchups": results,
     }
@@ -313,7 +381,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", type=int, default=25)
     parser.add_argument("--eval-deals", type=int, default=5000)
     parser.add_argument("--beta", type=float, default=0.05)
-    parser.add_argument("--info-weight", type=float, default=0.2)
+    parser.add_argument("--info-weight", type=float, default=0.05)
+    parser.add_argument("--info-calibration-deals", type=int, default=2048)
+    parser.add_argument("--actor-belief-coef", type=float, default=0.1)
     parser.add_argument("--learning-rate", type=float, default=3e-6)
     parser.add_argument("--belief-learning-rate", type=float, default=1e-5)
     parser.add_argument("--batch-size", type=int, default=256)

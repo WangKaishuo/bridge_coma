@@ -27,6 +27,8 @@ class MAPPOConfig(PPOConfig):
     """See the formal README for the current behavior contract."""
     hidden_dim:         int   = 1024
     obs_dim:            int   = OBS_DIM   # 480 (P104)
+    actor_belief_conditioned: bool = False
+    actor_belief_hidden_dim: Optional[int] = None
 
     # ── Critic ──────────────────────────────────────────────────────────────
     centralized_critic: bool  = True
@@ -139,6 +141,8 @@ class MAPPOAgent:
             return MLPPolicyNetwork(
                 obs_dim    = obs_dim,
                 hidden_dim = hidden_dim,
+                belief_conditioned=config.actor_belief_conditioned,
+                belief_hidden_dim=config.actor_belief_hidden_dim,
             ).to(self.device)
 
         def _make_critic() -> MLPValueNetwork:
@@ -335,6 +339,12 @@ class MAPPOAgent:
             'critic_w_optimizer': self.critic_w_optimizer.state_dict(),
             'obs_dim':    getattr(self.config, 'obs_dim', OBS_DIM),
             'hidden_dim': getattr(self.config, 'hidden_dim', 1024),
+            'actor_belief_conditioned': getattr(
+                self.config, 'actor_belief_conditioned', False
+            ),
+            'actor_belief_hidden_dim': getattr(
+                self.config, 'actor_belief_hidden_dim', None
+            ),
             'action_mapping_version': ACTION_MAPPING_VERSION,
         }, path)
 

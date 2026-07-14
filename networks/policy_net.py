@@ -10,8 +10,9 @@ independent bugs (dealer assignment, encoding layout, hand encoding).
     pyspiel.load_game('bridge(use_double_dummy_result=false)')
     state.observation_tensor()
 
-BCA extension (667-dim):
-    571 (OpenSpiel base) + 48 (partner belief) + 48 (RHO belief) = 667
+Belief-conditioned actor:
+    external API: 571 (OpenSpiel base)
+    internal activation: 571 + 48 (partner belief) + 48 (RHO belief) = 667
 
 Action mapping (our ordering ↔ OpenSpiel):
     Our:      Pass=0, Dbl=1, Rdbl=2, 1C=3, 1D=4, ..., 7NT=37
@@ -28,6 +29,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
+
+from utils.hand_features import HONOR_DIM, LENGTH_BINS, LENGTH_DIM, NUM_SUITS
 
 try:
     import pyspiel
@@ -318,11 +321,95 @@ class AllHandsEncoder(nn.Module):
 # MLPPolicyNetwork (Actor)
 # ==============================================================================
 
+class ActorBeliefHead(nn.Module):
+    """Trainable partner/RHO decoder used inside the deployed actor.
+
+    Unlike the frozen training-time Judge, this module predicts two relative
+    seats directly from the acting player's legal 571-dimensional observation:
+    partner first, then right-hand opponent (RHO).  Its probabilities are an
+    internal activation, not part of the policy's external API.
+    """
+
+    def __init__(self, obs_dim: int = OBS_DIM, hidden_dim: int = 1024):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.partner_honor_head = nn.Linear(hidden_dim, HONOR_DIM)
+        self.partner_length_head = nn.Linear(hidden_dim, LENGTH_DIM)
+        self.rho_honor_head = nn.Linear(hidden_dim, HONOR_DIM)
+        self.rho_length_head = nn.Linear(hidden_dim, LENGTH_DIM)
+
+    @staticmethod
+    def _to_probs(honor_logits: torch.Tensor,
+                  length_logits: torch.Tensor) -> torch.Tensor:
+        honor = torch.sigmoid(honor_logits)
+        length = F.softmax(
+            length_logits.view(-1, NUM_SUITS, LENGTH_BINS), dim=-1
+        ).view(-1, LENGTH_DIM)
+        return torch.cat([honor, length], dim=-1)
+
+    def forward(self, obs_571: torch.Tensor) -> torch.Tensor:
+        h = self.trunk(obs_571)
+        partner = self._to_probs(
+            self.partner_honor_head(h), self.partner_length_head(h)
+        )
+        rho = self._to_probs(self.rho_honor_head(h), self.rho_length_head(h))
+        return torch.cat([partner, rho], dim=-1)
+
+    @staticmethod
+    def _target_loss(honor_logits: torch.Tensor,
+                     length_logits: torch.Tensor,
+                     target: torch.Tensor) -> torch.Tensor:
+        honor_loss = F.binary_cross_entropy_with_logits(
+            honor_logits, target[:, :HONOR_DIM]
+        )
+        labels = target[:, HONOR_DIM:].view(
+            -1, NUM_SUITS, LENGTH_BINS
+        ).argmax(dim=-1)
+        length_loss = F.cross_entropy(
+            length_logits.view(-1, LENGTH_BINS), labels.reshape(-1)
+        )
+        return honor_loss + length_loss
+
+    def compute_loss(self, obs_571: torch.Tensor,
+                     targets: torch.Tensor) -> torch.Tensor:
+        """Supervise relative partner/RHO predictions.
+
+        ``targets`` has shape ``(batch, 2, 48)`` in partner, RHO order.
+        """
+        h = self.trunk(obs_571)
+        partner_loss = self._target_loss(
+            self.partner_honor_head(h), self.partner_length_head(h), targets[:, 0]
+        )
+        rho_loss = self._target_loss(
+            self.rho_honor_head(h), self.rho_length_head(h), targets[:, 1]
+        )
+        return 0.5 * (partner_loss + rho_loss)
+
+    def initialize_from_judge(self, judge) -> None:
+        """Warm-start both relative heads from a pretrained frozen Judge."""
+        with torch.no_grad():
+            judge_first = judge.trunk[0]
+            actor_first = self.trunk[0]
+            actor_first.weight.copy_(judge_first.weight[:, :actor_first.in_features])
+            actor_first.bias.copy_(judge_first.bias)
+            self.trunk[2].load_state_dict(judge.trunk[2].state_dict())
+            for honor_head in (self.partner_honor_head, self.rho_honor_head):
+                honor_head.load_state_dict(judge.honor_head.state_dict())
+            for length_head in (self.partner_length_head, self.rho_length_head):
+                length_head.load_state_dict(judge.length_head.state_dict())
+
+
 class MLPPolicyNetwork(nn.Module):
     """
     Actor: 4 × 1024 MLP.
-    P105: Default input is 571-dim (OpenSpiel native).
-    BCA mode: 571 + 96 = 667-dim.
+    External input is always 571-dim (OpenSpiel native).
+    In belief-conditioned mode, a trainable internal decoder supplies the
+    additional 96 features before the policy MLP.
 
     Compatible with SL checkpoint (sl_pretrain.py MLPPolicy):
     Both use self.net = nn.Sequential(...) with identical layer structure,
@@ -330,13 +417,29 @@ class MLPPolicyNetwork(nn.Module):
     """
 
     def __init__(self, obs_dim: int = OBS_DIM, hidden_dim: int = 1024,
-                 num_actions: int = NUM_BIDS):
+                 num_actions: int = NUM_BIDS,
+                 belief_conditioned: bool = False,
+                 belief_hidden_dim: Optional[int] = None):
         super().__init__()
         self.obs_dim = obs_dim
         self.num_actions = num_actions
+        self.belief_conditioned = belief_conditioned
+        self.belief_head = None
+        policy_input_dim = obs_dim
+        if belief_conditioned:
+            if obs_dim != OBS_DIM:
+                raise ValueError(
+                    "Belief-conditioned actors require the 571-dimensional "
+                    "OpenSpiel observation API"
+                )
+            self.belief_head = ActorBeliefHead(
+                obs_dim=obs_dim,
+                hidden_dim=belief_hidden_dim or hidden_dim,
+            )
+            policy_input_dim = BELIEF_OBS_DIM
 
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
+            nn.Linear(policy_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -346,10 +449,31 @@ class MLPPolicyNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, num_actions),
         )
+        if belief_conditioned:
+            # Preserve the exact 571-only policy at initialization.  PPO can
+            # learn to use the supervised decoder features from a clean zero
+            # contribution rather than receiving random belief-driven logits.
+            with torch.no_grad():
+                self.net[0].weight[:, OBS_DIM:].zero_()
+
+    def _policy_input(self, flat_obs):
+        if self.belief_head is None:
+            return flat_obs
+        belief_features = self.belief_head(flat_obs)
+        return torch.cat([flat_obs, belief_features], dim=-1)
 
     def _masked_logits(self, flat_obs, legal_actions):
-        logits = self.net(flat_obs)
+        logits = self.net(self._policy_input(flat_obs))
         return logits - 1e9 * (1.0 - legal_actions)
+
+    def compute_belief_loss(self, flat_obs, targets):
+        if self.belief_head is None:
+            return torch.zeros((), dtype=flat_obs.dtype, device=flat_obs.device)
+        return self.belief_head.compute_loss(flat_obs, targets)
+
+    def initialize_belief_from_judge(self, judge) -> None:
+        if self.belief_head is not None:
+            self.belief_head.initialize_from_judge(judge)
 
     def forward(self, flat_obs, legal_actions):
         return self._masked_logits(flat_obs, legal_actions)
@@ -450,18 +574,43 @@ def load_sl_into_mappo_agent(agent, sl_checkpoint_path: str):
     ckpt = torch.load(sl_checkpoint_path, map_location=agent.device,
                       weights_only=False)
 
+    def _load_actor_compat(actor, source_state):
+        """Load a legacy 571 actor into the 667-dim internal actor safely."""
+        target = actor.state_dict()
+        for key, value in source_state.items():
+            if key not in target:
+                continue
+            value = value.to(agent.device)
+            if target[key].shape == value.shape:
+                target[key] = value
+            elif (key == 'net.0.weight'
+                  and target[key].ndim == 2
+                  and value.ndim == 2
+                  and target[key].shape[0] == value.shape[0]
+                  and target[key].shape[1] > value.shape[1]):
+                expanded = torch.zeros_like(target[key])
+                expanded[:, :value.shape[1]] = value
+                target[key] = expanded
+            else:
+                raise ValueError(
+                    f"Unsupported SL tensor shape for {key}: "
+                    f"checkpoint={tuple(value.shape)} "
+                    f"target={tuple(target[key].shape)}"
+                )
+        actor.load_state_dict(target)
+
     if 'model_state' in ckpt:
         # P105 format
         sd = {k: v.to(agent.device) for k, v in ckpt['model_state'].items()}
         for player in range(NUM_PLAYERS):
-            agent.get_actor(player).load_state_dict(sd)
+            _load_actor_compat(agent.get_actor(player), sd)
     elif 'actor_n' in ckpt:
         # Old format (actor_n, actor_s, actor_e, actor_w)
         for player, key in [(0, 'actor_n'), (1, 'actor_e'),
                             (2, 'actor_s'), (3, 'actor_w')]:
             if key in ckpt:
                 sd = {k: v.to(agent.device) for k, v in ckpt[key].items()}
-                agent.get_actor(player).load_state_dict(sd)
+                _load_actor_compat(agent.get_actor(player), sd)
     else:
         raise ValueError(f"Unknown SL checkpoint format. Keys: {list(ckpt.keys())}")
 

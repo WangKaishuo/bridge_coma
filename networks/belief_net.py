@@ -267,7 +267,11 @@ class DualInfoComputer:
         target_features: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Info gain = max(0, CE(before, target) - CE(after, target))
+        Signed probe gain = CE(before, target) - CE(after, target).
+
+        Negative values are retained: a bid that makes the frozen Judge less
+        accurate must not be silently converted to zero reward.  Applying a
+        ReLU here creates a positive noise bias that grows with auction length.
         Honor: BCE, Length: CE (per suit), equal weight average.
         """
         h_before = belief_before[:, :HONOR_DIM].clamp(1e-7, 1-1e-7)
@@ -294,7 +298,7 @@ class DualInfoComputer:
         ce_before = (honor_ce_before + l_ce_before) / 2.0
         ce_after  = (honor_ce_after  + l_ce_after)  / 2.0
 
-        return torch.relu(ce_before - ce_after)
+        return ce_before - ce_after
 
     def compute_dual_info_bonus(
         self,

@@ -20,8 +20,9 @@ belief-based communication reward to MAPPO with fictitious self-play (FSP).
 
 ## Research design
 
-Both the controlled validation and main experiment use three agents with identical 571-dimensional
-OpenSpiel policies:
+Both the controlled validation and main experiment use three agents with an
+identical 571-dimensional external interface and identical internal
+partner/RHO belief heads:
 
 | Agent | Task reward | Partner information | Opponent leakage penalty |
 |---|---:|---:|---:|
@@ -29,13 +30,15 @@ OpenSpiel policies:
 | B | yes | yes | no |
 | C | yes | yes | yes |
 
-BeliefNet is a **training-only communication critic** for Agents B and C.  For a
-bid by player `i`, both receivers predict the same target, `i`'s hidden hand.
+The frozen Judge BeliefNet is a **training-only communication critic** for
+Agents B and C.  It is separate from the trainable belief head deployed inside
+every A/B/C actor.  For a bid by player `i`, both Judge receivers predict the
+same target, `i`'s hidden hand.
 The partner prediction conditions on the partner's private hand; the opponent
 prediction conditions on the next opponent's private hand.  Each information
-gain is measured immediately before and after that single bid.  The policy never
-consumes belief features at execution time, and an agent never reads an
-opponent's network.
+gain is measured immediately before and after that single bid.  At execution an
+agent computes its own partner/RHO belief activation from its legal 571-dim
+observation and never reads an opponent's network.
 
 The information reward is
 
@@ -43,9 +46,10 @@ The information reward is
 r_{info}=\Delta \ell_{partner}-\beta\Delta \ell_{opponent},
 \]
 
-where each gain is the reduction in calibrated hand-prediction loss caused by
-the current bid.  The reward is scaled relative to observed IMP variance before
-being added to the terminal task reward.
+where each gain is the **signed** reduction in calibrated hand-prediction loss
+caused by the current bid.  Before training, partner-only episode totals are
+pre-sampled once to define a B/C-shared scale (default target: 5% of IMP reward
+standard deviation).  That scale is frozen for every subsequent round.
 
 ## Evaluation contract
 
@@ -83,7 +87,7 @@ python experiments/execution_ablation.py \
 env/                         Bridge bidding and duplicate-table rules
 subgames/competitive_env.py  Fixed-prefix 1H-1S competitive environment
 subgames/subgame_trainer.py  MAPPO/FSP rollout and training loop
-networks/policy_net.py       571-dimensional policy and centralized critic
+networks/policy_net.py       571 API, internal belief actor, centralized critic
 networks/belief_net.py       Hidden-hand semantic model and information reward
 experiments/evaluation.py    Black-box evaluation and execution ablations
 experiments/subgame_validation.py  A/B/C validation entry point
@@ -153,12 +157,14 @@ python experiments/subgame_validation.py --eval-only --seed 42 \
 stored in different directories.
 
 Outputs are written to `results/competitive_v2/`.  Every policy checkpoint is
-self-contained for execution; a BeliefNet state may also be stored for research
-diagnostics, but it is not loaded by the evaluator.
+self-contained for execution, including its internal belief head.  The frozen
+Judge may also be stored for research diagnostics, but is not loaded by the
+evaluator.
 
 ## Correctness invariants
 
-- Policy input is always the standard 571-dimensional OpenSpiel observation.
+- Policy input is always the standard 571-dimensional OpenSpiel observation;
+  the 96 belief features are an internal activation only.
 - Card conversion is explicit: datasets use suit-major order and OpenSpiel uses
   rank-major order.
 - Bidding actions use OpenSpiel's native offset ordering: Pass/Dbl/RDbl/1C..7NT
@@ -172,6 +178,8 @@ diagnostics, but it is not loaded by the evaluator.
   not include intervening actions from other players.
 - Partner and opponent gains use receiver-specific observations but the same
   bidder position and bidder-hand target.
+- Judge gains retain their sign; no ReLU or positive-only clipping is allowed.
+- B and C share one frozen partner-only scale calibrated before training.
 - A scaled information bonus remains attached to the bid that produced it; it
   is not moved to the terminal transition.
 - Information reward is computed for the training side, independent of physical
