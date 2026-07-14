@@ -1039,7 +1039,6 @@ class SubgameTrainer:
                         _pending_rewards.append((
                             len(all_episodes) - 1,
                             envs[i]._current_dd.copy(),
-                            envs[i]._current_hands.copy(),
                             slot_dealer[i],
                             envs[i]._vulnerability,
                             envs[i].env.state.final_contract,
@@ -1052,20 +1051,11 @@ class SubgameTrainer:
 
 
         if not skip_dual_table and _pending_rewards:
-            reference_scores = self._play_role_swapped_tables_batch(
-                _pending_rewards, train_side, fsp_sd, batch_size
-            )
-            for pending, reference_score in zip(_pending_rewards, reference_scores):
-                ep_idx, dd, hands, dealer, vul, contract = pending
-                primary_score = self.env._compute_score_ns(contract, dd, vul)
-                # Both scores use the NS viewpoint.  The current policy controls
-                # train_side at the primary table and the opposite partnership
-                # at the reference table, exactly matching evaluate_match's
-                # opener/overcaller role exchange on the same deal.
-                signed_diff = (primary_score - reference_score
-                               if train_side == 'NS'
-                               else reference_score - primary_score)
-                task_imp = float(score_to_imp(signed_diff))
+            for ep_idx, dd, dealer, vul, contract in _pending_rewards:
+                score_ns  = self.env._compute_score_ns(contract, dd, vul)
+                score_opt = self.env._compute_dds_optimal_score_ns(dd, vul)
+                imp_ns    = float(score_to_imp(score_ns - score_opt))
+                imp_ew    = -imp_ns
 
                 last_step_idx: Dict[int, int] = {}
                 for s_idx, s in enumerate(all_episodes[ep_idx]):
@@ -1074,9 +1064,7 @@ class SubgameTrainer:
                 for player, s_idx in last_step_idx.items():
                     s = all_episodes[ep_idx][s_idx]
                     s['done']   = True
-                    is_train_player = ((train_side == 'NS' and player in (NORTH, SOUTH)) or
-                                       (train_side == 'EW' and player in (EAST, WEST)))
-                    s['reward'] = task_imp if is_train_player else -task_imp
+                    s['reward'] = imp_ns if player in (NORTH, SOUTH) else imp_ew
 
         # Build contiguous arrays for batched information-reward inference.
         result_eps = all_episodes[:num_deals]
@@ -1122,106 +1110,6 @@ class SubgameTrainer:
             _rinfo_data = None
 
         return result_eps, _rinfo_data
-
-    def _play_role_swapped_tables_batch(
-        self,
-        pending: List[Tuple],
-        train_side: str,
-        fsp_sd: Optional[dict],
-        batch_size: int,
-    ) -> List[int]:
-        """Play the paired table used by the duplicate-IMP task reward.
-
-        Hands, dealer and vulnerability stay fixed.  Current and FSP policies
-        exchange partnership roles, which is the same pairing used by the
-        formal evaluator.  Only final NS-view scores are retained.
-        """
-        from subgames.competitive_env import CompetitiveSubgameEnv
-
-        self._prepare_fsp_cache(fsp_sd)
-        scores: List[int] = []
-        for start in range(0, len(pending), batch_size):
-            chunk = pending[start:start + batch_size]
-            envs = []
-            observations = []
-            histories = []
-            done = []
-
-            for _, dd, hands, dealer, vul, _ in chunk:
-                env = CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
-                env.loader = self.env.loader
-                env.env = __import__('env', fromlist=['BridgeBiddingEnv']).BridgeBiddingEnv(60)
-                env.max_history_len = 60
-                env.dealer = NORTH
-                env._sampled_dealer = NORTH
-                env._is_constrained_data = self.env._is_constrained_data
-                env._filtered_deals = self.env._filtered_deals
-                env._current_hands = None
-                env._current_dd = None
-                env._vulnerability = (False, False)
-                env.history_int = []
-                observations.append(env.reset(hands, dd, vulnerability=vul, dealer=dealer))
-                histories.append(list(env.history_int))
-                done.append(False)
-                envs.append(env)
-
-            while not all(done):
-                from collections import defaultdict
-                groups = defaultdict(list)
-                for i, env in enumerate(envs):
-                    if done[i]:
-                        continue
-                    player = env.current_player
-                    primary_train = ((train_side == 'NS' and player in (NORTH, SOUTH)) or
-                                     (train_side == 'EW' and player in (EAST, WEST)))
-                    # Paired table: policies exchange partnership roles.
-                    use_current = not primary_train
-                    role = {NORTH:'actor_n', EAST:'actor_e',
-                            SOUTH:'actor_s', WEST:'actor_w'}[player]
-                    groups[(use_current, role)].append(i)
-
-                action_map = {}
-                for (use_current, role), slots in groups.items():
-                    if use_current or not fsp_sd or role not in fsp_sd:
-                        actor = getattr(self.agent.model, role)
-                    else:
-                        player = {'actor_n': NORTH, 'actor_e': EAST,
-                                  'actor_s': SOUTH, 'actor_w': WEST}[role]
-                        actor = self._get_fsp_actor(player, fsp_sd)
-
-                    flat = np.stack([
-                        self._encode_for_actor(
-                            observations[i], envs[i].dealer, histories[i],
-                            envs[i].current_player,
-                            all_hands=envs[i]._current_hands,
-                            use_prior=True,
-                            vulnerability=envs[i]._vulnerability,
-                        )[:OBS_DIM]
-                        for i in slots
-                    ])
-                    legal = np.stack([observations[i]['legal_actions'] for i in slots])
-                    flat_t = torch.as_tensor(flat, dtype=torch.float32, device=self.device)
-                    legal_t = torch.as_tensor(legal, dtype=torch.float32, device=self.device)
-                    with torch.no_grad():
-                        actions, _, _ = actor.get_action(flat_t, legal_t)
-                    for j, i in enumerate(slots):
-                        action_map[i] = int(actions[j].item())
-
-                for i, env in enumerate(envs):
-                    if done[i]:
-                        continue
-                    action = action_map[i]
-                    histories[i].append(action)
-                    observations[i], _, done[i], _ = env.step(action)
-
-            for env in envs:
-                scores.append(self.env._compute_score_ns(
-                    env.env.state.final_contract,
-                    env._current_dd,
-                    env._vulnerability,
-                ))
-
-        return scores
 
     def _get_fsp_actor(self, player: int, fsp_sd: dict) -> MLPPolicyNetwork:
         """See the formal README for the current behavior contract."""
