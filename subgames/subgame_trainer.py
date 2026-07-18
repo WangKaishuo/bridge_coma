@@ -18,13 +18,16 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from env import NUM_PLAYERS, NUM_BIDS, BID_PASS, NORTH, EAST, SOUTH, WEST
+from env import (
+    NUM_PLAYERS, NUM_BIDS, BID_PASS, BID_DOUBLE, BID_REDOUBLE, BID_1C,
+    NORTH, EAST, SOUTH, WEST,
+)
 from networks.belief_net import BeliefNetwork, DualInfoComputer
 from networks.policy_net import (
     MLPPolicyNetwork, MLPValueNetwork, OBS_DIM,
     convert_hands_suit_to_rank, hands_to_openspiel_state,
     get_openspiel_obs, ours_to_openspiel_raw,
-    physical_to_openspiel_player,
+    physical_to_openspiel_player, encode_openspiel_auction_observation,
 )
 from algorithms.mappo import MAPPOAgent, MAPPOConfig
 from utils.running_stats import RunningStats
@@ -52,7 +55,15 @@ class SubgameConfig:
     num_rounds:       int   = 20
     steps_per_phase:  int   = 500
     deals_per_step:   int   = 32
+    # CPU threads used for OpenSpiel observation construction and environment
+    # stepping during rollout collection.  Policy/critic inference remains a
+    # single batched GPU operation, so PPO stays on-policy.
+    collector_workers: int = 1
+    fast_observation_encoding: bool = True
     accumulate_steps: int   = 4
+    # Bound transient episode/r_info memory without changing the amount of
+    # on-policy data consumed by each PPO update.
+    rollout_chunk_deals: int = 8192
 
     # Learning rates
     lr:              float  = 1e-6
@@ -88,7 +99,7 @@ class SubgameConfig:
     actor_belief_coef:  float = 0.1
 
     # Fictitious self-play
-    fsp_pool_size:    int   = 0
+    fsp_pool_size:    int   = 10
     fsp_add_interval: int   = 2
     self_play:        bool  = False
 
@@ -139,7 +150,7 @@ class SubgameConfig:
 # ==============================================================================
 
 class FlatRolloutBuffer:
-    """See the formal README for the current behavior contract."""
+    """CPU rollout storage compacted into tensors after every collection chunk."""
 
     def __init__(self, device: str):
         self.device = device
@@ -156,9 +167,14 @@ class FlatRolloutBuffer:
         self.all_hands:     List[torch.Tensor] = []
         self.advantages:    Optional[torch.Tensor] = None
         self.returns:       Optional[torch.Tensor] = None
+        self._packed: dict = {}
+        self._packed_count = 0
+        self._materialized: Optional[dict] = None
 
     def add(self, flat_obs, legal_actions, action, log_prob, reward, value, done,
             all_hands=None):
+        if self._materialized is not None:
+            raise RuntimeError("Cannot append to a materialized rollout buffer")
         self.flat_obs.append(torch.tensor(flat_obs,      dtype=torch.float32))
         self.legal_actions.append(torch.tensor(legal_actions, dtype=torch.float32))
         self.actions.append(torch.tensor(action,         dtype=torch.int64))
@@ -171,21 +187,108 @@ class FlatRolloutBuffer:
         if all_hands is not None:
             self.all_hands.append(torch.tensor(all_hands, dtype=torch.float32))
 
+    def pack_pending(self) -> None:
+        """Replace thousands of tiny Python/Tensor objects with dense chunks."""
+        if not self.actions:
+            return
+        fields = {
+            'flat_obs': torch.stack(self.flat_obs),
+            'legal_actions': torch.stack(self.legal_actions),
+            'actions': torch.stack(self.actions),
+            'log_probs': torch.stack(self.log_probs),
+            'rewards': torch.as_tensor(self.rewards, dtype=torch.float32),
+            'values': torch.stack(self.values).reshape(-1),
+            'dones': torch.as_tensor(self.dones, dtype=torch.bool),
+        }
+        if self.all_hands:
+            if len(self.all_hands) != len(self.actions):
+                raise RuntimeError("all_hands missing from part of a rollout chunk")
+            fields['all_hands'] = torch.stack(self.all_hands)
+        for key, tensor in fields.items():
+            self._packed.setdefault(key, []).append(tensor)
+        self._packed_count += len(self.actions)
+        self.flat_obs.clear(); self.legal_actions.clear(); self.actions.clear()
+        self.log_probs.clear(); self.rewards.clear(); self.values.clear()
+        self.dones.clear(); self.all_hands.clear()
+
+    def add_steps(self, steps: List[dict]) -> None:
+        """Append one player's chunk directly as dense CPU tensors."""
+        if not steps:
+            return
+        if self._materialized is not None:
+            raise RuntimeError("Cannot append to a materialized rollout buffer")
+        self.pack_pending()
+        fields = {
+            'flat_obs': torch.from_numpy(np.stack(
+                [step['flat_obs'] for step in steps]
+            ).astype(np.float32, copy=False)),
+            'legal_actions': torch.from_numpy(np.stack(
+                [step['legal_actions'] for step in steps]
+            ).astype(np.float32, copy=False)),
+            'actions': torch.as_tensor(
+                [step['action'] for step in steps], dtype=torch.int64
+            ),
+            'log_probs': torch.stack([
+                step['log_prob'].detach().cpu()
+                if hasattr(step['log_prob'], 'detach')
+                else torch.as_tensor(step['log_prob'])
+                for step in steps
+            ]),
+            'rewards': torch.as_tensor(
+                [step['reward'] for step in steps], dtype=torch.float32
+            ),
+            'values': torch.stack([
+                step['value'].detach().cpu()
+                if hasattr(step['value'], 'detach')
+                else torch.as_tensor(step['value'])
+                for step in steps
+            ]).reshape(-1),
+            'dones': torch.as_tensor(
+                [step['done'] for step in steps], dtype=torch.bool
+            ),
+        }
+        if steps[0].get('all_hands') is not None:
+            fields['all_hands'] = torch.from_numpy(np.stack(
+                [step['all_hands'] for step in steps]
+            ).astype(np.float32, copy=False))
+        for key, tensor in fields.items():
+            self._packed.setdefault(key, []).append(tensor)
+        self._packed_count += len(steps)
+
+    def _materialize(self) -> dict:
+        if self._materialized is None:
+            self.pack_pending()
+            self._materialized = {
+                key: (chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0))
+                for key, chunks in self._packed.items()
+            }
+            self._packed.clear()
+        return self._materialized
+
+    def last_inputs(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        data = self._materialize()
+        return data['flat_obs'][-1], (
+            data['all_hands'][-1] if 'all_hands' in data else None
+        )
+
     def compute_returns_and_advantages(
         self, last_value: float, gamma: float, gae_lambda: float
     ):
-        n = len(self.rewards)
+        data = self._materialize()
+        rewards = data['rewards'].numpy()
+        values_np = data['values'].numpy()
+        dones = data['dones'].numpy()
+        n = len(rewards)
         advantages = np.zeros(n, dtype=np.float32)
         last_gae   = 0.0
-        values_np  = np.array([v.item() for v in self.values], dtype=np.float32)
 
         for t in reversed(range(n)):
             next_val  = last_value if t == n - 1 else values_np[t + 1]
             # dones[t] belongs to the transition stored at t.  Looking at
             # dones[t + 1] leaks the first value of the next episode across a
             # terminal boundary and cuts off the terminal reward one step early.
-            non_terminal = 1.0 - float(self.dones[t])
-            delta     = (self.rewards[t] + gamma * next_val * non_terminal
+            non_terminal = 1.0 - float(dones[t])
+            delta     = (rewards[t] + gamma * next_val * non_terminal
                          - values_np[t])
             last_gae  = delta + gamma * gae_lambda * non_terminal * last_gae
             advantages[t] = last_gae
@@ -195,10 +298,13 @@ class FlatRolloutBuffer:
         self.returns    = torch.tensor(returns,    dtype=torch.float32)
 
     def __len__(self):
-        return len(self.actions)
+        if self._materialized is not None:
+            return len(self._materialized['actions'])
+        return self._packed_count + len(self.actions)
 
     def get_batches(self, batch_size: int):
-        n       = len(self.actions)
+        data = self._materialize()
+        n       = len(data['actions'])
         indices = np.random.permutation(n)
         device  = self.device
 
@@ -207,17 +313,16 @@ class FlatRolloutBuffer:
             if len(idx) < 2:          # skip incomplete last batch (std() needs ≥2 samples)
                 continue
             batch = {
-                'flat_obs':      torch.stack([self.flat_obs[i]      for i in idx]).to(device),
-                'legal_actions': torch.stack([self.legal_actions[i] for i in idx]).to(device),
-                'actions':       torch.stack([self.actions[i]       for i in idx]).to(device),
-                'old_log_probs': torch.stack([self.log_probs[i]     for i in idx]).to(device),
-                'old_values':    torch.stack([self.values[i]        for i in idx]).to(device),
+                'flat_obs':      data['flat_obs'][idx].to(device),
+                'legal_actions': data['legal_actions'][idx].to(device),
+                'actions':       data['actions'][idx].to(device),
+                'old_log_probs': data['log_probs'][idx].to(device),
+                'old_values':    data['values'][idx].to(device),
                 'advantages':    self.advantages[idx].to(device),
                 'returns':       self.returns[idx].to(device),
             }
-            if self.all_hands:
-                batch['all_hands'] = torch.stack(
-                    [self.all_hands[i] for i in idx]).to(device)
+            if 'all_hands' in data:
+                batch['all_hands'] = data['all_hands'][idx].to(device)
             yield batch
 
 
@@ -489,7 +594,9 @@ class SubgameTrainer:
         for ep in eps:
             # Each step in ep is one bid AFTER the fixed prefix (1H-1S).
             # Auction length = prefix (2) + number of steps in episode.
-            auction_lengths.append(len(ep) + 2)
+            auction_lengths.append(
+                len(ep) + int(getattr(self.env, 'initial_history_length', 0))
+            )
 
             # Detect doubled contract: in bridge, auction ends with 3 consecutive
             # passes. The contract is doubled if the last non-Pass action before
@@ -576,9 +683,10 @@ class SubgameTrainer:
 
             # Bootstrap last value
             with torch.no_grad():
-                fo = buf.flat_obs[-1].unsqueeze(0).to(self.device)
-                ah = (buf.all_hands[-1].unsqueeze(0).to(self.device)
-                      if buf.all_hands else None)
+                last_obs, last_hands = buf.last_inputs()
+                fo = last_obs.unsqueeze(0).to(self.device)
+                ah = (last_hands.unsqueeze(0).to(self.device)
+                      if last_hands is not None else None)
                 last_val = critic(fo, ah).item()
 
             buf.compute_returns_and_advantages(
@@ -881,25 +989,14 @@ class SubgameTrainer:
         use_belief_prior: bool = False,   # P98b: use prior features instead of belief net
     ) -> List[List[dict]]:
         """See the formal README for the current behavior contract."""
-        from subgames.competitive_env import CompetitiveSubgameEnv
+        from concurrent.futures import ThreadPoolExecutor
 
         # P109: clear obs cache at start of each batch to bound memory usage
         self._obs_cache.clear()
         self._obs_state_cache.clear()
         self._prepare_fsp_cache(fsp_sd)
 
-        envs = [CompetitiveSubgameEnv.__new__(CompetitiveSubgameEnv)
-                for _ in range(batch_size)]
-        for e in envs:
-            e.loader          = self.env.loader
-            e.env             = __import__('env', fromlist=['BridgeBiddingEnv']).BridgeBiddingEnv(60)
-            e.max_history_len = 60
-            e.dealer          = NORTH
-            e._sampled_dealer  = NORTH
-            e._is_constrained_data = self.env._is_constrained_data
-            e._filtered_deals      = self.env._filtered_deals
-            e._current_hands = None; e._current_dd = None
-            e._vulnerability = (False, False); e.history_int = []
+        envs = [self.env.clone_for_worker() for _ in range(batch_size)]
 
         slot_obs    = [None] * batch_size
         slot_hist   = [None] * batch_size
@@ -931,7 +1028,17 @@ class SubgameTrainer:
 
         slot_obs = [_reset(i) for i in range(batch_size)]
 
-        while collected < num_deals:
+        worker_count = max(1, int(self.config.collector_workers))
+        executor = (ThreadPoolExecutor(max_workers=worker_count)
+                    if worker_count > 1 else None)
+
+        def _parallel_map(fn, items):
+            if executor is None:
+                return [fn(item) for item in items]
+            return list(executor.map(fn, items))
+
+        try:
+          while collected < num_deals:
             active = [i for i in range(batch_size) if not slot_done[i]]
             if not active:
                 break
@@ -975,14 +1082,15 @@ class SubgameTrainer:
                     critic = getattr(self.agent.model,
                                      role.replace('actor','critic'))
 
-                obs571_batch = np.stack([
-                    self._encode_for_actor(
+                def _encode_slot(i):
+                    return self._encode_for_actor(
                         slot_obs[i], slot_dealer[i], slot_hist[i],
                         envs[i].current_player,
                         all_hands=envs[i]._current_hands,
                         use_prior=True,
                         vulnerability=envs[i]._vulnerability)[:OBS_DIM]
-                    for i in slots])
+
+                obs571_batch = np.stack(_parallel_map(_encode_slot, slots))
                 legal_batch = np.stack([slot_obs[i]['legal_actions'] for i in slots])
                 ah_batch    = np.stack([envs[i]._current_hands for i in slots])
 
@@ -1001,7 +1109,7 @@ class SubgameTrainer:
                                       values[j].cpu(), flat_batch[j],
                                       legal_batch[j], is_train)
 
-            for i in active:
+            def _advance_slot(i):
                 action, log_prob, value, flat_obs, legal_actions, is_train = actions_map[i]
                 player    = envs[i].current_player
                 all_hands = envs[i]._current_hands
@@ -1052,23 +1160,21 @@ class SubgameTrainer:
                 obs_next, reward, done, info = envs[i].step(action)
                 if step.get('_rinfo'):
                     step['partner_obs_after'] = self._encode_for_actor(
-                        obs_next,
-                        _dealer_i,
-                        slot_hist[i],
-                        step['partner_pos'],
+                        obs_next, _dealer_i, slot_hist[i], step['partner_pos'],
                         all_hands=all_hands,
                         vulnerability=envs[i]._vulnerability,
                     )[:OBS_DIM]
                     step['opponent_obs_after'] = self._encode_for_actor(
-                        obs_next,
-                        _dealer_i,
-                        slot_hist[i],
-                        step['opponent_pos'],
+                        obs_next, _dealer_i, slot_hist[i], step['opponent_pos'],
                         all_hands=all_hands,
                         vulnerability=envs[i]._vulnerability,
                     )[:OBS_DIM]
                 step['reward'] = reward
                 step['done']   = done
+                return i, step, obs_next, done
+
+            advanced = _parallel_map(_advance_slot, active)
+            for i, step, obs_next, done in advanced:
                 slot_ep[i].append(step)
                 slot_obs[i] = obs_next
 
@@ -1086,6 +1192,10 @@ class SubgameTrainer:
                     slot_done[i] = True
                     if collected < num_deals:
                         slot_obs[i] = _reset(i)
+
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
 
 
@@ -1203,6 +1313,10 @@ class SubgameTrainer:
             vulnerability = getattr(self.env, '_vulnerability', (False, False))
         hands_sm = all_hands
         if hands_sm is not None:
+            if self.config.fast_observation_encoding:
+                return encode_openspiel_auction_observation(
+                    hands_sm, dealer, history_int, player, vulnerability
+                )
             hands_rm = convert_hands_suit_to_rank(hands_sm)
 
             # Build cache key from (hands bytes, dealer, history, vul)
@@ -1433,6 +1547,117 @@ class SubgameTrainer:
         )
         return dict(self.info_scale_metadata)
 
+    def _auction_health(self, episodes: List[List[dict]]) -> dict:
+        """Small structured health summary for pilot and long-run monitoring."""
+        if not episodes:
+            return {
+                'num_auctions': 0,
+                'mean_length': 0.0,
+                'median_length': 0.0,
+                'p95_length': 0.0,
+                'competitive_rate': 0.0,
+                'all_pass_rate': 0.0,
+                'double_call_rate': 0.0,
+                'redouble_call_rate': 0.0,
+            }
+
+        prefix_actions = list(getattr(self.env, 'initial_history_actions', []))
+        prefix_len = len(prefix_actions)
+        lengths = np.asarray([len(ep) + prefix_len for ep in episodes])
+        competitive = 0
+        all_pass = 0
+        doubles = 0
+        redoubles = 0
+        calls = 0
+        for ep in episodes:
+            dealer = int(ep[0].get('dealer', NORTH)) if ep else NORTH
+            sides = {
+                (dealer + index) % 2
+                for index, action in enumerate(prefix_actions)
+                if action >= BID_1C
+            }
+            sides.update({
+                step['player'] % 2
+                for step in ep
+                if step['action'] >= BID_1C
+            })
+            actions = prefix_actions + [step['action'] for step in ep]
+            competitive += int(len(sides) == 2)
+            all_pass += int(actions and all(action == BID_PASS for action in actions))
+            doubles += sum(step['action'] == BID_DOUBLE for step in ep)
+            redoubles += sum(step['action'] == BID_REDOUBLE for step in ep)
+            calls += len(actions)
+
+        n = len(episodes)
+        return {
+            'num_auctions': n,
+            'mean_length': float(lengths.mean()),
+            'median_length': float(np.median(lengths)),
+            'p95_length': float(np.percentile(lengths, 95)),
+            'competitive_rate': competitive / n,
+            'all_pass_rate': all_pass / n,
+            'double_call_rate': doubles / max(calls, 1),
+            'redouble_call_rate': redoubles / max(calls, 1),
+        }
+
+    def _new_auction_health_accumulator(self) -> dict:
+        return {
+            'lengths': [], 'competitive': 0, 'all_pass': 0,
+            'doubles': 0, 'redoubles': 0, 'calls': 0,
+        }
+
+    def _accumulate_auction_health(self, accumulator: dict,
+                                   episodes: List[List[dict]]) -> None:
+        """Accumulate exact health statistics while rollout chunks are freed."""
+        prefix_actions = list(getattr(self.env, 'initial_history_actions', []))
+        prefix_len = len(prefix_actions)
+        for ep in episodes:
+            accumulator['lengths'].append(len(ep) + prefix_len)
+            dealer = int(ep[0].get('dealer', NORTH)) if ep else NORTH
+            sides = {
+                (dealer + index) % 2
+                for index, action in enumerate(prefix_actions)
+                if action >= BID_1C
+            }
+            sides.update({
+                step['player'] % 2 for step in ep
+                if step['action'] >= BID_1C
+            })
+            actions = prefix_actions + [step['action'] for step in ep]
+            accumulator['competitive'] += int(len(sides) == 2)
+            accumulator['all_pass'] += int(
+                bool(actions) and all(action == BID_PASS for action in actions)
+            )
+            accumulator['doubles'] += sum(
+                step['action'] == BID_DOUBLE for step in ep
+            )
+            accumulator['redoubles'] += sum(
+                step['action'] == BID_REDOUBLE for step in ep
+            )
+            accumulator['calls'] += len(actions)
+
+    @staticmethod
+    def _finalize_auction_health(accumulator: dict) -> dict:
+        lengths = np.asarray(accumulator['lengths'])
+        n = len(lengths)
+        if not n:
+            return {
+                'num_auctions': 0, 'mean_length': 0.0,
+                'median_length': 0.0, 'p95_length': 0.0,
+                'competitive_rate': 0.0, 'all_pass_rate': 0.0,
+                'double_call_rate': 0.0, 'redouble_call_rate': 0.0,
+            }
+        return {
+            'num_auctions': n,
+            'mean_length': float(lengths.mean()),
+            'median_length': float(np.median(lengths)),
+            'p95_length': float(np.percentile(lengths, 95)),
+            'competitive_rate': accumulator['competitive'] / n,
+            'all_pass_rate': accumulator['all_pass'] / n,
+            'double_call_rate': accumulator['doubles'] / max(accumulator['calls'], 1),
+            'redouble_call_rate': accumulator['redoubles'] / max(accumulator['calls'], 1),
+        }
+
     def copy_info_scale_from(self, other: "SubgameTrainer") -> None:
         if other.info_scale_factor is None:
             raise RuntimeError("Source trainer has no calibrated information scale")
@@ -1458,9 +1683,10 @@ class SubgameTrainer:
 
         # Bootstrap last value
         with torch.no_grad():
-            fo  = buf.flat_obs[-1].unsqueeze(0).to(self.device)
-            ah  = (buf.all_hands[-1].unsqueeze(0).to(self.device)
-                   if buf.all_hands else None)
+            last_obs, last_hands = buf.last_inputs()
+            fo = last_obs.unsqueeze(0).to(self.device)
+            ah = (last_hands.unsqueeze(0).to(self.device)
+                  if last_hands is not None else None)
             last_val = critic(fo, ah).item()
 
         buf.compute_returns_and_advantages(
@@ -1594,17 +1820,31 @@ class SubgameTrainer:
     # ======================================================================
 
     def run(self, num_rounds: int = None, sl_trainer: "SubgameTrainer" = None,
-            h2h_deals: int = 500) -> List[dict]:
+            h2h_deals: int = 500, start_round: int = 0,
+            skip_warmup: bool = False, round_callback=None) -> List[dict]:
         """See the formal README for the current behavior contract."""
-        num_rounds = num_rounds or self.config.num_rounds
+        num_rounds = self.config.num_rounds if num_rounds is None else num_rounds
+        if not 0 <= start_round <= num_rounds:
+            raise ValueError(
+                f"start_round must be in [0, {num_rounds}], got {start_round}"
+            )
         n_deals    = self.config.steps_per_phase * self.config.deals_per_step
         batch_sz   = self.config.deals_per_step
         cfg = self.config
+        chunk_deals = min(n_deals, max(batch_sz, int(cfg.rollout_chunk_deals)))
+        if cfg.rollout_chunk_deals <= 0:
+            raise ValueError("rollout_chunk_deals must be positive")
         print(f"[Config] kl_lambda_start={cfg.kl_lambda_start}  kl_lambda_end={cfg.kl_lambda_end}  kl_anneal_frac={cfg.kl_anneal_frac}")
-        print(f"[Config] num_rounds={num_rounds}  deals_per_step={cfg.deals_per_step}  n_deals_per_phase={n_deals}  use_info_bonus={cfg.use_info_bonus}  beta={cfg.beta}  info_weight={cfg.info_reward_weight}")
+        print(f"[Config] num_rounds={num_rounds}  deals_per_step={cfg.deals_per_step}  n_deals_per_phase={n_deals}  rollout_chunk_deals={chunk_deals}  use_info_bonus={cfg.use_info_bonus}  beta={cfg.beta}  info_weight={cfg.info_reward_weight}")
 
-        print("\n[Trainer] Critic warmup...")
-        self.critic_warmup()
+        if not skip_warmup:
+            print("\n[Trainer] Critic warmup...")
+            import time as _time
+            warmup_started = _time.time()
+            self.critic_warmup()
+            print(f"  [Timing] critic_warmup={_time.time() - warmup_started:.1f}s")
+        else:
+            print(f"\n[Trainer] Resuming at round {start_round + 1}; critic warmup skipped.")
 
         if not self.config.self_play and not self._fsp_seeded and self.config.fsp_pool_size >= 0:
             self.fsp_pool.add_permanent(self.agent)
@@ -1613,7 +1853,9 @@ class SubgameTrainer:
         if self.config.self_play:
             print("  [Self-Play] Pure self-play mode: opponent = current agent (FSP disabled)")
 
-        for rnd in range(num_rounds):
+        for rnd in range(start_round, num_rounds):
+            import time as _time
+            round_started = _time.time()
             print(f"\n══════ Round {rnd+1}/{num_rounds} ══════")
 
             _bw = False
@@ -1628,85 +1870,80 @@ class SubgameTrainer:
 
             # ── (P93: JIT burn-in removed — belief update moved to after PPO) ──
 
-            import time as _time
+            health_acc = self._new_auction_health_accumulator()
+            belief_eps = []
 
-            print(f"  [Table1/NS] Collecting {n_deals} deals (batch={batch_sz})...")
+            def _collect_phase(train_side: str, players: Tuple[int, int]):
+                raw_vals = []
+                remaining = n_deals
+                timing = {'environment': 0.0, 'health_and_task': 0.0,
+                          'information': 0.0, 'buffer_pack': 0.0}
+                while remaining:
+                    current = min(chunk_deals, remaining)
+                    started = _time.time()
+                    eps, rinfo = self._collect_episodes_batch(
+                        current, train_side=train_side, fsp_sd=fsp_sd,
+                        batch_size=batch_sz, use_belief_prior=_bw)
+                    timing['environment'] += _time.time() - started
+                    started = _time.time()
+                    self._accumulate_auction_health(health_acc, eps)
+                    for ep in eps:
+                        for step in ep:
+                            if step.get('done') and step['player'] in players:
+                                value = float(step['reward'])
+                                self.reward_stats.update(value)
+                                raw_vals.append(value)
+                                break
+                    timing['health_and_task'] += _time.time() - started
+                    if self.config.use_info_bonus:
+                        started = _time.time()
+                        bonuses = self._compute_info_bonus(eps, rinfo_data=rinfo)
+                        for ep, episode_bonuses in zip(eps, bonuses):
+                            for step, bonus in zip(ep, episode_bonuses):
+                                step['reward'] += bonus
+                                if bonus != 0.0:
+                                    _ir_vals.append(bonus)
+                        timing['information'] += _time.time() - started
+                    started = _time.time()
+                    player_steps = {player: [] for player in players}
+                    for ep in eps:
+                        for step in ep:
+                            if step['player'] in player_steps:
+                                player_steps[step['player']].append(step)
+                    for player in players:
+                        self.buffers[player].add_steps(player_steps[player])
+                    timing['buffer_pack'] += _time.time() - started
+                    if self.belief_net is not None and not self.config.freeze_belief:
+                        belief_eps.extend(eps)
+                    remaining -= current
+                    del eps, rinfo
+                return raw_vals, timing
+
+            print(f"  [Table1/NS] Collecting {n_deals} deals (batch={batch_sz}, chunk={chunk_deals})...")
             _t = _time.time()
-            ns_eps, ns_rinfo = self._collect_episodes_batch(
-                n_deals, train_side='NS', fsp_sd=fsp_sd, batch_size=batch_sz,
-                use_belief_prior=_bw)
-
-            raw_ns_vals = []
-            for ep in ns_eps:
-                for step in ep:
-                    if step.get('done') and step['player'] in (NORTH, SOUTH):
-                        v = float(step['reward'])
-                        self.reward_stats.update(v)
-                        raw_ns_vals.append(v)
-                        break
-
-            _t = _time.time()
-            if self.config.use_info_bonus:
-                bonuses = self._compute_info_bonus(ns_eps, rinfo_data=ns_rinfo)
-                for ep, bs in zip(ns_eps, bonuses):
-                    for step, b in zip(ep, bs):
-                        step['reward'] += b
-                        if b != 0.0: _ir_vals.append(b)
-
-            _t = _time.time()
-            for ep in ns_eps:
-                for step in ep:
-                    if step['player'] in (NORTH, SOUTH):
-                        self.buffers[step['player']].add(
-                            flat_obs=step['flat_obs'], legal_actions=step['legal_actions'],
-                            action=step['action'], log_prob=step['log_prob'],
-                            reward=step['reward'], value=step['value'],
-                            done=step['done'], all_hands=step.get('all_hands'))
+            raw_ns_vals, ns_timing = _collect_phase('NS', (NORTH, SOUTH))
+            started = _time.time()
             for p in (NORTH, SOUTH):
                 m = self._safe_update(p, rnd)
                 if m: ns_metrics[p] = m
+            ns_timing['ppo'] = _time.time() - started
 
-            print(f"  [Table2/EW] Collecting {n_deals} deals (batch={batch_sz})...")
+            print(f"  [Table2/EW] Collecting {n_deals} deals (batch={batch_sz}, chunk={chunk_deals})...")
             _t = _time.time()
-            ew_eps, ew_rinfo = self._collect_episodes_batch(
-                n_deals, train_side='EW', fsp_sd=fsp_sd, batch_size=batch_sz,
-                use_belief_prior=_bw)
-
-            raw_ew_vals = []
-            for ep in ew_eps:
-                for step in ep:
-                    if step.get('done') and step['player'] in (EAST, WEST):
-                        v = float(step['reward'])
-                        self.reward_stats.update(v)
-                        raw_ew_vals.append(v)
-                        break
-
-            _t = _time.time()
-            if self.config.use_info_bonus:
-                ew_bonuses = self._compute_info_bonus(ew_eps, rinfo_data=ew_rinfo)
-                for ep, bs in zip(ew_eps, ew_bonuses):
-                    for step, b in zip(ep, bs):
-                        step['reward'] += b
-                        if b != 0.0: _ir_vals.append(b)
-
-            _t = _time.time()
-            for ep in ew_eps:
-                for step in ep:
-                    if step['player'] in (EAST, WEST):
-                        self.buffers[step['player']].add(
-                            flat_obs=step['flat_obs'], legal_actions=step['legal_actions'],
-                            action=step['action'], log_prob=step['log_prob'],
-                            reward=step['reward'], value=step['value'],
-                            done=step['done'], all_hands=step.get('all_hands'))
+            raw_ew_vals, ew_timing = _collect_phase('EW', (EAST, WEST))
+            started = _time.time()
             for p in (EAST, WEST):
                 m = self._safe_update(p, rnd)
                 if m: ew_metrics[p] = m
+            ew_timing['ppo'] = _time.time() - started
 
             # ── Belief Update: frozen (P96) or on-policy (P93/P95) ─────────
             _t = _time.time()
+            belief_started = _time.time()
             if self.belief_net is not None and not self.config.freeze_belief:
-                bl = self.update_belief_on_policy(ns_eps + ew_eps)
+                bl = self.update_belief_on_policy(belief_eps)
                 if bl is not None: _bl_vals.append(bl)
+            belief_seconds = _time.time() - belief_started
 
             all_vals = raw_ns_vals + raw_ew_vals
             mean_r = float(np.mean(all_vals)) if all_vals else 0.0
@@ -1718,6 +1955,12 @@ class SubgameTrainer:
                 for metrics in list(ns_metrics.values()) + list(ew_metrics.values())
                 if 'actor_belief_loss' in metrics
             ]
+            auction_health = self._finalize_auction_health(health_acc)
+            timing_seconds = {
+                'ns': ns_timing, 'ew': ew_timing,
+                'belief_update': belief_seconds,
+                'round_compute_total': _time.time() - round_started,
+            }
 
             log_entry = {
                 'round': rnd+1, 'mean_reward': mean_r, 'std_reward': std_r,
@@ -1732,6 +1975,8 @@ class SubgameTrainer:
                     if _actor_belief_vals else None
                 ),
                 'imp_std_running': float(self.reward_stats.std),
+                'auction_health': auction_health,
+                'timing_seconds': timing_seconds,
             }
             self.log.append(log_entry)
             self._print_log(log_entry)
@@ -1739,6 +1984,7 @@ class SubgameTrainer:
             # P110: Per-round H2H removed — too noisy (500-deal IMP std≈9).
             # All statistical evaluation is deferred to Stage 3 (5000 deals).
 
+            should_stop = False
             if self.config.early_stop_enabled:
                 all_vl = []
                 for m in list(ns_metrics.values()) + list(ew_metrics.values()):
@@ -1752,7 +1998,12 @@ class SubgameTrainer:
                     vl_range = max(window) - min(window)
                     if vl_range < self.config.early_stop_vl_delta:
                         print(f"\n  [Early Stop] vl plateau (range={vl_range:.3f} < {self.config.early_stop_vl_delta} over {pat} rounds). Stopping at round {rnd+1}.")
-                        break
+                        should_stop = True
+
+            if round_callback is not None:
+                round_callback(self, rnd + 1, log_entry)
+            if should_stop:
+                break
 
         return self.log
 
@@ -1765,6 +2016,34 @@ class SubgameTrainer:
         ew_r = entry.get('mean_ew_task_imp', 0.0)
 
         print(f"  [Round {rnd}] rollout_task_IMP={mr:+.3f}±{sr:.3f}  (NS={ns_r:+.3f} EW={ew_r:+.3f})  fsp={fsp}")
+
+        health = entry.get('auction_health') or {}
+        timing = entry.get('timing_seconds') or {}
+        if timing:
+            ns_t = timing.get('ns', {})
+            ew_t = timing.get('ew', {})
+            print(
+                "  [Timing] "
+                f"NS env={ns_t.get('environment', 0):.1f}s "
+                f"info={ns_t.get('information', 0):.1f}s "
+                f"pack={ns_t.get('buffer_pack', 0):.1f}s "
+                f"ppo={ns_t.get('ppo', 0):.1f}s | "
+                f"EW env={ew_t.get('environment', 0):.1f}s "
+                f"info={ew_t.get('information', 0):.1f}s "
+                f"pack={ew_t.get('buffer_pack', 0):.1f}s "
+                f"ppo={ew_t.get('ppo', 0):.1f}s | "
+                f"round={timing.get('round_compute_total', 0):.1f}s"
+            )
+        if health:
+            print(
+                "    auction_health: "
+                f"len={health['mean_length']:.2f} "
+                f"p95={health['p95_length']:.1f} "
+                f"competitive={health['competitive_rate']:.1%} "
+                f"all_pass={health['all_pass_rate']:.1%} "
+                f"dbl={health['double_call_rate']:.2%} "
+                f"rdbl={health['redouble_call_rate']:.2%}"
+            )
 
         ns = entry.get('ns_metrics', {})
         ns_n = ns.get(NORTH, {}); ns_s = ns.get(SOUTH, {})

@@ -7,16 +7,323 @@ belief-based communication reward to MAPPO with fictitious self-play (FSP).
 
 ## Current handoff
 
-- `experiments/subgame_validation.py` is a controlled **subexperiment** on
-  constrained deals with the relative prefix `dealer:1H, dealer+1:1S`.
-- The planned **main experiment** uses unrestricted random deals and complete
-  auctions; the fixed prefix must not shape its environment or interfaces.
-- Policies, critics, buffers, and FSP checkpoints use physical N/E/S/W seats.
-  Random dealer rotation exposes every seat to different auction roles.
-- Agent A/B/C may be trained in separate Colab sessions.  The July Agent A run
-  logged in `agentA.txt` predates the synchronized-dealer fix and must be rerun.
-- After the controlled A/B/C rerun, the next task is the unrestricted main
-  environment and black-box published-agent baseline adapters.
+- The unrestricted main environment, complete-auction training path, memmapped
+  10M training pool, black-box evaluator, pilot, memory-safe single-round
+  profile, and formal seed-42 A/B run are complete.
+- Formal A and B both completed 60 rounds without a crash or numerical failure.
+  The round-60 5000-deal match was inconclusive: B vs A was
+  `+0.0132 IMP/deal`, 95% CI `[-0.1050, +0.1314]`.
+- Post-run diagnostics show that the RL pipeline did learn: A vs SL was
+  `+0.4398 IMP/deal` and B vs SL was `+0.4378`, both with positive 95% CIs.
+- Frozen-Judge decomposition also shows that B increased partner information,
+  but 87.6% of that increase was accompanied by increased opponent information.
+  B therefore passed the information-manipulation check even though it did not
+  improve IMP over A.
+- Agent C has deliberately **not** been started.  The old "B must beat A" gate
+  is no longer the right prerequisite for C; the next decision is to specify a
+  scientifically meaningful leakage weight.  The configured `beta=0.05`
+  subtracts only 5% of an opponent term that is the same scale as the partner
+  term, so an unchanged C run would be a weak secrecy test.
+- The full operational and statistical record is in **Formal unrestricted A/B
+  experiment record (2026-07-15 to 2026-07-16)** immediately below.
+
+## Formal unrestricted A/B experiment record (2026-07-15 to 2026-07-16)
+
+This is the authoritative record of the first full-scale unrestricted main
+experiment.  It supersedes the planning estimates later in this README.  All
+reported IMP values in A/B matches use B's perspective unless stated otherwise.
+
+### Question, arms, and stopping rule
+
+The run tested whether the partner-information reward improves a task-only
+MAPPO/FSP bidder when architecture, initialization, data, optimizer, and random
+seed are held fixed:
+
+| Arm | Task reward | Partner information reward | Opponent leakage penalty |
+|---|---:|---:|---:|
+| A | yes | no | no |
+| B | yes | yes | no |
+
+The agreed staged plan was:
+
+1. run A and B first for seed 42;
+2. pause both after round 30 and play a fixed 5000-deal B-vs-A match;
+3. continue to round 60 after review if the intermediate result was promising;
+4. run C only after B had demonstrated a useful improvement over A;
+5. decide whether more than 60 rounds were justified from convergence and
+   head-to-head results rather than extending automatically.
+
+The round-30 evaluator labelled the result `INCONCLUSIVE`.  Training was held,
+the result was reviewed by the user, and the user explicitly authorized
+continuation to round 60.  The round-60 result was also `INCONCLUSIVE`; C remains
+unstarted.
+
+### Machine, datasets, and reproducibility
+
+- Server: 16 physical / 32 logical CPU cores, 128 GiB RAM, and two 24 GiB
+  NVIDIA A10 GPUs.
+- Training data: `data/pgx_train_10m_memmap`, a 10M-deal memory-mapped pool.
+- Evaluation data: `data/pgx_eval_500k_memmap`, a disjoint 500k-deal
+  memory-mapped pool.
+- Formal seed: 42.  Evaluation seed: 20260714.
+- Every formal match used 5000 paired deals with duplicate cross-table role
+  swapping, identical dealer and vulnerability, and black-box policy access.
+- The round-30 and round-60 comparisons reused the same evaluation seed and
+  deal source, making their change directly interpretable without a changed
+  test set.
+- There was no dataset sharding.  Memory mapping prevented the 10M pool from
+  being copied into each process, and `rollout_chunk_deals=8192` bounded
+  intermediate rollout construction without changing the sampled training
+  volume.
+
+### Formal hyperparameters and training volume
+
+| Setting | Value |
+|---|---:|
+| rounds | 60 |
+| phases per round | 2 (NS and EW) |
+| steps per phase | 256 |
+| deals per step | 512 |
+| deals per phase | 131,072 |
+| PPO batch size | 512 |
+| PPO epochs | 4 |
+| learning rate | 3e-6 |
+| entropy coefficient | 0.01 |
+| FSP pool cap | 10 |
+| FSP add interval | 1 round |
+| information weight | 0.05 |
+| leakage beta | 0.05 |
+| actor belief auxiliary coefficient | 0.1 |
+| information calibration deals | 2048 |
+| checkpoint interval | every round |
+
+Each arm therefore collected
+`60 * 2 * 256 * 512 = 15,728,640` deal episodes.  A and B together collected
+31,457,280 deal episodes.  With the observed auction length near 10.5 calls,
+this is approximately 165 million environment action steps per arm.  A/B used
+the same `sl_base.pt` policy initializer; B's frozen communication Judge came
+from `sl_base_bca.pt` and was not exposed at evaluation time.
+
+### Pilot and full-round profiling
+
+Before the 60-round launch, one complete unrestricted pilot round was run for
+A, B, and C.  All three reached their final checkpoint.  Their initial task
+rollout was identical (`-0.079 +/- 7.559 IMP`), and their common initial auction
+health was: mean length 10.46, p95 17, 52.8% competitive, 0.4% all-pass,
+3.65% doubles, and 0.12% redoubles.  This established wiring and parity; it was
+not used as a performance result.
+
+A separate concurrent A/B full-round profile used the exact formal sampling
+and PPO settings:
+
+| Component | A | B |
+|---|---:|---:|
+| NS environment collection | 225.3 s | 293.7 s |
+| NS information reward | 0.0 s | 4.5 s |
+| NS packing | 43.9 s | 40.6 s |
+| NS PPO | 83.9 s | 85.8 s |
+| EW environment collection | 228.3 s | 296.5 s |
+| EW information reward | 0.0 s | 4.6 s |
+| EW packing | 42.1 s | 44.3 s |
+| EW PPO | 83.2 s | 82.2 s |
+| complete round | 718.1 s | 868.2 s |
+| complete process | 732.7 s | 888.0 s |
+
+The actual bottleneck was sequential environment collection, especially B's
+belief/Judge-conditioned rollout path; PPO was not the dominant cost.  The
+profile peak resident memory was 5.61 GiB for A and 6.11 GiB for B, minimum
+system `MemAvailable` was 115.1 GiB, and peak GPU allocations were 1206 MiB and
+1508 MiB respectively.  This left a large safety margin for the formal run.
+
+### Memory and failure safeguards
+
+The formal processes ran independently, A on GPU 0 and B on GPU 1, under a
+supervisor that:
+
+- used memory-mapped train and evaluation data and refused to start if either
+  data file was missing;
+- refused to overwrite an existing result directory;
+- required at least 40 GiB of free disk before launch;
+- set `MALLOC_ARENA_MAX=2` and PyTorch expandable CUDA allocation segments;
+- capped FSP at 10 and wrote a resume checkpoint every round;
+- sampled process RSS, system `MemAvailable`, and GPU allocation every five
+  minutes;
+- terminated and marked the run blocked if available RAM fell below 16 GiB;
+- scanned for Traceback, CUDA OOM, killed processes, and NaN;
+- treated any process exit before its final checkpoint as a failure.
+
+No guard triggered.  In the formal run, peak RSS was 7.03 GiB for A and
+7.79 GiB for B, minimum `MemAvailable` was 111.2 GiB, and peak GPU allocation
+was 1316 MiB for A and 2142 MiB for B.  After completion the filesystem had
+426 GiB free.  The final deployment checkpoint for each arm was about 479 MB;
+the round-resumable checkpoint, including optimizer/FSP state, was about
+1.38 GB.
+
+### Runtime and late-round stability
+
+The supervisor launched A and B at 2026-07-15 14:48 UTC and recorded formal
+completion at 2026-07-16 05:03 UTC.
+
+| Arm | Process time | Completion |
+|---|---:|---|
+| A | 46,207.2 s (12 h 50 min) | round 60 checkpoint saved |
+| B | 51,107.6 s (14 h 12 min) | round 60 checkpoint saved |
+
+Across rounds 46-60, neither policy showed numerical or auction collapse:
+
+- A competitive-auction rate stayed between 51.5% and 52.7%; B stayed between
+  54.0% and 54.8%.
+- All-pass stayed at 0.3%-0.4%, doubles near 4.5%-5.0%, and redoubles near
+  0.12%-0.14%.
+- Mean auction length stayed near 10.2-10.5 calls with p95 16-17.
+- Actor belief loss declined from 1.8301 to 1.8214 for A and from 1.8241 to
+  1.8139 for B.
+- B's recorded information-reward statistic `step_ir` remained stable near
+  0.136-0.137.
+
+These observations establish stable execution and a persistent training
+signal.  They do **not** establish task improvement, because self-play rollout
+statistics are not a substitute for the held-out cross-agent match.
+
+### Round-30 gate
+
+The watcher paused both processes immediately after their round-30 resume
+checkpoints, copied immutable gate snapshots, and evaluated B against A on 5000
+paired deals:
+
+| Stratum | Mean IMP/deal | 95% CI | B wins / A wins / ties |
+|---|---:|---:|---:|
+| Overall | +0.0444 | [-0.0577, +0.1465] | 554 / 522 / 3924 |
+| Competitive | +0.1412 | [-0.0047, +0.2871] | 304 / 257 / 1904 |
+| Non-competitive | +0.0200 | [-0.1057, +0.1457] | 142 / 139 / 1923 |
+| Mixed classification | -0.5136 | [-1.2169, +0.1897] | 108 / 126 / 97 |
+
+The competitive subset was close to a positive significance boundary, but the
+overall confidence interval crossed zero.  The automatic decision was
+`INCONCLUSIVE`, not `WIN`.  Training resumed only after user review and explicit
+approval.
+
+### Round-60 final B-vs-A evaluation
+
+After both final checkpoints were complete, an eval-only run used the same
+5000-deal source and seed:
+
+| Stratum | Mean IMP/deal | 95% CI | B wins / A wins / ties |
+|---|---:|---:|---:|
+| Overall | +0.0132 | [-0.1050, +0.1314] | 707 / 693 / 3600 |
+| Competitive | +0.0184 | [-0.1604, +0.1973] | 369 / 356 / 1660 |
+| Non-competitive | -0.0707 | [-0.2055, +0.0642] | 145 / 156 / 1807 |
+| Mixed classification | +0.3373 | [-0.2419, +0.9165] | 193 / 181 / 133 |
+
+The evaluator again returned `INCONCLUSIVE`.  B's point estimate remained very
+slightly positive overall, so the result is not evidence that B is worse than
+A.  It failed the original B-must-beat-A gate: the experiment did not show that
+B is better, and the promising round-30 competitive point estimate did not grow
+with another 30 rounds.  The post-run diagnostics below show that this gate was
+too strict as a prerequisite for the wiretap arm: B manipulated the intended
+information quantity even though the manipulation did not improve IMP.
+
+An additional human-readable trace was produced for the first 100 deals of the
+same seeded evaluation stream.  It contains all four hands, HCP and shape,
+dealer/vulnerability, both cross-table auctions, controllers, contracts, DDS
+tricks, scores, and duplicate IMP.  That 100-deal diagnostic subset gave B
+`-0.160 IMP/deal` with 11 B wins, 15 A wins, and 74 ties; it is for qualitative
+auction inspection only and must not replace the 5000-deal result.
+
+### Post-run A/B-vs-SL and frozen-Judge diagnostics
+
+Two eval-only diagnostics were then run on the same 5000-deal source and seed.
+They did not modify a checkpoint or expose the Judge to a playing policy.
+
+First, each trained arm played the original `sl_base.pt` policy in black-box
+duplicate cross-table evaluation:
+
+| Match and stratum | Mean IMP/deal | 95% CI | Trained wins / SL wins / ties |
+|---|---:|---:|---:|
+| A vs SL, overall | +0.4398 | [+0.2859, +0.5937] | 1307 / 982 / 2711 |
+| A vs SL, competitive | +0.4039 | [+0.1646, +0.6431] | 658 / 509 / 1064 |
+| A vs SL, non-competitive | +0.2492 | [+0.0507, +0.4476] | 330 / 250 / 1487 |
+| A vs SL, mixed | +1.1154 | [+0.5867, +1.6441] | 319 / 223 / 160 |
+| B vs SL, overall | +0.4378 | [+0.2816, +0.5940] | 1300 / 997 / 2703 |
+| B vs SL, competitive | +0.4738 | [+0.2380, +0.7097] | 687 / 547 / 1117 |
+| B vs SL, non-competitive | +0.1142 | [-0.0948, +0.3233] | 320 / 253 / 1423 |
+| B vs SL, mixed | +1.2971 | [+0.7537, +1.8405] | 293 / 197 / 163 |
+
+This decisively rejects the cheap explanation that A and B stayed at the SL
+initializer.  Both learned task-improving policies of almost identical overall
+strength.  The A/B null result is therefore not caused by a completely inactive
+RL pipeline.
+
+Second, the frozen training Judge measured the raw signed loss reduction caused
+by every actual A and B call in duplicate B-vs-A cross-play.  Partner and next-
+opponent receiver observations, bidder-hand targets, and immediate before/after
+states exactly match the training definition.  Confidence intervals treat each
+paired deal, not each call, as an independent unit.  The replayed match exactly
+reproduced the formal B-vs-A result (`+0.0132 IMP/deal`, 707/693/3600), providing
+an end-to-end deal-order and scoring check.
+
+| Model | Calls | Partner gain/call | Opponent gain/call | Partner total/deal | Opponent total/deal | Partner - opponent/deal |
+|---|---:|---:|---:|---:|---:|---:|
+| A | 51,614 | +0.08628 | +0.08800 | +0.89063 | +0.90843 | -0.01780 |
+| B | 51,491 | +0.09203 | +0.09307 | +0.94772 | +0.95844 | -0.01072 |
+
+The paired B-minus-A changes were:
+
+| Quantity, per deal | B - A | 95% CI |
+|---|---:|---:|
+| Partner information gain | +0.05709 | [+0.04853, +0.06564] |
+| Opponent information gain | +0.05001 | [+0.04195, +0.05808] |
+| Raw secrecy difference (`partner - opponent`) | +0.00708 | [+0.00084, +0.01331] |
+| Configured C expression (`partner - 0.05 * opponent`) | +0.05459 | [+0.04632, +0.06286] |
+
+B therefore did what its shaping reward asked: it increased frozen-Judge
+partner information.  However, `0.05001 / 0.05709 = 87.6%` of that increment
+was accompanied by increased opponent information.  Only a small residual
+improved the partner-minus-opponent balance, and none of these information
+changes produced a measurable B-vs-A IMP gain.
+
+This resolves the immediate decision tree:
+
+- `A ~= SL` is false; do not treat the result as a dead RL pipeline.
+- `B did not change partner information` is false; the reward reached behaviour.
+- The data support substantial public-channel leakage, although not exact
+  one-for-one washout: B's partner gain rose slightly more than opponent gain.
+- B no longer needs to beat A as a prerequisite for testing the leakage arm.
+  The information manipulation itself is established.
+- Before launching C, revisit `beta`.  With partner and opponent terms on the
+  same empirical scale, `beta=0.05` is dominated by the partner term and is not
+  a strong test of the wiretap difference.  Any C variants and selection rule
+  should be declared before inspecting their IMP results.
+
+### Artifacts and current decision
+
+Server artifacts are under:
+
+```text
+results/main_unrestricted_pilot_seed42/
+results/profile_full_round_memory_safe_seed42/
+results/main_unrestricted_formal_memory_safe_seed42/A/
+results/main_unrestricted_formal_memory_safe_seed42/B/
+results/main_unrestricted_formal_memory_safe_seed42/resources.tsv
+results/main_unrestricted_formal_memory_safe_seed42/round30_gate/
+results/main_unrestricted_formal_memory_safe_seed42/round60_eval/result.json
+results/main_unrestricted_formal_memory_safe_seed42/round60_eval/B_vs_A_100_auctions.txt
+results/main_unrestricted_formal_memory_safe_seed42/round60_diagnostics/agents_vs_sl.json
+results/main_unrestricted_formal_memory_safe_seed42/round60_diagnostics/judge_information.json
+```
+
+The engineering outcome is successful: the unrestricted pipeline is stable,
+memory-safe, reproducible, learns substantially beyond SL, and produces
+bridge-plausible auctions at the full planned scale.  The scientific A-vs-B
+outcome is also sharper: partner-only shaping measurably changed the intended
+Judge information quantity, but most of the extra information was public
+leakage and there was no reliable duplicate-IMP gain.  Therefore:
+
+- preserve all A/B checkpoints and evaluation artifacts;
+- do not relabel the result as either a B win or proof that B is harmful;
+- do not run the original `beta=0.05` C or a three-seed sweep blindly;
+- specify the C leakage weights and selection rule from the A/B information
+  decomposition, then pilot the declared C variants before full training.
 
 ## Research design
 
@@ -91,6 +398,8 @@ networks/policy_net.py       571 API, internal belief actor, centralized critic
 networks/belief_net.py       Hidden-hand semantic model and information reward
 experiments/evaluation.py    Black-box evaluation and execution ablations
 experiments/subgame_validation.py  A/B/C validation entry point
+experiments/benchmark_training.py   End-to-end training throughput benchmark
+scripts/cloud_benchmark_quad.sh     Multi-process/two-GPU throughput sweep
 utils/sl_pretrain.py         SAYC supervised policy pretraining
 tests/test_all.py            Core environment, scoring, and network tests
 ```
@@ -191,8 +500,195 @@ evaluator.
 
 ```bash
 python tests/test_all.py
-python -m unittest tests.test_information_reward tests.test_receiver_rollout
+python -m unittest discover -s tests -v
 ```
+
+## Server performance and formal-run handoff (2026-07-15)
+
+### July 15 conversation handoff: research interpretation and decisions
+
+This subsection preserves the scientific and bridge-domain conclusions from
+the July 15 planning conversation, not just the engineering benchmark.
+
+#### How to interpret the current A/B/C result
+
+- In bridge, an advantage of **+0.1 IMP/deal is already important**.  Do not use
+  effect-size intuitions from games where only multi-IMP changes matter.
+- The current question is not whether Agent A is good in isolation.  It is why
+  B and C did not beat A in the completed controlled experiment, despite the
+  intended communication reward.
+- The corrected action mask removed the earlier pathological repeated
+  Double/Redouble behaviour.  The user's expert bridge inspection finds the
+  new bidding dramatically more coherent than the pre-fix models.
+- The user manually inspected 100 A-vs-B deals.  Their bridge judgement is that
+  A and B currently resemble players with roughly one or two years of amateur
+  experience: much better than before, but still far below expert level.  B is
+  slightly more human-like and handles some auctions somewhat better than A,
+  although the difference is small and 100 deals cannot establish strength.
+- Therefore the negative aggregate B-vs-A result does not by itself prove that
+  information reward is conceptually harmful.  Two live explanations remain:
+  (1) both models are undertrained and B's advantage may emerge only at much
+  larger scale; or (2) the expert intuition that the more human-like treatment
+  should be stronger is misleading, and task-only PPO is genuinely better.
+
+The earlier interpretation that B increased opponent gain more than partner
+gain is also not sufficient.  The controlled dataset forces a competitive
+`1H-1S` start, while ordinary bridge contains a substantial non-competitive
+auction region (estimated in the conversation at roughly 30-40%).  Information
+shaping may be more useful when partners have room to exchange constructive
+information without immediate interference.  The main experiment must cover
+that region before concluding that `r_info` has no value.
+
+#### Experimental priorities
+
+1. Preserve the corrected bidding mask, dealer/seat mapping, reward attribution,
+   GAE, value clipping, and FSP snapshot fixes.  The old apparent `+3.8 IMP`
+   result passed through known bugs and must not be treated as a trustworthy
+   target.
+2. Do not spend the main budget merely repeating the forced-competition
+   A/B/C experiment.  Implement and validate unrestricted random deals and
+   complete auctions, including both competitive and non-competitive cases.
+3. Run a short end-to-end pilot on the actual main-experiment entry point to
+   measure auction length, throughput, reward statistics, action-mask health,
+   checkpoint/resume, and GPU allocation before the long run.
+4. Train A/B/C from the same `sl_base.pt`, Judge checkpoint, seed schedule, deal
+   distribution, architecture, FSP settings, optimizer settings, and evaluation
+   deals.  Only the intended information-reward terms may differ.
+5. Evaluate on large paired duplicate samples.  Because +0.1 IMP is meaningful,
+   confidence intervals and multiple seeds matter; 100 manually inspected
+   deals are qualitative diagnostics, not the strength result.
+6. Alongside IMP, stratify evaluation by competitive versus non-competitive
+   auctions.  Aggregate IMP alone could hide the region in which information
+   reward helps or hurts.
+
+The initial scale discussed for the main run was inspired by prior bridge-RL
+work but remains a compute hypothesis, not a fixed law.  `deals_per_step=4096`
+was only an early assumption.  Actual rollout and PPO batch sizes must follow
+measured throughput while preserving the intended total number of deals and
+optimization semantics.
+
+#### Compute, budget, and operational decision
+
+- Budget discussed: approximately CNY 1,000-2,000, with no more than two weeks
+  of server time and a preference for leaving room for a failed experiment.
+- DDS generation is CPU-heavy and should not consume expensive GPU rental time.
+  Ten million precomputed PGX/DDS training deals and a separate 500k evaluation
+  set are already present locally; verify the selected main entry point uses the
+  intended files and does not accidentally reuse the constrained 500k set.
+- The rented test server costs about CNY 60/day and provides two A10 24 GiB GPUs,
+  16 physical/32 logical CPU cores, and 128 GiB RAM.  A single process initially
+  looked no better than the local 40-series GPU, but optimization plus concurrent
+  independent runs made the whole machine cost-effective.
+- Rent one week for the prepared run and retain the ability to extend.  Reserve
+  two weeks up front only if seller availability/discount makes extension risky
+  or if both a complete failed full-scale run and a complete rerun must fit.
+
+Long jobs should run detached from the SSH session, write one log per agent,
+save a resume checkpoint every round, and emit small structured health summaries.
+Monitoring should be event-driven or every few hours (process alive, round
+progress, NaN/Inf, GPU idle, memory/disk, checkpoint freshness), rather than
+continuous conversational polling.  This substantially reduces assistant-token
+usage; deeper analysis is needed only on an alert or phase boundary.
+
+#### Product-oriented model after the controlled study
+
+The scientific A/B/C experiment is not the final performance ceiling.  Once the
+best treatment is identified, train a separate strongest model with more data,
+more rounds, selected hyperparameters, multiple seeds/checkpoint selection or
+ensembling, and possibly greater capacity.  The product goal is a useful bridge
+bidding bot, not merely a statistically clean ablation.
+
+Monte Carlo search should sample hidden deals from a belief conditioned on the
+player's hand and public auction, then use the learned policy as a prior or
+rollout policy.  Naive perfect-information Monte Carlo can suffer strategy
+fusion and should not be presented as a correct information-set solution.  The
+base policy must first be strong enough that search refines good bidding rather
+than averaging weak continuations.
+
+**Launch gate:** all throughput measurements below used
+`CompetitiveSubgameEnv` and the constrained `1H-1S` data.  They validate the
+training engine and hardware, not the unrestricted main-experiment
+distribution.  Do not label the next run as the main experiment until its
+entry point uses random deals, complete auctions from the opening call, and the
+intended competitive/non-competitive mixture.  Benchmark that entry point
+briefly before extrapolating the times below.
+
+The rented benchmark machine has 16 physical/32 logical CPU cores, 128 GiB RAM,
+and two 24 GiB NVIDIA A10 GPUs.  The original rollout path was CPU/OpenSpiel
+bound: one Agent-B process reached only about 192 deals/s and averaged less than
+10% GPU utilization.  Increasing `deals_per_step` from 512 to 4096 made it
+slower (about 174 deals/s), and Python threads also reduced throughput.  Keep
+`collector_workers=1`.
+
+`encode_openspiel_auction_observation` now constructs the exact 571-dimensional
+OpenSpiel auction tensor directly instead of dealing 52 cards and replaying the
+auction into a new OpenSpiel state for every observation.  It includes the
+auction/opening-lead phase transition after the final three passes.  Random
+deals, vulnerabilities, dealers, histories, all four receiver seats, and
+terminal states are tested element-for-element against OpenSpiel in
+`tests/test_fast_observation.py`.  The optimized path is enabled by
+`fast_observation_encoding=True` and reproduces the old actions, task IMP,
+calibration scale, PPO losses, and information reward while raising one-process
+throughput to about 335 deals/s.
+
+Measured end-to-end multi-process throughput with four PPO epochs was:
+
+| Concurrent processes | PPO batch | Aggregate deals/s | Per-process deals/s |
+|---:|---:|---:|---:|
+| 3 | 512 | 878 | 320-339 |
+| 4 | 512 | 1092 | 300-303 |
+| 4 | 1024 | 1192 | 332-334 |
+
+The 1024 PPO batch is faster but changes the number and noise of optimizer
+updates.  Use 512 for the controlled formal comparison unless a learning-quality
+pilot justifies 1024.  The server has enough CPU capacity for four independent
+processes, but the formal A/B/C run needs three.  Expected runtime is
+`C > B > A` because C computes both information terms, B computes partner gain,
+and A has no information reward.  Balance the GPUs as follows:
+
+```text
+GPU 0: Agent A + Agent B
+GPU 1: Agent C
+```
+
+Run A/B/C as independent processes with the same seed, data, SL checkpoint,
+Judge checkpoint, and hyperparameters.  Do not run the built-in sequential
+`--train-agents A B C` path when wall-clock time matters.  Each process should
+use one label (`--train-agents A`, etc.), write its own log, and rely on the
+per-round resume checkpoint.
+
+Recommended controlled-run performance settings:
+
+```text
+deals_per_step=512
+steps_per_phase=256
+batch_size=512
+num_epochs=4
+collector_workers=1
+fast_observation_encoding=True
+```
+
+`steps_per_phase * deals_per_step` is the number of deals collected per side in
+each round.  Therefore `256 * 512` preserves exactly the same 131,072 deals as
+the earlier hypothetical `32 * 4096`, while using the substantially faster
+rollout batch size.  With three concurrent agents, the 60-round version contains
+47.2 million deals in total and is estimated at about 15 hours in the current
+competitive environment.  Unrestricted full auctions should be budgeted at
+roughly 1.5-2 times that duration until measured.  A 100-round configuration at
+the earlier 64-by-4096 scale is about 157.3 million total deals: approximately
+50 hours in the current environment and conservatively 3-4 days with full
+auctions.
+
+One server week is sufficient for one successful formal run at these scales.
+If a complete failed full-scale run and a complete rerun must both fit without
+extension risk, reserve the second week; otherwise rent one week and extend only
+if the learning curves or infrastructure require it.
+
+The scientific A/B/C comparison should keep architecture, data, and optimizer
+settings controlled.  After selecting the best treatment, a separate
+performance-oriented model may use more deals, larger capacity, multiple seeds
+or checkpoint selection, and belief-conditioned information-set Monte Carlo
+search; it need not be constrained to the ablation's compute budget.
 
 The preliminary report is available as `paper.pdf`.  It documents the earlier
 Full Disclosure/BCA formulation; the formal experiment described here replaces

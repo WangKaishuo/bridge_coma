@@ -319,8 +319,9 @@ class MAPPOAgent:
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
 
-    def save(self, path: str):
-        torch.save({
+    def checkpoint_dict(self) -> dict:
+        """Return the complete trainable state, including all optimizers."""
+        return {
             'actor_n': self.model.actor_n.state_dict(),
             'actor_s': self.model.actor_s.state_dict(),
             'actor_e': self.model.actor_e.state_dict(),
@@ -346,10 +347,13 @@ class MAPPOAgent:
                 self.config, 'actor_belief_hidden_dim', None
             ),
             'action_mapping_version': ACTION_MAPPING_VERSION,
-        }, path)
+        }
 
-    def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
+    def save(self, path: str):
+        torch.save(self.checkpoint_dict(), path)
+
+    def load_checkpoint_dict(self, ckpt: dict) -> None:
+        """Restore a dictionary produced by :meth:`checkpoint_dict`."""
         for role in ('actor_n','actor_s','actor_e','actor_w',
                      'critic_n','critic_s','critic_e','critic_w'):
             if role in ckpt:
@@ -360,6 +364,10 @@ class MAPPOAgent:
                         'critic_e_optimizer','critic_w_optimizer'):
             if opt_key in ckpt:
                 getattr(self, opt_key).load_state_dict(ckpt[opt_key])
+
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location=self.device)
+        self.load_checkpoint_dict(ckpt)
 
     def state_dict(self) -> dict:
         d = {}

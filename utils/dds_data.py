@@ -51,15 +51,16 @@ def deck_to_hands(deck: np.ndarray) -> np.ndarray:
     """
     if deck.ndim == 1:
         hands = np.zeros((4, 52), dtype=np.float32)
-        for card, player in enumerate(deck):
-            hands[player, card] = 1.0
+        hands[deck.astype(np.intp), np.arange(52)] = 1.0
         return hands
     else:
         batch_size = deck.shape[0]
         hands = np.zeros((batch_size, 4, 52), dtype=np.float32)
-        for b in range(batch_size):
-            for card, player in enumerate(deck[b]):
-                hands[b, player, card] = 1.0
+        hands[
+            np.arange(batch_size)[:, None],
+            deck.astype(np.intp),
+            np.arange(52)[None, :],
+        ] = 1.0
         return hands
 
 
@@ -145,6 +146,64 @@ class MultiFileLoader:
         return self.num_samples
 
 
+class MemmapDDSLoader:
+    """Single-file, zero-decompression DDS loader.
+
+    ``dds.npy`` is a structured array with ``decks`` and ``tricks`` fields.
+    Multiple training processes map the same file and share the operating
+    system page cache instead of each holding or repeatedly decompressing a
+    private copy.
+    """
+
+    def __init__(self, data_path: str):
+        path = Path(data_path)
+        if path.is_dir():
+            path = path / "dds.npy"
+        if not path.exists():
+            raise FileNotFoundError(f"Memmap DDS data not found: {path}")
+        self.data_path = path
+        self.records = np.load(path, mmap_mode="r", allow_pickle=False)
+        required = {"decks", "tricks"}
+        names = set(self.records.dtype.names or ())
+        if not required.issubset(names):
+            raise ValueError(f"Expected structured fields {required}, got {names}")
+        if self.records.dtype["decks"].shape != (52,):
+            raise ValueError("Memmap decks field must have shape (52,)")
+        if self.records.dtype["tricks"].shape != (5, 4):
+            raise ValueError("Memmap tricks field must have shape (5, 4)")
+        self.num_samples = len(self.records)
+        size_mb = os.path.getsize(path) / 1024 / 1024
+        print(f"  {path.name}: {self.num_samples:,} samples, {size_mb:.1f} MB (memmap)")
+
+    def sample(self, batch_size: int = 1) -> Tuple[np.ndarray, np.ndarray]:
+        indices = np.random.randint(0, self.num_samples, size=batch_size)
+        records = self.records[indices]
+        decks = np.asarray(records["decks"])
+        tricks = np.asarray(records["tricks"])
+        return deck_to_hands(decks), tricks.copy()
+
+    def sample_one(self) -> Tuple[np.ndarray, np.ndarray]:
+        record = self.records[np.random.randint(0, self.num_samples)]
+        return (
+            deck_to_hands(np.asarray(record["decks"])),
+            np.asarray(record["tricks"]).copy(),
+        )
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def close(self) -> None:
+        mmap = getattr(self.records, "_mmap", None)
+        if mmap is not None:
+            mmap.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def create_loader(data_path: str, preload: bool = False):
     """
     智能创建加载器
@@ -153,9 +212,13 @@ def create_loader(data_path: str, preload: bool = False):
     """
     path = Path(data_path)
     
+    if path.is_file() and path.suffix == ".npy":
+        return MemmapDDSLoader(str(path))
     if path.is_file():
         return DDSDataLoader(str(path), preload)
     elif path.is_dir():
+        if (path / "dds.npy").exists():
+            return MemmapDDSLoader(str(path / "dds.npy"))
         files = sorted(path.glob("dds_*.npz"))
         if not files:
             raise FileNotFoundError(f"No dds_*.npz in {path}")

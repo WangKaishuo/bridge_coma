@@ -68,6 +68,8 @@ class FSPPool:
             for role, sd in snapshot.items()
         }
 
+        if self._fifo_capacity <= 0:
+            return
         if len(self._pool) >= self._fifo_capacity:
             self._pool.pop(0)
         self._pool.append(snapshot)
@@ -88,6 +90,8 @@ class FSPPool:
         sd_cpu['belief_net'] = (
             copy.deepcopy(belief_net.state_dict()) if belief_net is not None else None
         )
+        if self._fifo_capacity <= 0:
+            return
         if len(self._pool) >= self._fifo_capacity:
             self._pool.pop(0)
         self._pool.append(sd_cpu)

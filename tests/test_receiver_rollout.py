@@ -13,6 +13,7 @@ except ImportError:
 
 from subgames.competitive_env import CompetitiveSubgameEnv
 from subgames.subgame_trainer import SubgameConfig, SubgameTrainer
+from networks.policy_net import physical_to_openspiel_player
 from utils.hand_features import hand_to_belief_target
 from utils.running_stats import RunningStats
 
@@ -72,7 +73,10 @@ class ReceiverRolloutTests(unittest.TestCase):
         steps = [step for episode in episodes for step in episode if step.get("_rinfo")]
         self.assertTrue(steps)
         for step in steps:
-            self.assertEqual(step["target_pos"], step["player"])
+            self.assertEqual(
+                step["target_pos"],
+                physical_to_openspiel_player(step["player"], step["dealer"]),
+            )
             expected = hand_to_belief_target(step["all_hands"][step["player"]])
             self.assertTrue(np.array_equal(step["belief_target"], expected))
             self.assertEqual(step["partner_obs_before"].shape, (571,))

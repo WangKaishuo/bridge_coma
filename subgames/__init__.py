@@ -7,3 +7,4 @@ does not initialize PyTorch.
 from subgames.competitive_env import (
     CompetitiveSubgameEnv,
 )
+from subgames.unrestricted_env import UnrestrictedBiddingEnv

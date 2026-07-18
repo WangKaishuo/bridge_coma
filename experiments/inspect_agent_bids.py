@@ -1,4 +1,4 @@
-"""Print detailed deterministic bidding traces for current 571-dim agents.
+"""Print compact bridge-style bidding records for current 571-dim agents.
 
 The report compares two agents on the same constrained deals in both roles:
 table 1 assigns Agent A to the opener partnership and Agent B to the
@@ -15,7 +15,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -37,8 +36,9 @@ from utils.imp import score_to_imp
 
 
 SEATS = ("N", "E", "S", "W")
+SEAT_NAMES = ("North", "East", "South", "West")
 RANKS = "23456789TJQKA"
-SUITS = ("C", "D", "H", "S")
+SUITS = ("♣", "♦", "♥", "♠")
 VULNERABILITIES = (
     (False, False),
     (True, False),
@@ -67,8 +67,27 @@ def hand_name(hand: np.ndarray) -> str:
             for rank in range(12, -1, -1)
             if hand[suit * 13 + rank] > 0.5
         )
-        chunks.append(f"{SUITS[suit]}:{cards or '-'}")
-    return "  ".join(chunks)
+        chunks.append(f"{SUITS[suit]}{cards or '-'}")
+    return " ".join(chunks)
+
+
+def hand_hcp(hand: np.ndarray) -> int:
+    points = {12: 4, 11: 3, 10: 2, 9: 1}
+    return sum(
+        points.get(rank, 0)
+        for suit in range(4)
+        for rank in range(13)
+        if hand[suit * 13 + rank] > 0.5
+    )
+
+
+def hand_shape(hand: np.ndarray) -> str:
+    # Standard display order: spades-hearts-diamonds-clubs.
+    lengths = [
+        int(hand[suit * 13:(suit + 1) * 13].sum())
+        for suit in range(3, -1, -1)
+    ]
+    return "-".join(str(length) for length in lengths)
 
 
 def vulnerability_name(vulnerability: tuple[bool, bool]) -> str:
@@ -116,7 +135,7 @@ class ActorPolicy:
 
     def choose(
         self, state, player: int, dealer: int
-    ) -> tuple[int, list[tuple[int, float]]]:
+    ) -> int:
         observer = physical_to_openspiel_player(player, dealer)
         observation = get_openspiel_obs(state, observer)
         legal_mask = np.zeros(NUM_BIDS, dtype=np.float32)
@@ -133,14 +152,8 @@ class ActorPolicy:
         ).unsqueeze(0)
         with torch.no_grad():
             logits = self.actors[player](obs_t, legal_t)
-            probabilities = F.softmax(logits, dim=-1).squeeze(0)
-            legal_count = int(legal_mask.sum())
-            values, indices = torch.topk(probabilities, k=min(3, legal_count))
-        top = [
-            (int(action), float(probability))
-            for action, probability in zip(indices.cpu(), values.cpu())
-        ]
-        return top[0][0], top
+            action = int(torch.argmax(logits, dim=-1).item())
+        return action
 
 
 @dataclass
@@ -148,8 +161,6 @@ class BidTrace:
     player: int
     controller: str
     action: int
-    top3: list[tuple[int, float]] | None
-    selected_action: int | None = None
 
 
 @dataclass
@@ -187,7 +198,7 @@ def play_table(
             raise RuntimeError(f"Fixed-prefix action {prefix_bid} is illegal")
         state.apply_action(raw_action)
         _, _, done, _ = inner.step(action)
-        bids.append(BidTrace(player, "fixed", action, None))
+        bids.append(BidTrace(player, "fixed", action))
         if done:
             break
 
@@ -195,7 +206,7 @@ def play_table(
     while not done:
         player = inner.state.current_player
         policy = opener_policy if player in opener_seats else overcaller_policy
-        selected_action, top3 = policy.choose(state, player, dealer)
+        selected_action = policy.choose(state, player, dealer)
         # Match CompetitiveSubgameEnv.play_mixed exactly: OpenSpiel supplies
         # the policy mask, while the local auction environment has the final
         # validity check and falls back to Pass when the two disagree.
@@ -207,9 +218,7 @@ def play_table(
             raise RuntimeError(
                 f"Applied action {bid_name(action)} is illegal for {SEATS[player]}"
             )
-        bids.append(
-            BidTrace(player, policy.label, action, top3, selected_action)
-        )
+        bids.append(BidTrace(player, policy.label, action))
         state.apply_action(raw_action)
         _, _, done, _ = inner.step(action)
 
@@ -227,47 +236,82 @@ def contract_name(contract) -> str:
     return f"{contract.level}{strain}{doubled} by {SEATS[contract.declarer]}"
 
 
-def write_table(handle, title: str, trace: TableTrace) -> None:
-    handle.write(f"\n{title}\n")
-    handle.write("-" * 88 + "\n")
-    handle.write(" No. Seat Model  Bid    Top-3 legal-action probabilities\n")
-    for index, bid in enumerate(trace.bids, 1):
-        if bid.top3 is None:
-            top_text = "fixed experimental prefix"
-        else:
-            top_text = ", ".join(
-                f"{bid_name(action)}={probability:.1%}"
-                for action, probability in bid.top3
-            )
-            if bid.selected_action != bid.action:
-                top_text = (
-                    f"selected {bid_name(bid.selected_action)} -> local-env fallback Pass; "
-                    + top_text
-                )
+def write_auction(handle, trace: TableTrace, dealer: int) -> None:
+    seat_order = [(dealer + offset) % 4 for offset in range(4)]
+    width = 10
+    handle.write(
+        "  Seat   "
+        + "".join(f"{SEATS[seat]:^{width}}" for seat in seat_order)
+        + "\n"
+    )
+
+    bids_by_round: list[list[str]] = []
+    row = [""] * 4
+    for bid in trace.bids:
+        column = (bid.player - dealer) % 4
+        row[column] = bid_name(bid.action)
+        if column == 3:
+            bids_by_round.append(row)
+            row = [""] * 4
+    if any(row):
+        bids_by_round.append(row)
+    for auction_round in bids_by_round:
         handle.write(
-            f" {index:>3}  {SEATS[bid.player]:>2}   {bid.controller:<5} "
-            f"{bid_name(bid.action):>5}   {top_text}\n"
+            "         "
+            + "".join(f"{bid:^{width}}" for bid in auction_round)
+            + "\n"
         )
 
-    handle.write(f" Contract: {contract_name(trace.contract)}\n")
+
+def write_table(
+    handle,
+    title: str,
+    trace: TableTrace,
+    dealer: int,
+    opener_label: str,
+    overcaller_label: str,
+) -> None:
+    opener_seats = {dealer, (dealer + 2) % 4}
+    seat_order = [(dealer + offset) % 4 for offset in range(4)]
+    controllers = [
+        opener_label if seat in opener_seats else overcaller_label
+        for seat in seat_order
+    ]
+
+    handle.write(f"\n  -- {title} --\n")
+    handle.write(
+        "  Model  "
+        + "".join(f"{label:^10}" for label in controllers)
+        + "\n"
+    )
+    write_auction(handle, trace, dealer)
+
+    handle.write(f"  Contract: {contract_name(trace.contract)}\n")
     if trace.contract is not None:
         required = 6 + trace.contract.level
-        result = (
-            f"made with {trace.tricks - required} overtrick(s)"
-            if trace.tricks >= required
-            else f"down {required - trace.tricks}"
-        )
-        handle.write(f" DDS tricks: {trace.tricks} ({result})\n")
-    handle.write(f" NS score: {trace.score_ns:+d}\n")
+        if trace.tricks == required:
+            result = "making"
+        elif trace.tricks > required:
+            result = f"making +{trace.tricks - required}"
+        else:
+            result = f"down {required - trace.tricks}"
+        handle.write(f"  DDS: {trace.tricks} tricks ({result})\n")
+    handle.write(f"  NS score: {trace.score_ns:+d}\n")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent-a", default="agent_a_seed42.pt")
-    parser.add_argument("--agent-b", default="agent_b_seed42.pt")
+    parser.add_argument(
+        "--agent-a", default="competitive_v4_signed/agent_a_seed42.pt"
+    )
+    parser.add_argument(
+        "--agent-b", default="competitive_v4_signed/agent_b_seed42.pt"
+    )
     parser.add_argument("--data", default="data/competitive_500k.npz")
-    parser.add_argument("--output", default="agent_a_vs_b_50_bidding_traces.txt")
-    parser.add_argument("--deals", type=int, default=50)
+    parser.add_argument(
+        "--output", default="competitive_v4_signed/A_vs_B_100_bidding.txt"
+    )
+    parser.add_argument("--deals", type=int, default=100)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     return parser.parse_args()
@@ -297,11 +341,10 @@ def main() -> None:
     env = CompetitiveSubgameEnv(str((PROJECT_ROOT / args.data).resolve()))
 
     imp_values = []
-    with output_path.open("w", encoding="utf-8") as handle:
-        handle.write("Agent A vs Agent B: deterministic bidding traces\n")
-        handle.write(f"Deals: {args.deals}  Seed: {args.seed}\n")
-        handle.write("Each deal is played twice with opener/overcaller roles swapped.\n")
-        handle.write("Probabilities are normalized over legal actions only.\n")
+    with output_path.open("w", encoding="utf-8-sig") as handle:
+        handle.write("AGENT A vs AGENT B - CROSS-TABLE BIDDING RECORDS\n")
+        handle.write(f"Deals: {args.deals}    Seed: {args.seed}\n")
+        handle.write("Each deal is played twice with opener/overcaller partnerships swapped.\n")
 
         for deal_index in range(1, args.deals + 1):
             hands, dd_table = env.generate_deal()
@@ -320,26 +363,46 @@ def main() -> None:
             imp_a = float(score_to_imp(score_difference))
             imp_values.append(imp_a)
 
-            handle.write("\n\n" + "=" * 88 + "\n")
+            handle.write("\n\n" + "=" * 72 + "\n")
             handle.write(
-                f"DEAL {deal_index:02d}/{args.deals}  Dealer={SEATS[dealer]}  "
-                f"Vulnerability={vulnerability_name(vulnerability)}\n"
+                f"DEAL {deal_index:03d}/{args.deals}    "
+                f"Dealer: {SEAT_NAMES[dealer]}    "
+                f"Vulnerability: {vulnerability_name(vulnerability)}\n"
             )
-            handle.write("=" * 88 + "\n")
+            handle.write("=" * 72 + "\n")
+            opener_seats = {dealer, (dealer + 2) % 4}
             for seat in (NORTH, EAST, SOUTH, WEST):
-                handle.write(f" {SEATS[seat]}: {hand_name(hands[seat])}\n")
+                role = "opener side" if seat in opener_seats else "overcaller side"
+                handle.write(
+                    f"  {SEAT_NAMES[seat]:<5}: {hand_name(hands[seat]):<32} "
+                    f"({hand_hcp(hands[seat]):>2} HCP, {hand_shape(hands[seat])})  {role}\n"
+                )
 
-            write_table(handle, "TABLE 1: A opener partnership vs B overcaller partnership", table_1)
-            write_table(handle, "TABLE 2: B opener partnership vs A overcaller partnership", table_2)
+            first = FIXED_PREFIX[0]
+            second = FIXED_PREFIX[1]
             handle.write(
-                f"\n A-perspective result: {imp_a:+.0f} IMP "
-                f"(table scores {table_1.score_ns:+d}, {table_2.score_ns:+d})\n"
+                f"\n  Fixed prefix: {SEATS[dealer]}:{first} -> "
+                f"{SEATS[(dealer + 1) % 4]}:{second}\n"
+            )
+
+            write_table(
+                handle, "TABLE 1: A opener side vs B overcaller side",
+                table_1, dealer, "A", "B"
+            )
+            write_table(
+                handle, "TABLE 2: B opener side vs A overcaller side",
+                table_2, dealer, "B", "A"
+            )
+            outcome = "tie" if imp_a == 0 else ("A wins" if imp_a > 0 else "B wins")
+            handle.write(
+                f"\n  IMP (A perspective): {imp_a:+.0f}  "
+                f"(T1={table_1.score_ns:+d}, T2={table_2.score_ns:+d})  -- {outcome}\n"
             )
 
         values = np.asarray(imp_values, dtype=np.float64)
-        handle.write("\n\n" + "=" * 88 + "\n")
-        handle.write("SUMMARY\n")
-        handle.write("=" * 88 + "\n")
+        handle.write("\n\n" + "=" * 72 + "\n")
+        handle.write(f"A vs B CROSS-TABLE SUMMARY ({args.deals} deals)\n")
+        handle.write("=" * 72 + "\n")
         handle.write(
             f"A-perspective IMP: mean={values.mean():+.3f}, std={values.std():.3f}\n"
         )

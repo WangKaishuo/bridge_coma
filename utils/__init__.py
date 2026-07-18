@@ -14,6 +14,7 @@ from utils.imp import (
  
 from utils.dds_data import (
     DDSDataLoader,
+    MemmapDDSLoader,
     MultiFileLoader,
     create_loader,
     deck_to_hands,

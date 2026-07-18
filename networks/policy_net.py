@@ -95,6 +95,60 @@ def physical_to_openspiel_player(player: int, dealer: int) -> int:
     return (int(player) - int(dealer)) % NUM_PLAYERS
 
 
+def encode_openspiel_auction_observation(
+    hands_sm: np.ndarray,
+    dealer: int,
+    history_int: list,
+    player: int,
+    vulnerability: tuple = (False, False),
+) -> np.ndarray:
+    """Build OpenSpiel's 571-dim auction observation without replaying a state.
+
+    This is a direct translation of BridgeState::WriteObservationTensor for
+    the auction phase.  The unused play-phase tail remains zero.  Keeping this
+    small, pure NumPy path avoids dealing 52 cards into a new pyspiel state for
+    every rollout table.
+    """
+    values = np.zeros(OBS_DIM, dtype=np.float32)
+    has_contract = any(int(call) >= BID_1C for call in history_int)
+    opening_lead = (
+        has_contract and len(history_int) >= 3
+        and all(int(call) == BID_PASS for call in history_int[-3:])
+    )
+    values[1 if opening_lead else 0] = 1.0
+    offset = 4
+
+    ns_vul, ew_vul = bool(vulnerability[0]), bool(vulnerability[1])
+    own_vul = ns_vul if player % 2 == 0 else ew_vul
+    opp_vul = ew_vul if player % 2 == 0 else ns_vul
+    values[offset + int(own_vul)] = 1.0
+    offset += 2
+    values[offset + int(opp_vul)] = 1.0
+    offset += 2
+
+    os_player = physical_to_openspiel_player(player, dealer)
+    last_bid = 0
+    for auction_idx, call in enumerate(history_int):
+        call = int(call)
+        relative_bidder = (auction_idx - os_player) % NUM_PLAYERS
+        if last_bid == 0 and call == BID_PASS:
+            values[offset + relative_bidder] = 1.0
+        if call == BID_DOUBLE:
+            base = offset + NUM_PLAYERS + (last_bid - BID_1C) * 12
+            values[base + NUM_PLAYERS + relative_bidder] = 1.0
+        elif call == BID_REDOUBLE:
+            base = offset + NUM_PLAYERS + (last_bid - BID_1C) * 12
+            values[base + 2 * NUM_PLAYERS + relative_bidder] = 1.0
+        elif call != BID_PASS:
+            last_bid = call
+            base = offset + NUM_PLAYERS + (last_bid - BID_1C) * 12
+            values[base + relative_bidder] = 1.0
+
+    offset += NUM_PLAYERS * (1 + 3 * 35)
+    values[offset:offset + 52] = convert_hands_suit_to_rank(hands_sm)[player]
+    return values
+
+
 # ==============================================================================
 # Card Encoding Conversion
 # ==============================================================================
