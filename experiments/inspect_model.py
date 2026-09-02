@@ -1,4 +1,4 @@
-"""Inspect and validate one inference-only Bridge-COMA checkpoint."""
+"""Inspect and validate one inference-only MARL Dual Audience checkpoint."""
 
 from __future__ import annotations
 

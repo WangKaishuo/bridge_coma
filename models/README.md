@@ -1,9 +1,7 @@
 # Round-100 models
 
-The twelve inference-only models are distributed in three GitHub Release
-archives, one per training seed. Extract each archive into
-`models/round100/seed<seed>/` and verify the files against `MANIFEST.csv`.
-The archive-level sizes and hashes are recorded in `ASSETS.csv`.
+The twelve inference-only round-100 models are stored directly in this
+directory. Verify their sizes and SHA-256 hashes against `MANIFEST.csv`.
 
 Each `.pt` file contains these keys:
 

@@ -1,9 +1,8 @@
 """
-Belief Network (P105 rewrite)
-==============================
+Belief Network
+==============
 
-P105: Uses OpenSpiel 571-dim observation as input instead of the previous
-(observer_hand + encode_history_flat + position_embeds) = 268-dim encoding.
+Uses the OpenSpiel 571-dimensional observation as input.
 
 The old encoding had a fatal flaw: encode_history_flat collapsed all bidding
 history into a 38-dim "which bids appeared" bitmap, discarding WHO made each bid.
@@ -48,7 +47,7 @@ except ImportError:
 
 class BeliefNetwork(nn.Module):
     """
-    Belief Network (P105): predicts target player's hand features from
+    Predicts target player's hand features from an
     OpenSpiel 571-dim observation + target position.
 
     Input:
@@ -80,7 +79,7 @@ class BeliefNetwork(nn.Module):
         # Length head: 4 suits x 8 bins = 32 logits
         self.length_head = nn.Linear(hidden_dim, LENGTH_DIM)
 
-        # Bias initialization (P86)
+        # Bias initialization
         self._init_bias()
 
         # Legacy buffer for backward compat
@@ -178,7 +177,7 @@ class BeliefNetwork(nn.Module):
         return belief_accuracy(probs, targets)
 
     # ==================================================================
-    # EWC (Elastic Weight Consolidation) - P97
+    # EWC (Elastic Weight Consolidation)
     # ==================================================================
 
     def compute_fisher(
@@ -252,7 +251,7 @@ class BeliefNetwork(nn.Module):
 
 class DualInfoComputer:
     """
-    Dual-Info Bonus (P86)
+    Dual-Info Bonus
     r_info = I(bid; hand | partner) - beta * I(bid; hand | opponent)
     """
 

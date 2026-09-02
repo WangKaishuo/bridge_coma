@@ -62,14 +62,8 @@ def build_config(args, label: str, device: str) -> SubgameConfig:
     else:
         raise ValueError(f"Unknown agent label: {label}")
 
-    use_help_bonus = bool(getattr(args, "help_reward", False)) and label in {"B", "C"}
-    if use_help_bonus:
-        # B-prime is partner-only; C-prime subtracts receiver-mediated opponent
-        # help with the command-line beta.
-        use_info_bonus = False
-        help_beta = 0.0 if label == "B" else float(args.beta)
-    else:
-        help_beta = 0.0
+    use_help_bonus = False
+    help_beta = 0.0
 
     return SubgameConfig(
         num_rounds=args.rounds,
@@ -92,26 +86,16 @@ def build_config(args, label: str, device: str) -> SubgameConfig:
         ),
         use_help_bonus=use_help_bonus,
         help_beta=help_beta,
-        help_reward_weight=(args.help_weight if use_help_bonus else 0.0),
-        help_weight_clip=args.help_weight_clip,
-        help_return_equivalent=(
-            use_help_bonus and bool(args.help_return_equivalent)
-        ),
-        help_receiver_value_baseline=(
-            use_help_bonus and bool(args.help_receiver_value_baseline)
-        ),
-        help_all_action_q=(
-            use_help_bonus and bool(getattr(args, "help_all_action_q", False))
-        ),
-        help_task_q_lr=float(getattr(args, "help_task_q_lr", 3e-4)),
-        help_task_q_batch_size=(
-            64 if args.quick else int(getattr(args, "help_task_q_batch_size", 1024))
-        ),
-        help_task_q_epochs=int(getattr(args, "help_task_q_epochs", 1)),
-        help_task_q_min_samples=(
-            1 if args.quick else int(getattr(args, "help_task_q_min_samples", 4096))
-        ),
-        help_task_q_hidden_dim=int(getattr(args, "help_task_q_hidden_dim", 256)),
+        help_reward_weight=0.0,
+        help_weight_clip=10.0,
+        help_return_equivalent=False,
+        help_receiver_value_baseline=False,
+        help_all_action_q=False,
+        help_task_q_lr=3e-4,
+        help_task_q_batch_size=1024,
+        help_task_q_epochs=1,
+        help_task_q_min_samples=4096,
+        help_task_q_hidden_dim=256,
         belief_conditioned=True,
         actor_belief_coef=args.actor_belief_coef,
         freeze_belief=True,
@@ -723,8 +707,8 @@ def build_parser(
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", default=default_data)
     parser.add_argument("--eval-data", default=default_eval_data)
-    parser.add_argument("--sl-checkpoint", default="results/sl_base.pt")
-    parser.add_argument("--belief-checkpoint", default="results/sl_base_bca.pt")
+    parser.add_argument("--sl-checkpoint", default="data/sl_base.pt")
+    parser.add_argument("--belief-checkpoint", default="data/sl_base_bca.pt")
     parser.add_argument("--output-dir", default=default_output_dir)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-seed", type=int, default=2026)
@@ -748,35 +732,6 @@ def build_parser(
             "gamma*Phi(next own turn)-Phi(now) shaping"
         ),
     )
-    parser.add_argument(
-        "--help-reward", action="store_true",
-        help="Train B/C with receiver-mediated MC task-IMP help reward",
-    )
-    parser.add_argument("--help-weight", type=float, default=0.05)
-    parser.add_argument("--help-weight-clip", type=float, default=10.0)
-    parser.add_argument(
-        "--help-return-equivalent", action="store_true",
-        help=(
-            "Redistribute help credit from each sender's terminal task reward "
-            "instead of adding a new episode-level objective"
-        ),
-    )
-    parser.add_argument(
-        "--help-receiver-value-baseline", action="store_true",
-        help="Subtract the detached receiver-state value inside the help estimator",
-    )
-    parser.add_argument(
-        "--help-all-action-q", action="store_true",
-        help=(
-            "Use the expensive COMA-style all-action receiver Task-Q estimator "
-            "instead of the sampled-action importance estimator"
-        ),
-    )
-    parser.add_argument("--help-task-q-lr", type=float, default=3e-4)
-    parser.add_argument("--help-task-q-batch-size", type=int, default=1024)
-    parser.add_argument("--help-task-q-epochs", type=int, default=1)
-    parser.add_argument("--help-task-q-min-samples", type=int, default=4096)
-    parser.add_argument("--help-task-q-hidden-dim", type=int, default=256)
     parser.add_argument("--actor-belief-coef", type=float, default=0.1)
     parser.add_argument("--learning-rate", type=float, default=3e-6)
     parser.add_argument("--belief-learning-rate", type=float, default=1e-5)

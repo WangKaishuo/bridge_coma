@@ -1,0 +1,303 @@
+{
+  "beta": 1.0,
+  "deals_per_side": 512,
+  "diagnostic_scales": {
+    "legacy_c": {
+      "factor": 0.8239895435662693,
+      "info_std": 0.40997134805278845,
+      "task_std": 6.756242079145306
+    },
+    "strict_potential_c": {
+      "factor": 0.7578139048500049,
+      "info_std": 0.44577184688123256,
+      "task_std": 6.756242079145306
+    }
+  },
+  "gradient_comparisons_by_seat": {
+    "0": {
+      "legacy_c_vs_strict_potential_c": {
+        "cosine": 1.0,
+        "left_norm": 0.878246545791626,
+        "right_norm": 0.8786177635192871,
+        "right_to_left_norm_ratio": 1.0004226805439087
+      },
+      "shaping_increments_vs_task": {
+        "legacy_c": {
+          "cosine_with_task": 0.023257149486046,
+          "increment_norm": 0.011395119166216314,
+          "increment_to_task_norm_ratio": 0.012974524863572302,
+          "task_norm": 0.878268706256028
+        },
+        "return_equivalent": {
+          "cosine_with_task": 0.20002435354488612,
+          "increment_norm": 0.019752832082136892,
+          "increment_to_task_norm_ratio": 0.02249064772709624,
+          "task_norm": 0.878268706256028
+        },
+        "strict_potential_c": {
+          "cosine_with_task": 0.03823605397114477,
+          "increment_norm": 0.015155655016887998,
+          "increment_to_task_norm_ratio": 0.017256284903392545,
+          "task_norm": 0.878268706256028
+        }
+      },
+      "task_vs_legacy_c": {
+        "cosine": 1.0,
+        "left_norm": 0.8779080510139465,
+        "right_norm": 0.878246545791626,
+        "right_to_left_norm_ratio": 1.0003855697385262
+      },
+      "task_vs_return_equivalent": {
+        "cosine": 1.0,
+        "left_norm": 0.8779080510139465,
+        "right_norm": 0.882073163986206,
+        "right_to_left_norm_ratio": 1.0047443612886897
+      },
+      "task_vs_strict_potential_c": {
+        "cosine": 1.0,
+        "left_norm": 0.8779080510139465,
+        "right_norm": 0.8786177635192871,
+        "right_to_left_norm_ratio": 1.0008084132552617
+      }
+    },
+    "1": {
+      "legacy_c_vs_strict_potential_c": {
+        "cosine": 1.0,
+        "left_norm": 0.9450856447219849,
+        "right_norm": 0.9446327686309814,
+        "right_to_left_norm_ratio": 0.9995208094699856
+      },
+      "shaping_increments_vs_task": {
+        "legacy_c": {
+          "cosine_with_task": 0.07304058339918823,
+          "increment_norm": 0.014582261015208361,
+          "increment_to_task_norm_ratio": 0.015443044525023607,
+          "task_norm": 0.9442607635806237
+        },
+        "return_equivalent": {
+          "cosine_with_task": -0.24460838656450107,
+          "increment_norm": 0.03511028189640163,
+          "increment_to_task_norm_ratio": 0.037182824120811635,
+          "task_norm": 0.9442607635806237
+        },
+        "strict_potential_c": {
+          "cosine_with_task": 0.027791816719235446,
+          "increment_norm": 0.01910352618563612,
+          "increment_to_task_norm_ratio": 0.020231197697123213,
+          "task_norm": 0.9442607635806237
+        }
+      },
+      "task_vs_legacy_c": {
+        "cosine": 1.0,
+        "left_norm": 0.943907618522644,
+        "right_norm": 0.9450856447219849,
+        "right_to_left_norm_ratio": 1.0012480312439735
+      },
+      "task_vs_return_equivalent": {
+        "cosine": 1.0,
+        "left_norm": 0.943907618522644,
+        "right_norm": 0.9359346628189087,
+        "right_to_left_norm_ratio": 0.9915532457337147
+      },
+      "task_vs_strict_potential_c": {
+        "cosine": 1.0,
+        "left_norm": 0.943907618522644,
+        "right_norm": 0.9446327686309814,
+        "right_to_left_norm_ratio": 1.0007682426692057
+      }
+    },
+    "2": {
+      "legacy_c_vs_strict_potential_c": {
+        "cosine": 1.0,
+        "left_norm": 0.8763086795806885,
+        "right_norm": 0.8749915361404419,
+        "right_to_left_norm_ratio": 0.9984969412366463
+      },
+      "shaping_increments_vs_task": {
+        "legacy_c": {
+          "cosine_with_task": 0.15788163357981913,
+          "increment_norm": 0.013769881916696501,
+          "increment_to_task_norm_ratio": 0.015747671094936504,
+          "task_norm": 0.8744075129384725
+        },
+        "return_equivalent": {
+          "cosine_with_task": 0.004649458409970238,
+          "increment_norm": 0.02967162727341684,
+          "increment_to_task_norm_ratio": 0.03393340843299076,
+          "task_norm": 0.8744075129384725
+        },
+        "strict_potential_c": {
+          "cosine_with_task": 0.07307867770731537,
+          "increment_norm": 0.012050859521333699,
+          "increment_to_task_norm_ratio": 0.013781742886490563,
+          "task_norm": 0.8744075129384725
+        }
+      },
+      "task_vs_legacy_c": {
+        "cosine": 1.0,
+        "left_norm": 0.8740267157554626,
+        "right_norm": 0.8763086795806885,
+        "right_to_left_norm_ratio": 1.002610862784959
+      },
+      "task_vs_return_equivalent": {
+        "cosine": 1.0,
+        "left_norm": 0.8740267157554626,
+        "right_norm": 0.8746689558029175,
+        "right_to_left_norm_ratio": 1.000734805968602
+      },
+      "task_vs_strict_potential_c": {
+        "cosine": 1.0,
+        "left_norm": 0.8740267157554626,
+        "right_norm": 0.8749915361404419,
+        "right_to_left_norm_ratio": 1.0011038797414165
+      }
+    },
+    "3": {
+      "legacy_c_vs_strict_potential_c": {
+        "cosine": 1.0,
+        "left_norm": 0.8113552331924438,
+        "right_norm": 0.8134540915489197,
+        "right_to_left_norm_ratio": 1.0025868550181374
+      },
+      "shaping_increments_vs_task": {
+        "legacy_c": {
+          "cosine_with_task": -0.11097869056174368,
+          "increment_norm": 0.013936852855964509,
+          "increment_to_task_norm_ratio": 0.01713862516850824,
+          "task_norm": 0.8131838300293246
+        },
+        "return_equivalent": {
+          "cosine_with_task": -0.033701355036207095,
+          "increment_norm": 0.019768222802986846,
+          "increment_to_task_norm_ratio": 0.024309660464195377,
+          "task_norm": 0.8131838300293246
+        },
+        "strict_potential_c": {
+          "cosine_with_task": 0.03137164977748284,
+          "increment_norm": 0.016230054451774993,
+          "increment_to_task_norm_ratio": 0.019958653692351107,
+          "task_norm": 0.8131838300293246
+        }
+      },
+      "task_vs_legacy_c": {
+        "cosine": 1.0,
+        "left_norm": 0.812781810760498,
+        "right_norm": 0.8113552331924438,
+        "right_to_left_norm_ratio": 0.998244820997262
+      },
+      "task_vs_return_equivalent": {
+        "cosine": 1.0,
+        "left_norm": 0.812781810760498,
+        "right_norm": 0.812354564666748,
+        "right_to_left_norm_ratio": 0.9994743409755317
+      },
+      "task_vs_strict_potential_c": {
+        "cosine": 1.0,
+        "left_norm": 0.812781810760498,
+        "right_norm": 0.8134540915489197,
+        "right_to_left_norm_ratio": 1.0008271356217884
+      }
+    }
+  },
+  "gradient_definition": "full_frozen_batch_on_policy_normalized_discounted_monte_carlo",
+  "read_only": true,
+  "return_equivalent_metadata": {
+    "EW": {
+      "all_action_q": false,
+      "baseline": "detached_receiver_state_value",
+      "clip_count": 0,
+      "clip_fraction": 0.0,
+      "direct_help_abs_mean_imp": 0.0,
+      "frozen_scale_factor": 0.26826196848888956,
+      "heard_deaf_policy_l1_mean": 0.0,
+      "help_beta": 1.0,
+      "help_reward_weight": 0.05,
+      "help_weight_clip": 10.0,
+      "legal_q_span_mean_imp": 0.0,
+      "opponent_help_mean_imp": -0.01144081866480532,
+      "partner_help_mean_imp": -0.051161986154504804,
+      "q_source": "terminal_task_imp_mc",
+      "raw_weight_abs_max": 5.791489644235488,
+      "raw_weight_mean": 0.0021979696014435683,
+      "raw_weight_std": 0.15124240231096545,
+      "receiver_event_count": 3895,
+      "return_equivalent": true,
+      "rewarded_sender_count": 2008,
+      "scale_mode": "frozen_capped_mc",
+      "shaped_reward_abs_max": 9.54442097412588,
+      "shaped_reward_mean": -0.009343551178501329,
+      "shaped_reward_std": 0.39333702401908566,
+      "task_q_ready": false,
+      "task_q_samples_seen": 0,
+      "task_q_updates": 0
+    },
+    "NS": {
+      "all_action_q": false,
+      "baseline": "detached_receiver_state_value",
+      "clip_count": 0,
+      "clip_fraction": 0.0,
+      "direct_help_abs_mean_imp": 0.0,
+      "frozen_scale_factor": 0.26826196848888956,
+      "heard_deaf_policy_l1_mean": 0.0,
+      "help_beta": 1.0,
+      "help_reward_weight": 0.05,
+      "help_weight_clip": 10.0,
+      "legal_q_span_mean_imp": 0.0,
+      "opponent_help_mean_imp": -0.0037071315314505067,
+      "partner_help_mean_imp": -0.029665622022998005,
+      "q_source": "terminal_task_imp_mc",
+      "raw_weight_abs_max": 1.6702472642474246,
+      "raw_weight_mean": -0.0003317481080679184,
+      "raw_weight_std": 0.09362528647127132,
+      "receiver_event_count": 3754,
+      "return_equivalent": true,
+      "rewarded_sender_count": 1988,
+      "scale_mode": "frozen_capped_mc",
+      "shaped_reward_abs_max": 3.405083766393412,
+      "shaped_reward_mean": -0.005944391207002749,
+      "shaped_reward_std": 0.23447246547810305,
+      "task_q_ready": false,
+      "task_q_samples_seen": 0,
+      "task_q_updates": 0
+    }
+  },
+  "schema_version": "info-potential-audit-v1",
+  "seed": 2026072201,
+  "source_a_actor_only": "models/seed42_a_round100_actor_only.pt",
+  "source_a_resume": null,
+  "telescoping": {
+    "EW": {
+      "legacy_endpoint_residual": {
+        "count": 1024,
+        "max_abs": 1.0595993399620056,
+        "mean": -0.04088915212196298,
+        "mean_abs": 0.14072334233787842,
+        "std": 0.20674409836735644
+      },
+      "strict_discounted_telescoping_residual": {
+        "count": 1024,
+        "max_abs": 3.5762786865234375e-07,
+        "mean": 1.4551915235193937e-09,
+        "mean_abs": 8.556526159644816e-09,
+        "std": 3.682064855923642e-08
+      }
+    },
+    "NS": {
+      "legacy_endpoint_residual": {
+        "count": 1024,
+        "max_abs": 1.0994160771369934,
+        "mean": -0.03664640581700951,
+        "mean_abs": 0.12722130620386451,
+        "std": 0.18933758407118043
+      },
+      "strict_discounted_telescoping_residual": {
+        "count": 1024,
+        "max_abs": 4.768371583141473e-07,
+        "mean": 9.895302356712475e-10,
+        "mean_abs": 6.268965080621336e-08,
+        "std": 9.666658158636416e-08
+      }
+    }
+  },
+  "weight": 0.05
+}

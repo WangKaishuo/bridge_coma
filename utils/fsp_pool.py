@@ -2,8 +2,8 @@
 FSP Pool - Fictitious Self-Play Checkpoint Pool
 ===============================================
 
-P125: BeliefNet now stored alongside actor weights in every snapshot.
-Full Disclosure: each agent uses opponent's BeliefNet to interpret opponent bids.
+BeliefNet is stored alongside actor weights in every snapshot because each
+agent uses the opponent's BeliefNet to interpret opponent bids.
 
 Pool entry format:
     {
@@ -60,7 +60,7 @@ class FSPPool:
                 getattr(agent.model, 'actor_e', agent.model.actor_n).state_dict()),
             'actor_w': copy.deepcopy(
                 getattr(agent.model, 'actor_w', agent.model.actor_s).state_dict()),
-            # P125: BeliefNet snapshot
+            # BeliefNet snapshot
             'belief_net': copy.deepcopy(belief_net.state_dict()) if belief_net is not None else None,
         }
         snapshot = {
@@ -86,7 +86,7 @@ class FSPPool:
             role: ({k: v.cpu() for k, v in sd.items()} if isinstance(sd, dict) else sd)
             for role, sd in state_dict.items()
         }
-        # P125: attach BeliefNet
+        # Attach BeliefNet.
         sd_cpu['belief_net'] = (
             copy.deepcopy(belief_net.state_dict()) if belief_net is not None else None
         )

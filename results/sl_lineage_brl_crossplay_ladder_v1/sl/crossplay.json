@@ -1,0 +1,62 @@
+{
+  "schema_version": "sl-lineage-vs-brl-fsp-sl-crossplay-v1",
+  "focal_kind": "sl",
+  "run": null,
+  "checkpoint_round": null,
+  "deals": 20000,
+  "seed": 1611583527,
+  "device": "cpu",
+  "sign_convention": "positive IMP means focal+SL beats BRL-FSP+SL",
+  "artifacts": {
+    "focal": {
+      "path": "results\\sl_base.pt",
+      "sha256": "9abe781bf6e3ab8b546c99bc03aaaf0d0fa867c06fe278fd77a484f3e8329d2e"
+    },
+    "sl": {
+      "path": "results\\sl_base.pt",
+      "sha256": "9abe781bf6e3ab8b546c99bc03aaaf0d0fa867c06fe278fd77a484f3e8329d2e"
+    },
+    "brl_fsp": {
+      "path": "brl\\model-pretrained-rl-with-fsp.pkl",
+      "sha256": "63bff43eeb685d8c6b402ad3116199a531cfb939a249d83f6107da675cea16a2"
+    }
+  },
+  "seat_assignments": {
+    "focal_first": {
+      "self_check_all_zero": true,
+      "overall": {
+        "mean_imp": 2.223,
+        "std_imp": 7.510352273333353,
+        "standard_error": 0.05310621021573817,
+        "ci_low": 2.1189118279771533,
+        "ci_high": 2.3270881720228465,
+        "wins": 10073,
+        "losses": 5290,
+        "ties": 4637
+      }
+    },
+    "focal_second": {
+      "self_check_all_zero": true,
+      "overall": {
+        "mean_imp": 0.589,
+        "std_imp": 6.148818536797937,
+        "standard_error": 0.04347871283655366,
+        "ci_low": 0.5037817228403548,
+        "ci_high": 0.6742182771596451,
+        "wins": 6740,
+        "losses": 5215,
+        "ties": 8045
+      }
+    }
+  },
+  "primary_balanced": {
+    "mean_imp": 1.406,
+    "std_imp": 4.981308028167257,
+    "standard_error": 0.03522316685896057,
+    "ci_low": 1.3369625929564373,
+    "ci_high": 1.4750374070435626,
+    "wins": 10984,
+    "losses": 6146,
+    "ties": 2870
+  }
+}

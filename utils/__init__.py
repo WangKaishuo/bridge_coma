@@ -1,5 +1,5 @@
 """
-Utilities for Bridge-COMA
+Utilities for MARL Dual Audience
 """
  
 from utils.scoring import (

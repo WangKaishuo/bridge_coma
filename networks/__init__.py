@@ -1,4 +1,4 @@
-"""Policy, value, and belief networks used by Bridge-COMA."""
+"""Policy, value, and belief networks used by MARL Dual Audience."""
  
 from networks.policy_net import (
     MLPPolicyNetwork,

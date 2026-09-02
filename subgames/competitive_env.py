@@ -441,8 +441,8 @@ class CompetitiveSubgameEnv:
             raise ValueError("Must provide opener_policy and overcaller_policy")
 
         dealer = dealer if dealer is not None else self.dealer
-        self.dealer = dealer  # P93 fix: policy closures read env.dealer for encode_obs_flat
-        self._vulnerability = vulnerability  # P122: policy closures read env._vulnerability
+        self.dealer = dealer  # Policy closures read the current dealer.
+        self._vulnerability = vulnerability  # Policy closures read vulnerability.
         opener_seats = {dealer, (dealer + 2) % NUM_PLAYERS}
 
         inner = BridgeBiddingEnv(self.max_history_len)

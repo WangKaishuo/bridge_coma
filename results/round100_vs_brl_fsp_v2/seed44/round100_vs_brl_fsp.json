@@ -1,0 +1,219 @@
+{
+  "schema_version": "round100-vs-brl-fsp-v2",
+  "deals": 20000,
+  "seed": 1611583527,
+  "sampling": "memmap_without_replacement",
+  "deal_indices_file": "deal_indices.npy",
+  "device": "cpu",
+  "deterministic_duplicate_self_check": {
+    "deals": 200,
+    "all_zero": true
+  },
+  "artifacts": {
+    "local": {
+      "TASK": {
+        "path": "results\\seed43_44_round120_actor_timeline_v1\\actor_only\\seed44\\a\\seed44_a_round100_actor_only.pt",
+        "sha256": "c6cfaf4db78d4a3c54ebf3992f2f689bf01f48632f04fe718ab39b57108a773b"
+      },
+      "TEAM": {
+        "path": "results\\seed43_44_round120_actor_timeline_v1\\actor_only\\seed44\\b\\seed44_b_round100_actor_only.pt",
+        "sha256": "0d71dbc13732673606c053b1fdb74a521b9b9a700fdebf7ba1aa23ec3fa926d7"
+      },
+      "DUAL": {
+        "path": "results\\seed43_44_round120_actor_timeline_v1\\actor_only\\seed44\\legacy_c\\seed44_legacy_c_round100_actor_only.pt",
+        "sha256": "4692ebb44537ba56a371d7950980ee8b511a2d0c0b19d7c801f0c8bb4ce4a96d"
+      },
+      "DAPS": {
+        "path": "results\\seed43_44_round120_actor_timeline_v1\\actor_only\\seed44\\strict_c\\seed44_strict_c_round100_actor_only.pt",
+        "sha256": "02de8948851e0e28c955350faaf44ba72bb750b5bfaffd6c05bbef3298082a0f"
+      }
+    },
+    "brl_fsp": {
+      "path": "brl\\model-pretrained-rl-with-fsp.pkl",
+      "sha256": "63bff43eeb685d8c6b402ad3116199a531cfb939a249d83f6107da675cea16a2"
+    }
+  },
+  "sign_convention": "positive IMP means the named local actor beats BRL-FSP",
+  "comparisons": {
+    "task_minus_brl_fsp": {
+      "local": "TASK",
+      "opponent": "BRL-FSP",
+      "orientation": "TASK minus BRL-FSP",
+      "overall": {
+        "mean_imp": -1.0955,
+        "std_imp": 6.559445942040633,
+        "standard_error": 0.04638228706443513,
+        "ci_low": -1.1864092826462929,
+        "ci_high": -1.004590717353707,
+        "wins": 5634,
+        "losses": 7581,
+        "ties": 6785
+      },
+      "competitive": {
+        "mean_imp": -1.0097724620770128,
+        "std_imp": 6.928185809151835,
+        "standard_error": 0.08367276529434797,
+        "ci_low": -1.1737710820539349,
+        "ci_high": -0.8457738421000908,
+        "wins": 2179,
+        "losses": 2697,
+        "ties": 1980
+      },
+      "non_competitive": {
+        "mean_imp": -0.7246662289341212,
+        "std_imp": 5.859595355583283,
+        "standard_error": 0.08668761350712051,
+        "ci_low": -0.8945739514080775,
+        "ci_high": -0.554758506460165,
+        "wins": 1067,
+        "losses": 1398,
+        "ties": 2104
+      },
+      "mixed": {
+        "mean_imp": -1.3616326530612244,
+        "std_imp": 6.598534317315649,
+        "standard_error": 0.07125747273935744,
+        "ci_low": -1.501297299630365,
+        "ci_high": -1.2219680064920837,
+        "wins": 2388,
+        "losses": 3486,
+        "ties": 2701
+      }
+    },
+    "team_minus_brl_fsp": {
+      "local": "TEAM",
+      "opponent": "BRL-FSP",
+      "orientation": "TEAM minus BRL-FSP",
+      "overall": {
+        "mean_imp": -1.035,
+        "std_imp": 6.560383139066389,
+        "standard_error": 0.04638891404815733,
+        "ci_low": -1.1259222715343884,
+        "ci_high": -0.9440777284656116,
+        "wins": 5751,
+        "losses": 7485,
+        "ties": 6764
+      },
+      "competitive": {
+        "mean_imp": -0.9861111111111112,
+        "std_imp": 6.886922494274592,
+        "standard_error": 0.08283680324911509,
+        "ci_low": -1.1484712454793766,
+        "ci_high": -0.8237509767428456,
+        "wins": 2168,
+        "losses": 2670,
+        "ties": 2074
+      },
+      "non_competitive": {
+        "mean_imp": -0.5423002784322125,
+        "std_imp": 5.923442160583597,
+        "standard_error": 0.08668864509636827,
+        "ci_low": -0.7122100228210944,
+        "ci_high": -0.37239053404333067,
+        "wins": 1183,
+        "losses": 1411,
+        "ties": 2075
+      },
+      "mixed": {
+        "mean_imp": -1.3483786673001543,
+        "std_imp": 6.604418391245736,
+        "standard_error": 0.07197875381600935,
+        "ci_low": -1.4894570247795327,
+        "ci_high": -1.207300309820776,
+        "wins": 2400,
+        "losses": 3404,
+        "ties": 2615
+      }
+    },
+    "dual_minus_brl_fsp": {
+      "local": "DUAL",
+      "opponent": "BRL-FSP",
+      "orientation": "DUAL minus BRL-FSP",
+      "overall": {
+        "mean_imp": -1.1388,
+        "std_imp": 6.600735795777035,
+        "standard_error": 0.04667425042014723,
+        "ci_low": -1.2302815308234887,
+        "ci_high": -1.0473184691765114,
+        "wins": 5716,
+        "losses": 7642,
+        "ties": 6642
+      },
+      "competitive": {
+        "mean_imp": -1.0678245246294356,
+        "std_imp": 7.000687463465108,
+        "standard_error": 0.08566136052559814,
+        "ci_low": -1.235720791259608,
+        "ci_high": -0.8999282579992632,
+        "wins": 2137,
+        "losses": 2655,
+        "ties": 1887
+      },
+      "non_competitive": {
+        "mean_imp": -0.6338507335743143,
+        "std_imp": 5.856491106656879,
+        "standard_error": 0.08539845207065788,
+        "ci_low": -0.8012316996328037,
+        "ci_high": -0.46646976751582486,
+        "wins": 1179,
+        "losses": 1436,
+        "ties": 2088
+      },
+      "mixed": {
+        "mean_imp": -1.469366442330007,
+        "std_imp": 6.646099676670548,
+        "standard_error": 0.07159185336741938,
+        "ci_low": -1.609686474930149,
+        "ci_high": -1.329046409729865,
+        "wins": 2400,
+        "losses": 3551,
+        "ties": 2667
+      }
+    },
+    "daps_minus_brl_fsp": {
+      "local": "DAPS",
+      "opponent": "BRL-FSP",
+      "orientation": "DAPS minus BRL-FSP",
+      "overall": {
+        "mean_imp": -1.0406,
+        "std_imp": 6.6193838423317475,
+        "standard_error": 0.04680611202189443,
+        "ci_low": -1.132339979562913,
+        "ci_high": -0.948860020437087,
+        "wins": 5737,
+        "losses": 7516,
+        "ties": 6747
+      },
+      "competitive": {
+        "mean_imp": -1.018724400234055,
+        "std_imp": 7.005981385110199,
+        "standard_error": 0.0847359986246605,
+        "ci_low": -1.1848069575383895,
+        "ci_high": -0.8526418429297205,
+        "wins": 2176,
+        "losses": 2716,
+        "ties": 1944
+      },
+      "non_competitive": {
+        "mean_imp": -0.602267864783911,
+        "std_imp": 5.8774053671591195,
+        "standard_error": 0.08596888443323848,
+        "ci_low": -0.7707668782730585,
+        "ci_high": -0.4337688512947636,
+        "wins": 1143,
+        "losses": 1373,
+        "ties": 2158
+      },
+      "mixed": {
+        "mean_imp": -1.2995288574793875,
+        "std_imp": 6.672057430008092,
+        "standard_error": 0.07241123102124772,
+        "ci_low": -1.441454870281033,
+        "ci_high": -1.157602844677742,
+        "wins": 2418,
+        "losses": 3427,
+        "ties": 2645
+      }
+    }
+  }
+}

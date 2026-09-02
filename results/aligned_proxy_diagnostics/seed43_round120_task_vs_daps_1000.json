@@ -1,0 +1,1728 @@
+{
+  "checkpoint_round": 120,
+  "deals": 1000,
+  "seed": 20260714,
+  "judge_checkpoint": "results\\sl_base_bca.pt",
+  "measurement": "Raw signed Judge loss reduction per actual call in duplicate B-vs-A cross-play; receiver observations match training.",
+  "b_vs_a_match_sanity_check": {
+    "count": 1000,
+    "mean": 0.006,
+    "std": 5.697756438145495,
+    "standard_error": 0.18017887897428056,
+    "ci_low": -0.34715060278958987,
+    "ci_high": 0.3591506027895899,
+    "wins": 229,
+    "losses": 222,
+    "ties": 549
+  },
+  "judge_information": {
+    "by_stratum": {
+      "overall": {
+        "A": {
+          "deals": 1000,
+          "calls": 10547,
+          "mean_calls_per_deal": 10.547,
+          "metrics": {
+            "partner_gain": {
+              "per_deal_total": {
+                "count": 1000,
+                "mean": 0.7801798170804978,
+                "std": 0.5953990820043755,
+                "standard_error": 0.01882817215907198,
+                "ci_low": 0.7432765996487167,
+                "ci_high": 0.8170830345122788
+              },
+              "mean_per_call": 0.07397172817677991,
+              "positive_call_fraction": 0.4320659903290035
+            },
+            "opponent_gain": {
+              "per_deal_total": {
+                "count": 1000,
+                "mean": 0.8139353204965591,
+                "std": 0.5474958081168528,
+                "standard_error": 0.017313337630437575,
+                "ci_low": 0.7800011787409015,
+                "ci_high": 0.8478694622522168
+              },
+              "mean_per_call": 0.0771722120504939,
+              "positive_call_fraction": 0.43263487247558546
+            },
+            "secrecy_difference": {
+              "per_deal_total": {
+                "count": 1000,
+                "mean": -0.0337555034160614,
+                "std": 0.4324487898018981,
+                "standard_error": 0.013675231471573937,
+                "ci_low": -0.06055895710034632,
+                "ci_high": -0.0069520497317764815
+              },
+              "mean_per_call": -0.0032004838737139853,
+              "positive_call_fraction": 0.2853892102019532
+            },
+            "beta_005_bonus": {
+              "per_deal_total": {
+                "count": 1000,
+                "mean": 0.7394830511842302,
+                "std": 0.576096743259834,
+                "standard_error": 0.018217778613063312,
+                "ci_low": 0.7037762051026261,
+                "ci_high": 0.7751898972658343
+              },
+              "mean_per_call": 0.07011311758644449,
+              "positive_call_fraction": 0.4308334123447426
+            }
+          },
+          "judge_quality": {
+            "partner_cross_entropy_before": {
+              "count": 10547,
+              "mean": 0.9771779471210272,
+              "std": 0.2930872337410521,
+              "standard_error": 0.0028538584525054445,
+              "ci_low": 0.9715843845541166,
+              "ci_high": 0.9827715096879379
+            },
+            "partner_cross_entropy_after": {
+              "count": 10547,
+              "mean": 0.9032062189498987,
+              "std": 0.2632449581707897,
+              "standard_error": 0.002563277285625158,
+              "ci_low": 0.8981821954700734,
+              "ci_high": 0.908230242429724
+            },
+            "partner_brier_before": {
+              "count": 10547,
+              "mean": 0.12418053710499939,
+              "std": 0.022541585895719692,
+              "standard_error": 0.00021949265623153792,
+              "ci_low": 0.12375033149878557,
+              "ci_high": 0.12461074271121321
+            },
+            "partner_brier_after": {
+              "count": 10547,
+              "mean": 0.11957904432370525,
+              "std": 0.02125415283958718,
+              "standard_error": 0.00020695662161010207,
+              "ci_low": 0.11917340934534945,
+              "ci_high": 0.11998467930206105
+            },
+            "opponent_cross_entropy_before": {
+              "count": 10547,
+              "mean": 0.9826334041221974,
+              "std": 0.28270964777244706,
+              "standard_error": 0.0027528094881576082,
+              "ci_low": 0.9772378975254085,
+              "ci_high": 0.9880289107189862
+            },
+            "opponent_cross_entropy_after": {
+              "count": 10547,
+              "mean": 0.9054611920547494,
+              "std": 0.24849267275102685,
+              "standard_error": 0.002419630856875689,
+              "ci_low": 0.900718715575273,
+              "ci_high": 0.9102036685342257
+            },
+            "opponent_brier_before": {
+              "count": 10547,
+              "mean": 0.12531134636135444,
+              "std": 0.023504081124782354,
+              "standard_error": 0.00022886469577722317,
+              "ci_low": 0.12486277155763108,
+              "ci_high": 0.12575992116507778
+            },
+            "opponent_brier_after": {
+              "count": 10547,
+              "mean": 0.12003817634164829,
+              "std": 0.02145446972115616,
+              "standard_error": 0.0002089071536013735,
+              "ci_low": 0.11962871832058959,
+              "ci_high": 0.12044763436270699
+            }
+          },
+          "partner_to_opponent_ratio": 0.9585280272694541
+        },
+        "B": {
+          "deals": 1000,
+          "calls": 10560,
+          "mean_calls_per_deal": 10.56,
+          "metrics": {
+            "partner_gain": {
+              "per_deal_total": {
+                "count": 1000,
+                "mean": 0.772884493470192,
+                "std": 0.5788762936706726,
+                "standard_error": 0.01830567571475838,
+                "ci_low": 0.7370053690692655,
+                "ci_high": 0.8087636178711184
+              },
+              "mean_per_call": 0.07318981945740455,
+              "positive_call_fraction": 0.42803030303030304
+            },
+            "opponent_gain": {
+              "per_deal_total": {
+                "count": 1000,
+                "mean": 0.7991077558100224,
+                "std": 0.535207086909287,
+                "standard_error": 0.016924734144970345,
+                "ci_low": 0.7659352768858805,
+                "ci_high": 0.8322802347341642
+              },
+              "mean_per_call": 0.07567308293655514,
+              "positive_call_fraction": 0.42556818181818185
+            },
+            "secrecy_difference": {
+              "per_deal_total": {
+                "count": 1000,
+                "mean": -0.026223262339830397,
+                "std": 0.4287096511154095,
+                "standard_error": 0.013556989524208394,
+                "ci_low": -0.05279496180727885,
+                "ci_high": 0.00034843712761805506
+              },
+              "mean_per_call": -0.002483263479150606,
+              "positive_call_fraction": 0.29015151515151516
+            },
+            "beta_005_bonus": {
+              "per_deal_total": {
+                "count": 1000,
+                "mean": 0.732929105818439,
+                "std": 0.5602912264533216,
+                "standard_error": 0.017717964286016817,
+                "ci_low": 0.698201895817846,
+                "ci_high": 0.7676563158190319
+              },
+              "mean_per_call": 0.06940616532371581,
+              "positive_call_fraction": 0.4262310606060606
+            }
+          },
+          "judge_quality": {
+            "partner_cross_entropy_before": {
+              "count": 10560,
+              "mean": 0.9761275962164456,
+              "std": 0.2943486351533966,
+              "standard_error": 0.0028643762710288075,
+              "ci_low": 0.9705134187252291,
+              "ci_high": 0.9817417737076621
+            },
+            "partner_cross_entropy_after": {
+              "count": 10560,
+              "mean": 0.9029377767646855,
+              "std": 0.26322240068728897,
+              "standard_error": 0.0025614795126839476,
+              "ci_low": 0.8979172769198249,
+              "ci_high": 0.907958276609546
+            },
+            "partner_brier_before": {
+              "count": 10560,
+              "mean": 0.12400592547474486,
+              "std": 0.022660113689928586,
+              "standard_error": 0.00022051093227736844,
+              "ci_low": 0.12357372404748121,
+              "ci_high": 0.1244381269020085
+            },
+            "partner_brier_after": {
+              "count": 10560,
+              "mean": 0.11944612518242194,
+              "std": 0.02138259215176264,
+              "standard_error": 0.00020807906766979602,
+              "ci_low": 0.11903829020978914,
+              "ci_high": 0.11985396015505474
+            },
+            "opponent_cross_entropy_before": {
+              "count": 10560,
+              "mean": 0.9793153132086224,
+              "std": 0.2753102098552468,
+              "standard_error": 0.002679108846114962,
+              "ci_low": 0.9740642598702371,
+              "ci_high": 0.9845663665470077
+            },
+            "opponent_cross_entropy_after": {
+              "count": 10560,
+              "mean": 0.9036422302551341,
+              "std": 0.23968972659901866,
+              "standard_error": 0.0023324774885462515,
+              "ci_low": 0.8990705743775834,
+              "ci_high": 0.9082138861326848
+            },
+            "opponent_brier_before": {
+              "count": 10560,
+              "mean": 0.12518223927878408,
+              "std": 0.02339929619165597,
+              "standard_error": 0.00022770409224158645,
+              "ci_low": 0.12473593925799056,
+              "ci_high": 0.1256285392995776
+            },
+            "opponent_brier_after": {
+              "count": 10560,
+              "mean": 0.12001647932426722,
+              "std": 0.021279182342021315,
+              "standard_error": 0.00020707276232355146,
+              "ci_low": 0.11961061671011305,
+              "ci_high": 0.12042234193842138
+            }
+          },
+          "partner_to_opponent_ratio": 0.9671843225783125
+        }
+      },
+      "competitive": {
+        "A": {
+          "deals": 401,
+          "calls": 4384,
+          "mean_calls_per_deal": 10.932668329177057,
+          "metrics": {
+            "partner_gain": {
+              "per_deal_total": {
+                "count": 401,
+                "mean": 1.038373712589616,
+                "std": 0.6249331817859913,
+                "standard_error": 0.031207673847556603,
+                "ci_low": 0.977206671848405,
+                "ci_high": 1.099540753330827
+              },
+              "mean_per_call": 0.09497898237874908
+            },
+            "opponent_gain": {
+              "per_deal_total": {
+                "count": 401,
+                "mean": 1.0362306589497592,
+                "std": 0.5452295483798026,
+                "standard_error": 0.02722746433348194,
+                "ci_low": 0.9828648288561346,
+                "ci_high": 1.0895964890433838
+              },
+              "mean_per_call": 0.09478295945229322
+            },
+            "secrecy_difference": {
+              "per_deal_total": {
+                "count": 401,
+                "mean": 0.002143053639856657,
+                "std": 0.4820186763913194,
+                "standard_error": 0.024070864021431656,
+                "ci_low": -0.045035839842149386,
+                "ci_high": 0.049321947121862705
+              },
+              "mean_per_call": 0.00019602292645586668
+            },
+            "beta_005_bonus": {
+              "per_deal_total": {
+                "count": 401,
+                "mean": 0.9865621800023187,
+                "std": 0.6070510142693119,
+                "standard_error": 0.030314681015982153,
+                "ci_low": 0.9271454052109936,
+                "ci_high": 1.0459789547936438
+              },
+              "mean_per_call": 0.09023983443908071
+            }
+          },
+          "judge_quality": {
+            "partner_cross_entropy_before": {
+              "count": 4384,
+              "mean": 1.0001523291800904,
+              "std": 0.3215471657881059,
+              "standard_error": 0.0048563436725073995,
+              "ci_low": 0.9906338955819759,
+              "ci_high": 1.0096707627782049
+            },
+            "partner_cross_entropy_after": {
+              "count": 4384,
+              "mean": 0.9051733468217353,
+              "std": 0.27096784593505124,
+              "standard_error": 0.004092441557786301,
+              "ci_low": 0.8971521613684742,
+              "ci_high": 0.9131945322749965
+            },
+            "partner_brier_before": {
+              "count": 4384,
+              "mean": 0.1250969497104563,
+              "std": 0.023930563743649356,
+              "standard_error": 0.00036142455658461715,
+              "ci_low": 0.12438855757955045,
+              "ci_high": 0.12580534184136213
+            },
+            "partner_brier_after": {
+              "count": 4384,
+              "mean": 0.11995105089935862,
+              "std": 0.022656832867944836,
+              "standard_error": 0.00034218733251036975,
+              "ci_low": 0.1192803637276383,
+              "ci_high": 0.12062173807107894
+            },
+            "opponent_cross_entropy_before": {
+              "count": 4384,
+              "mean": 0.9945559000909111,
+              "std": 0.29760368693088746,
+              "standard_error": 0.004494724058286659,
+              "ci_low": 0.9857462409366693,
+              "ci_high": 1.003365559245153
+            },
+            "opponent_cross_entropy_after": {
+              "count": 4384,
+              "mean": 0.899772940618224,
+              "std": 0.24732096095722753,
+              "standard_error": 0.0037353014164477815,
+              "ci_low": 0.8924517498419864,
+              "ci_high": 0.9070941313944616
+            },
+            "opponent_brier_before": {
+              "count": 4384,
+              "mean": 0.12490029823558446,
+              "std": 0.023718763545939558,
+              "standard_error": 0.0003582257271144124,
+              "ci_low": 0.12419817581044021,
+              "ci_high": 0.12560242066072871
+            },
+            "opponent_brier_after": {
+              "count": 4384,
+              "mean": 0.11905522591155702,
+              "std": 0.02197715679811623,
+              "standard_error": 0.00033192214925808767,
+              "ci_low": 0.11840465849901118,
+              "ci_high": 0.11970579332410287
+            }
+          }
+        },
+        "B": {
+          "deals": 401,
+          "calls": 4383,
+          "mean_calls_per_deal": 10.930174563591022,
+          "metrics": {
+            "partner_gain": {
+              "per_deal_total": {
+                "count": 401,
+                "mean": 1.0404253293599868,
+                "std": 0.6065500358572615,
+                "standard_error": 0.030289663347944022,
+                "ci_low": 0.9810575891980164,
+                "ci_high": 1.099793069521957
+              },
+              "mean_per_call": 0.0951883543402589
+            },
+            "opponent_gain": {
+              "per_deal_total": {
+                "count": 401,
+                "mean": 1.038806951997286,
+                "std": 0.5295507964668907,
+                "standard_error": 0.02644450482629663,
+                "ci_low": 0.9869757225377446,
+                "ci_high": 1.0906381814568273
+              },
+              "mean_per_call": 0.09504028924273596
+            },
+            "secrecy_difference": {
+              "per_deal_total": {
+                "count": 401,
+                "mean": 0.0016183773627007692,
+                "std": 0.4938020764448158,
+                "standard_error": 0.024659298939599797,
+                "ci_low": -0.04671384855891483,
+                "ci_high": 0.04995060328431637
+              },
+              "mean_per_call": 0.00014806509752293142
+            },
+            "beta_005_bonus": {
+              "per_deal_total": {
+                "count": 401,
+                "mean": 0.9884849825410632,
+                "std": 0.590236969746004,
+                "standard_error": 0.029475027701299655,
+                "ci_low": 0.9307139282465159,
+                "ci_high": 1.0462560368356106
+              },
+              "mean_per_call": 0.09043633994957023
+            }
+          },
+          "judge_quality": {
+            "partner_cross_entropy_before": {
+              "count": 4383,
+              "mean": 0.9994864497803783,
+              "std": 0.3220841765160654,
+              "standard_error": 0.004865009064890576,
+              "ci_low": 0.9899510320131927,
+              "ci_high": 1.0090218675475637
+            },
+            "partner_cross_entropy_after": {
+              "count": 4383,
+              "mean": 0.9042980954673174,
+              "std": 0.2677172729907092,
+              "standard_error": 0.004043809211666193,
+              "ci_low": 0.8963722294124516,
+              "ci_high": 0.9122239615221832
+            },
+            "partner_brier_before": {
+              "count": 4383,
+              "mean": 0.12485614539420063,
+              "std": 0.023979634219265907,
+              "standard_error": 0.00036220698300486024,
+              "ci_low": 0.12414621970751111,
+              "ci_high": 0.12556607108089016
+            },
+            "partner_brier_after": {
+              "count": 4383,
+              "mean": 0.11963618300411491,
+              "std": 0.02260917186135934,
+              "standard_error": 0.00034150645724036584,
+              "ci_low": 0.1189668303479238,
+              "ci_high": 0.12030553566030602
+            },
+            "opponent_cross_entropy_before": {
+              "count": 4383,
+              "mean": 0.9881806995548833,
+              "std": 0.29086196558446775,
+              "standard_error": 0.004393404589156353,
+              "ci_low": 0.9795696265601368,
+              "ci_high": 0.9967917725496298
+            },
+            "opponent_cross_entropy_after": {
+              "count": 4383,
+              "mean": 0.8931404103053479,
+              "std": 0.2386148819190158,
+              "standard_error": 0.0036042241382693418,
+              "ci_low": 0.8860761309943399,
+              "ci_high": 0.9002046896163558
+            },
+            "opponent_brier_before": {
+              "count": 4383,
+              "mean": 0.12452206128883955,
+              "std": 0.023709983072097245,
+              "standard_error": 0.0003581339630585722,
+              "ci_low": 0.12382011872124475,
+              "ci_high": 0.12522400385643434
+            },
+            "opponent_brier_after": {
+              "count": 4383,
+              "mean": 0.11861585144284188,
+              "std": 0.021797268056680207,
+              "standard_error": 0.00032924283282916754,
+              "ci_low": 0.11797053549049671,
+              "ci_high": 0.11926116739518705
+            }
+          }
+        }
+      },
+      "non_competitive": {
+        "A": {
+          "deals": 423,
+          "calls": 4402,
+          "mean_calls_per_deal": 10.40661938534279,
+          "metrics": {
+            "partner_gain": {
+              "per_deal_total": {
+                "count": 423,
+                "mean": 0.5738749499862076,
+                "std": 0.46162317374527384,
+                "standard_error": 0.022444886771195157,
+                "ci_low": 0.529882971914665,
+                "ci_high": 0.6178669280577501
+              },
+              "mean_per_call": 0.055145184880546524
+            },
+            "opponent_gain": {
+              "per_deal_total": {
+                "count": 423,
+                "mean": 0.6590764971348693,
+                "std": 0.4936743821933683,
+                "standard_error": 0.024003269853788003,
+                "ci_low": 0.6120300882214448,
+                "ci_high": 0.7061229060482938
+              },
+              "mean_per_call": 0.06333243032440929
+            },
+            "secrecy_difference": {
+              "per_deal_total": {
+                "count": 423,
+                "mean": -0.0852015471486617,
+                "std": 0.3726946522517341,
+                "standard_error": 0.01812103409400332,
+                "ci_low": -0.1207187739729082,
+                "ci_high": -0.049684320324415186
+              },
+              "mean_per_call": -0.008187245443862765
+            },
+            "beta_005_bonus": {
+              "per_deal_total": {
+                "count": 423,
+                "mean": 0.5409211244131865,
+                "std": 0.44475812149602606,
+                "standard_error": 0.021624879870212464,
+                "ci_low": 0.49853635986757006,
+                "ci_high": 0.583305888958803
+              },
+              "mean_per_call": 0.05197856329549702
+            }
+          },
+          "judge_quality": {
+            "partner_cross_entropy_before": {
+              "count": 4402,
+              "mean": 0.9504568164712025,
+              "std": 0.26701539316178313,
+              "standard_error": 0.004024493956955743,
+              "ci_low": 0.9425688083155692,
+              "ci_high": 0.9583448246268358
+            },
+            "partner_cross_entropy_after": {
+              "count": 4402,
+              "mean": 0.895311631590656,
+              "std": 0.25784831672734937,
+              "standard_error": 0.0038863264780082765,
+              "ci_low": 0.8876944316937597,
+              "ci_high": 0.9029288314875522
+            },
+            "partner_brier_before": {
+              "count": 4402,
+              "mean": 0.12266307937887679,
+              "std": 0.021627351653754522,
+              "standard_error": 0.0003259705180470825,
+              "ci_low": 0.1220241771635045,
+              "ci_high": 0.12330198159424907
+            },
+            "partner_brier_after": {
+              "count": 4402,
+              "mean": 0.11842600426474575,
+              "std": 0.01998885777641105,
+              "standard_error": 0.0003012749054466417,
+              "ci_low": 0.11783550545007034,
+              "ci_high": 0.11901650307942117
+            },
+            "opponent_cross_entropy_before": {
+              "count": 4402,
+              "mean": 0.9708127528090522,
+              "std": 0.27173754753394125,
+              "standard_error": 0.004095666938818432,
+              "ci_low": 0.962785245608968,
+              "ci_high": 0.9788402600091364
+            },
+            "opponent_cross_entropy_after": {
+              "count": 4402,
+              "mean": 0.9074803224778728,
+              "std": 0.24975447369161646,
+              "standard_error": 0.003764334925385993,
+              "ci_low": 0.9001022260241163,
+              "ci_high": 0.9148584189316293
+            },
+            "opponent_brier_before": {
+              "count": 4402,
+              "mean": 0.12542533908954998,
+              "std": 0.0238532229619616,
+              "standard_error": 0.00035951916677016553,
+              "ci_low": 0.12472068152268045,
+              "ci_high": 0.1261299966564195
+            },
+            "opponent_brier_after": {
+              "count": 4402,
+              "mean": 0.12047812380218224,
+              "std": 0.02106355154596949,
+              "standard_error": 0.0003174728426889541,
+              "ci_low": 0.1198558770305119,
+              "ci_high": 0.12110037057385259
+            }
+          }
+        },
+        "B": {
+          "deals": 423,
+          "calls": 4406,
+          "mean_calls_per_deal": 10.416075650118204,
+          "metrics": {
+            "partner_gain": {
+              "per_deal_total": {
+                "count": 423,
+                "mean": 0.5811722366663299,
+                "std": 0.44147327980640233,
+                "standard_error": 0.021465165401836166,
+                "ci_low": 0.539100512478731,
+                "ci_high": 0.6232439608539287
+              },
+              "mean_per_call": 0.055795700433467446
+            },
+            "opponent_gain": {
+              "per_deal_total": {
+                "count": 423,
+                "mean": 0.6645941744882164,
+                "std": 0.4720170206109812,
+                "standard_error": 0.02295025289942743,
+                "ci_low": 0.6196116788053387,
+                "ci_high": 0.7095766701710942
+              },
+              "mean_per_call": 0.06380466087347153
+            },
+            "secrecy_difference": {
+              "per_deal_total": {
+                "count": 423,
+                "mean": -0.0834219378218865,
+                "std": 0.3635366822159073,
+                "standard_error": 0.017675758353532037,
+                "ci_low": -0.1180664241948093,
+                "ci_high": -0.04877745144896371
+              },
+              "mean_per_call": -0.008008960440004083
+            },
+            "beta_005_bonus": {
+              "per_deal_total": {
+                "count": 423,
+                "mean": 0.5479425271754494,
+                "std": 0.425650874582873,
+                "standard_error": 0.02069585373403405,
+                "ci_low": 0.5073786538567427,
+                "ci_high": 0.5885064004941561
+              },
+              "mean_per_call": 0.052605467316208604
+            }
+          },
+          "judge_quality": {
+            "partner_cross_entropy_before": {
+              "count": 4406,
+              "mean": 0.9470301795373761,
+              "std": 0.26260676542725975,
+              "standard_error": 0.003956249423127341,
+              "ci_low": 0.9392759306680465,
+              "ci_high": 0.9547844284067057
+            },
+            "partner_cross_entropy_after": {
+              "count": 4406,
+              "mean": 0.8912344791039087,
+              "std": 0.2513239401968637,
+              "standard_error": 0.0037862702882167244,
+              "ci_low": 0.883813389339004,
+              "ci_high": 0.8986555688688135
+            },
+            "partner_brier_before": {
+              "count": 4406,
+              "mean": 0.1224729005345433,
+              "std": 0.021720031324175874,
+              "standard_error": 0.0003272187647442029,
+              "ci_low": 0.12183155175564465,
+              "ci_high": 0.12311424931344193
+            },
+            "partner_brier_after": {
+              "count": 4406,
+              "mean": 0.1183252671722507,
+              "std": 0.020121597547173214,
+              "standard_error": 0.00030313788206821684,
+              "ci_low": 0.117731116923397,
+              "ci_high": 0.1189194174211044
+            },
+            "opponent_cross_entropy_before": {
+              "count": 4406,
+              "mean": 0.9603607360268527,
+              "std": 0.2569300493373485,
+              "standard_error": 0.0038707279982720852,
+              "ci_low": 0.9527741091502394,
+              "ci_high": 0.967947362903466
+            },
+            "opponent_cross_entropy_after": {
+              "count": 4406,
+              "mean": 0.8965560751466171,
+              "std": 0.22705590827998112,
+              "standard_error": 0.0034206651328605995,
+              "ci_low": 0.8898515714862103,
+              "ci_high": 0.9032605788070238
+            },
+            "opponent_brier_before": {
+              "count": 4406,
+              "mean": 0.12498736526281033,
+              "std": 0.023571552770404566,
+              "standard_error": 0.0003551124888134678,
+              "ci_low": 0.12429134478473594,
+              "ci_high": 0.12568338574088472
+            },
+            "opponent_brier_after": {
+              "count": 4406,
+              "mean": 0.1201058049498974,
+              "std": 0.020623941015387396,
+              "standard_error": 0.00031070583658416646,
+              "ci_low": 0.11949682151019243,
+              "ci_high": 0.12071478838960235
+            }
+          }
+        }
+      },
+      "mixed": {
+        "A": {
+          "deals": 176,
+          "calls": 1761,
+          "mean_calls_per_deal": 10.005681818181818,
+          "metrics": {
+            "partner_gain": {
+              "per_deal_total": {
+                "count": 176,
+                "mean": 0.6877434914084998,
+                "std": 0.5940791497108446,
+                "standard_error": 0.04478040080373283,
+                "ci_low": 0.5999739058331834,
+                "ci_high": 0.7755130769838161
+              },
+              "mean_per_call": 0.06873529499596591
+            },
+            "opponent_gain": {
+              "per_deal_total": {
+                "count": 176,
+                "mean": 0.6796447043730454,
+                "std": 0.50461174504618,
+                "standard_error": 0.03803654143465135,
+                "ci_low": 0.6050930831611288,
+                "ci_high": 0.754196325584962
+              },
+              "mean_per_call": 0.06792587618946962
+            },
+            "secrecy_difference": {
+              "per_deal_total": {
+                "count": 176,
+                "mean": 0.008098787035454403,
+                "std": 0.43639533115902907,
+                "standard_error": 0.03289453576630432,
+                "ci_low": -0.056374503066502074,
+                "ci_high": 0.07257207713741087
+              },
+              "mean_per_call": 0.0008094188064962947
+            },
+            "beta_005_bonus": {
+              "per_deal_total": {
+                "count": 176,
+                "mean": 0.6537612578211504,
+                "std": 0.5768106379224864,
+                "standard_error": 0.043478737751691615,
+                "ci_low": 0.5685429318278348,
+                "ci_high": 0.7389795838144659
+              },
+              "mean_per_call": 0.06533900134953007
+            }
+          },
+          "judge_quality": {
+            "partner_cross_entropy_before": {
+              "count": 1761,
+              "mean": 0.9867785866290314,
+              "std": 0.2752422410508023,
+              "standard_error": 0.006558966417423413,
+              "ci_low": 0.9739230124508815,
+              "ci_high": 0.9996341608071813
+            },
+            "partner_cross_entropy_after": {
+              "count": 1761,
+              "mean": 0.918043291616142,
+              "std": 0.25641477921867495,
+              "standard_error": 0.006110311845324315,
+              "ci_low": 0.9060670803993063,
+              "ci_high": 0.9300195028329776
+            },
+            "partner_brier_before": {
+              "count": 1761,
+              "mean": 0.12569234633161425,
+              "std": 0.020947285803993177,
+              "standard_error": 0.0004991695446165274,
+              "ci_low": 0.12471397402416586,
+              "ci_high": 0.12667071863906265
+            },
+            "partner_brier_after": {
+              "count": 1761,
+              "mean": 0.12153520872567879,
+              "std": 0.020539157526503423,
+              "standard_error": 0.0004894439310775718,
+              "ci_low": 0.12057589862076674,
+              "ci_high": 0.12249451883059083
+            },
+            "opponent_cross_entropy_before": {
+              "count": 1761,
+              "mean": 0.9825006867761574,
+              "std": 0.2701842775078982,
+              "standard_error": 0.0064384361787078485,
+              "ci_low": 0.9698813518658901,
+              "ci_high": 0.9951200216864248
+            },
+            "opponent_cross_entropy_after": {
+              "count": 1761,
+              "mean": 0.9145748105528407,
+              "std": 0.24803137922365864,
+              "standard_error": 0.0059105371347958156,
+              "ci_low": 0.9029901577686409,
+              "ci_high": 0.9261594633370406
+            },
+            "opponent_brier_before": {
+              "count": 1761,
+              "mean": 0.12604969899841223,
+              "std": 0.02203357586661176,
+              "standard_error": 0.0005250556150579498,
+              "ci_low": 0.12502058999289864,
+              "ci_high": 0.12707880800392582
+            },
+            "opponent_brier_after": {
+              "count": 1761,
+              "mean": 0.12138548239744028,
+              "std": 0.021003303971306963,
+              "standard_error": 0.0005005044461082969,
+              "ci_low": 0.12040449368306802,
+              "ci_high": 0.12236647111181254
+            }
+          }
+        },
+        "B": {
+          "deals": 176,
+          "calls": 1771,
+          "mean_calls_per_deal": 10.0625,
+          "metrics": {
+            "partner_gain": {
+              "per_deal_total": {
+                "count": 176,
+                "mean": 0.6240800016305663,
+                "std": 0.571751891081285,
+                "standard_error": 0.043097420361199325,
+                "ci_low": 0.5396090577226156,
+                "ci_high": 0.708550945538517
+              },
+              "mean_per_call": 0.06202037283285131
+            },
+            "opponent_gain": {
+              "per_deal_total": {
+                "count": 176,
+                "mean": 0.5762660923329267,
+                "std": 0.48128158581131086,
+                "standard_error": 0.03627796451462167,
+                "ci_low": 0.5051612818842682,
+                "ci_high": 0.6473709027815852
+              },
+              "mean_per_call": 0.05726867998339644
+            },
+            "secrecy_difference": {
+              "per_deal_total": {
+                "count": 176,
+                "mean": 0.04781390929763967,
+                "std": 0.3974303614062267,
+                "standard_error": 0.029957440660904486,
+                "ci_low": -0.010902674397733118,
+                "ci_high": 0.10653049299301245
+              },
+              "mean_per_call": 0.0047516928494548746
+            },
+            "beta_005_bonus": {
+              "per_deal_total": {
+                "count": 176,
+                "mean": 0.5952666978650996,
+                "std": 0.5544819541994624,
+                "standard_error": 0.04179564988869647,
+                "ci_low": 0.5133472240832545,
+                "ci_high": 0.6771861716469446
+              },
+              "mean_per_call": 0.059156938918270764
+            }
+          },
+          "judge_quality": {
+            "partner_cross_entropy_before": {
+              "count": 1771,
+              "mean": 0.9907076993882488,
+              "std": 0.2910970256269844,
+              "standard_error": 0.006917170606364941,
+              "ci_low": 0.9771500449997734,
+              "ci_high": 1.004265353776724
+            },
+            "partner_cross_entropy_after": {
+              "count": 1771,
+              "mean": 0.9286873265217416,
+              "std": 0.2787179299898566,
+              "standard_error": 0.006623013301630931,
+              "ci_low": 0.915706220450545,
+              "ci_high": 0.9416684325929382
+            },
+            "partner_brier_before": {
+              "count": 1771,
+              "mean": 0.12571569056766038,
+              "std": 0.021329947841087025,
+              "standard_error": 0.0005068512394583101,
+              "ci_low": 0.12472226213832209,
+              "ci_high": 0.12670911899699866
+            },
+            "partner_brier_after": {
+              "count": 1771,
+              "mean": 0.12176429399119333,
+              "std": 0.021113989515683673,
+              "standard_error": 0.0005017195464172618,
+              "ci_low": 0.1207809236802155,
+              "ci_high": 0.12274766430217117
+            },
+            "opponent_cross_entropy_before": {
+              "count": 1771,
+              "mean": 1.004530942066452,
+              "std": 0.276954519521609,
+              "standard_error": 0.006581110396468481,
+              "ci_low": 0.9916319656893738,
+              "ci_high": 1.0174299184435303
+            },
+            "opponent_cross_entropy_after": {
+              "count": 1771,
+              "mean": 0.9472622620157439,
+              "std": 0.26676260597333584,
+              "standard_error": 0.006338925837327481,
+              "ci_low": 0.934837967374582,
+              "ci_high": 0.9596865566569058
+            },
+            "opponent_brier_before": {
+              "count": 1771,
+              "mean": 0.1273009151931303,
+              "std": 0.022047889862809252,
+              "standard_error": 0.00052391128134309,
+              "ci_low": 0.12627404908169784,
+              "ci_high": 0.12832778130456277
+            },
+            "opponent_brier_after": {
+              "count": 1771,
+              "mean": 0.12326062573745789,
+              "std": 0.021236464909666002,
+              "standard_error": 0.0005046298585148616,
+              "ci_low": 0.12227155121476875,
+              "ci_high": 0.12424970026014702
+            }
+          }
+        }
+      }
+    },
+    "paired_b_minus_a": {
+      "overall": {
+        "partner_gain": {
+          "count": 1000,
+          "mean": -0.007295323610305786,
+          "std": 0.4777783141601966,
+          "standard_error": 0.015108676893816994,
+          "ci_low": -0.03690833032218709,
+          "ci_high": 0.022317683101575524
+        },
+        "opponent_gain": {
+          "count": 1000,
+          "mean": -0.014827564686536789,
+          "std": 0.4627982846908964,
+          "standard_error": 0.014634966768422674,
+          "ci_low": -0.04351209955264523,
+          "ci_high": 0.01385697017957165
+        },
+        "secrecy_difference": {
+          "count": 1000,
+          "mean": 0.007532241076231003,
+          "std": 0.3519310798520459,
+          "standard_error": 0.01112903791735059,
+          "ci_low": -0.014280673241776152,
+          "ci_high": 0.029345155394238157
+        },
+        "beta_005_bonus": {
+          "count": 1000,
+          "mean": -0.006553945365791151,
+          "std": 0.4613866373650728,
+          "standard_error": 0.01459032656039779,
+          "ci_low": -0.03515098542417082,
+          "ci_high": 0.022043094692588514
+        }
+      },
+      "competitive": {
+        "partner_gain": {
+          "count": 401,
+          "mean": 0.00205161677037094,
+          "std": 0.4377483877414291,
+          "standard_error": 0.021860111304837896,
+          "ci_low": -0.04079420138711134,
+          "ci_high": 0.04489743492785322
+        },
+        "opponent_gain": {
+          "count": 401,
+          "mean": 0.002576293047526828,
+          "std": 0.4028375829649569,
+          "standard_error": 0.020116748908707426,
+          "ci_low": -0.03685253481353972,
+          "ci_high": 0.04200512090859338
+        },
+        "secrecy_difference": {
+          "count": 401,
+          "mean": -0.000524676277155888,
+          "std": 0.3570837935082054,
+          "standard_error": 0.017831913697084673,
+          "ci_low": -0.035475227123441845,
+          "ci_high": 0.034425874569130065
+        },
+        "beta_005_bonus": {
+          "count": 401,
+          "mean": 0.0019228025387445385,
+          "std": 0.42509963613522983,
+          "standard_error": 0.021228462792309076,
+          "ci_low": -0.039684984534181254,
+          "ci_high": 0.04353058961167033
+        }
+      },
+      "non_competitive": {
+        "partner_gain": {
+          "count": 423,
+          "mean": 0.007297286680122358,
+          "std": 0.4191163241803575,
+          "standard_error": 0.020378133021065555,
+          "ci_low": -0.032643854041166126,
+          "ci_high": 0.04723842740141085
+        },
+        "opponent_gain": {
+          "count": 423,
+          "mean": 0.005517677353347165,
+          "std": 0.41953822381027006,
+          "standard_error": 0.020398646483042276,
+          "ci_low": -0.0344636697534157,
+          "ci_high": 0.045499024460110025
+        },
+        "secrecy_difference": {
+          "count": 423,
+          "mean": 0.0017796093267751923,
+          "std": 0.2806635422899733,
+          "standard_error": 0.013646328403298642,
+          "ci_low": -0.024967194343690147,
+          "ci_high": 0.02852641299724053
+        },
+        "beta_005_bonus": {
+          "count": 423,
+          "mean": 0.007021402762262932,
+          "std": 0.4030553104297219,
+          "standard_error": 0.019597219809670878,
+          "ci_low": -0.031389148064691993,
+          "ci_high": 0.04543195358921785
+        }
+      },
+      "mixed": {
+        "partner_gain": {
+          "count": 176,
+          "mean": -0.06366348977793347,
+          "std": 0.6615228094071224,
+          "standard_error": 0.049864157933300284,
+          "ci_low": -0.161397239327202,
+          "ci_high": 0.034070259771335085
+        },
+        "opponent_gain": {
+          "count": 176,
+          "mean": -0.10337861204011874,
+          "std": 0.6463214768399517,
+          "standard_error": 0.04871831437787494,
+          "ci_low": -0.1988665082207536,
+          "ci_high": -0.007890715859483866
+        },
+        "secrecy_difference": {
+          "count": 176,
+          "mean": 0.03971512226218527,
+          "std": 0.4736724760376622,
+          "standard_error": 0.035704406284898516,
+          "ci_low": -0.030265514056215824,
+          "ci_high": 0.10969575858058636
+        },
+        "beta_005_bonus": {
+          "count": 176,
+          "mean": -0.05849455995605075,
+          "std": 0.638050033080718,
+          "standard_error": 0.048094830845513456,
+          "ci_low": -0.15276042841325713,
+          "ci_high": 0.035771308501155626
+        }
+      }
+    }
+  },
+  "judge_calibration": {
+    "A": {
+      "partner_before": {
+        "ece_10_bin": 0.012881750806044565,
+        "component_predictions": 506256,
+        "bins": [
+          {
+            "bin_low": 0.0,
+            "bin_high": 0.1,
+            "count": 250377,
+            "mean_confidence": 0.01559938913103512,
+            "empirical_frequency": 0.02511013391805158
+          },
+          {
+            "bin_low": 0.1,
+            "bin_high": 0.2,
+            "count": 51564,
+            "mean_confidence": 0.15039038195739096,
+            "empirical_frequency": 0.16689938716934294
+          },
+          {
+            "bin_low": 0.2,
+            "bin_high": 0.30000000000000004,
+            "count": 73027,
+            "mean_confidence": 0.2549621611203058,
+            "empirical_frequency": 0.26592903994413025
+          },
+          {
+            "bin_low": 0.30000000000000004,
+            "bin_high": 0.4,
+            "count": 88215,
+            "mean_confidence": 0.34307156305548786,
+            "empirical_frequency": 0.3362353341268492
+          },
+          {
+            "bin_low": 0.4,
+            "bin_high": 0.5,
+            "count": 25708,
+            "mean_confidence": 0.44082269758004616,
+            "empirical_frequency": 0.4039598568538976
+          },
+          {
+            "bin_low": 0.5,
+            "bin_high": 0.6000000000000001,
+            "count": 9737,
+            "mean_confidence": 0.54377399811182,
+            "empirical_frequency": 0.5031323816370545
+          },
+          {
+            "bin_low": 0.6000000000000001,
+            "bin_high": 0.7000000000000001,
+            "count": 4273,
+            "mean_confidence": 0.6430340343717945,
+            "empirical_frequency": 0.5909197285279663
+          },
+          {
+            "bin_low": 0.7000000000000001,
+            "bin_high": 0.8,
+            "count": 1942,
+            "mean_confidence": 0.741513439543338,
+            "empirical_frequency": 0.6585993820803295
+          },
+          {
+            "bin_low": 0.8,
+            "bin_high": 0.9,
+            "count": 871,
+            "mean_confidence": 0.8448040363572358,
+            "empirical_frequency": 0.7508610792192881
+          },
+          {
+            "bin_low": 0.9,
+            "bin_high": 1.0,
+            "count": 542,
+            "mean_confidence": 0.9447604720222994,
+            "empirical_frequency": 0.8044280442804428
+          }
+        ]
+      },
+      "partner_after": {
+        "ece_10_bin": 0.008662004645393209,
+        "component_predictions": 506256,
+        "bins": [
+          {
+            "bin_low": 0.0,
+            "bin_high": 0.1,
+            "count": 254883,
+            "mean_confidence": 0.013930595783338242,
+            "empirical_frequency": 0.019091112392744906
+          },
+          {
+            "bin_low": 0.1,
+            "bin_high": 0.2,
+            "count": 48145,
+            "mean_confidence": 0.15016815375719675,
+            "empirical_frequency": 0.16026586353723127
+          },
+          {
+            "bin_low": 0.2,
+            "bin_high": 0.30000000000000004,
+            "count": 66706,
+            "mean_confidence": 0.25497883139112537,
+            "empirical_frequency": 0.2553143645249303
+          },
+          {
+            "bin_low": 0.30000000000000004,
+            "bin_high": 0.4,
+            "count": 80506,
+            "mean_confidence": 0.3438010489938718,
+            "empirical_frequency": 0.3331428713387822
+          },
+          {
+            "bin_low": 0.4,
+            "bin_high": 0.5,
+            "count": 30442,
+            "mean_confidence": 0.44241210826220506,
+            "empirical_frequency": 0.41741672689048026
+          },
+          {
+            "bin_low": 0.5,
+            "bin_high": 0.6000000000000001,
+            "count": 13624,
+            "mean_confidence": 0.5440628164990887,
+            "empirical_frequency": 0.5182031708749266
+          },
+          {
+            "bin_low": 0.6000000000000001,
+            "bin_high": 0.7000000000000001,
+            "count": 6563,
+            "mean_confidence": 0.6444166197421509,
+            "empirical_frequency": 0.6163339936004876
+          },
+          {
+            "bin_low": 0.7000000000000001,
+            "bin_high": 0.8,
+            "count": 3132,
+            "mean_confidence": 0.7431843204859117,
+            "empirical_frequency": 0.6810344827586207
+          },
+          {
+            "bin_low": 0.8,
+            "bin_high": 0.9,
+            "count": 1450,
+            "mean_confidence": 0.8440304473761855,
+            "empirical_frequency": 0.7662068965517241
+          },
+          {
+            "bin_low": 0.9,
+            "bin_high": 1.0,
+            "count": 805,
+            "mean_confidence": 0.9456588576299063,
+            "empirical_frequency": 0.8236024844720496
+          }
+        ]
+      },
+      "opponent_before": {
+        "ece_10_bin": 0.013884393307210176,
+        "component_predictions": 506256,
+        "bins": [
+          {
+            "bin_low": 0.0,
+            "bin_high": 0.1,
+            "count": 248746,
+            "mean_confidence": 0.016240851363077173,
+            "empirical_frequency": 0.025331060599969448
+          },
+          {
+            "bin_low": 0.1,
+            "bin_high": 0.2,
+            "count": 57862,
+            "mean_confidence": 0.15126279151371472,
+            "empirical_frequency": 0.17858006982129895
+          },
+          {
+            "bin_low": 0.2,
+            "bin_high": 0.30000000000000004,
+            "count": 79003,
+            "mean_confidence": 0.2535101870943465,
+            "empirical_frequency": 0.2731794995126767
+          },
+          {
+            "bin_low": 0.30000000000000004,
+            "bin_high": 0.4,
+            "count": 83390,
+            "mean_confidence": 0.342524852509235,
+            "empirical_frequency": 0.34023264180357354
+          },
+          {
+            "bin_low": 0.4,
+            "bin_high": 0.5,
+            "count": 23021,
+            "mean_confidence": 0.4401980553075278,
+            "empirical_frequency": 0.4103210112505973
+          },
+          {
+            "bin_low": 0.5,
+            "bin_high": 0.6000000000000001,
+            "count": 7917,
+            "mean_confidence": 0.542666791770379,
+            "empirical_frequency": 0.5063786787924719
+          },
+          {
+            "bin_low": 0.6000000000000001,
+            "bin_high": 0.7000000000000001,
+            "count": 3372,
+            "mean_confidence": 0.6423057515001807,
+            "empirical_frequency": 0.5963819691577699
+          },
+          {
+            "bin_low": 0.7000000000000001,
+            "bin_high": 0.8,
+            "count": 1449,
+            "mean_confidence": 0.7430444779767917,
+            "empirical_frequency": 0.6639061421670117
+          },
+          {
+            "bin_low": 0.8,
+            "bin_high": 0.9,
+            "count": 850,
+            "mean_confidence": 0.8480952960603377,
+            "empirical_frequency": 0.7247058823529412
+          },
+          {
+            "bin_low": 0.9,
+            "bin_high": 1.0,
+            "count": 646,
+            "mean_confidence": 0.9484363284088879,
+            "empirical_frequency": 0.804953560371517
+          }
+        ]
+      },
+      "opponent_after": {
+        "ece_10_bin": 0.00532115781717058,
+        "component_predictions": 506256,
+        "bins": [
+          {
+            "bin_low": 0.0,
+            "bin_high": 0.1,
+            "count": 250905,
+            "mean_confidence": 0.01462827643033216,
+            "empirical_frequency": 0.01797493075068253
+          },
+          {
+            "bin_low": 0.1,
+            "bin_high": 0.2,
+            "count": 53700,
+            "mean_confidence": 0.15146645403746342,
+            "empirical_frequency": 0.16467411545623836
+          },
+          {
+            "bin_low": 0.2,
+            "bin_high": 0.30000000000000004,
+            "count": 74377,
+            "mean_confidence": 0.2538492529784953,
+            "empirical_frequency": 0.2573779528617718
+          },
+          {
+            "bin_low": 0.30000000000000004,
+            "bin_high": 0.4,
+            "count": 78333,
+            "mean_confidence": 0.343748900270221,
+            "empirical_frequency": 0.3441078472674352
+          },
+          {
+            "bin_low": 0.4,
+            "bin_high": 0.5,
+            "count": 27603,
+            "mean_confidence": 0.4418304430750908,
+            "empirical_frequency": 0.43241676629351883
+          },
+          {
+            "bin_low": 0.5,
+            "bin_high": 0.6000000000000001,
+            "count": 11400,
+            "mean_confidence": 0.5433309692353533,
+            "empirical_frequency": 0.5295614035087719
+          },
+          {
+            "bin_low": 0.6000000000000001,
+            "bin_high": 0.7000000000000001,
+            "count": 5295,
+            "mean_confidence": 0.6433934439680732,
+            "empirical_frequency": 0.626628895184136
+          },
+          {
+            "bin_low": 0.7000000000000001,
+            "bin_high": 0.8,
+            "count": 2497,
+            "mean_confidence": 0.743091173586389,
+            "empirical_frequency": 0.6960352422907489
+          },
+          {
+            "bin_low": 0.8,
+            "bin_high": 0.9,
+            "count": 1317,
+            "mean_confidence": 0.8468186099961932,
+            "empirical_frequency": 0.7410782080485953
+          },
+          {
+            "bin_low": 0.9,
+            "bin_high": 1.0,
+            "count": 829,
+            "mean_confidence": 0.9505512907076514,
+            "empirical_frequency": 0.8395657418576599
+          }
+        ]
+      }
+    },
+    "B": {
+      "partner_before": {
+        "ece_10_bin": 0.0124955456584289,
+        "component_predictions": 506880,
+        "bins": [
+          {
+            "bin_low": 0.0,
+            "bin_high": 0.1,
+            "count": 250503,
+            "mean_confidence": 0.015633274685804756,
+            "empirical_frequency": 0.025037624299908585
+          },
+          {
+            "bin_low": 0.1,
+            "bin_high": 0.2,
+            "count": 51918,
+            "mean_confidence": 0.1504795748913073,
+            "empirical_frequency": 0.16541469239955314
+          },
+          {
+            "bin_low": 0.2,
+            "bin_high": 0.30000000000000004,
+            "count": 73222,
+            "mean_confidence": 0.2549963793029345,
+            "empirical_frequency": 0.26609488951408045
+          },
+          {
+            "bin_low": 0.30000000000000004,
+            "bin_high": 0.4,
+            "count": 88489,
+            "mean_confidence": 0.34304435316608256,
+            "empirical_frequency": 0.33510379821220715
+          },
+          {
+            "bin_low": 0.4,
+            "bin_high": 0.5,
+            "count": 25554,
+            "mean_confidence": 0.4407020965222976,
+            "empirical_frequency": 0.41003365422243093
+          },
+          {
+            "bin_low": 0.5,
+            "bin_high": 0.6000000000000001,
+            "count": 9657,
+            "mean_confidence": 0.5438663073673349,
+            "empirical_frequency": 0.5011908460184322
+          },
+          {
+            "bin_low": 0.6000000000000001,
+            "bin_high": 0.7000000000000001,
+            "count": 4318,
+            "mean_confidence": 0.6431629593557867,
+            "empirical_frequency": 0.5856878184344604
+          },
+          {
+            "bin_low": 0.7000000000000001,
+            "bin_high": 0.8,
+            "count": 1845,
+            "mean_confidence": 0.743097546397832,
+            "empirical_frequency": 0.675880758807588
+          },
+          {
+            "bin_low": 0.8,
+            "bin_high": 0.9,
+            "count": 863,
+            "mean_confidence": 0.8444433833190768,
+            "empirical_frequency": 0.7752027809965237
+          },
+          {
+            "bin_low": 0.9,
+            "bin_high": 1.0,
+            "count": 511,
+            "mean_confidence": 0.9460870900032805,
+            "empirical_frequency": 0.8297455968688845
+          }
+        ]
+      },
+      "partner_after": {
+        "ece_10_bin": 0.00836907103050107,
+        "component_predictions": 506880,
+        "bins": [
+          {
+            "bin_low": 0.0,
+            "bin_high": 0.1,
+            "count": 254789,
+            "mean_confidence": 0.013982772723759126,
+            "empirical_frequency": 0.01912562944240136
+          },
+          {
+            "bin_low": 0.1,
+            "bin_high": 0.2,
+            "count": 48882,
+            "mean_confidence": 0.1502259927413308,
+            "empirical_frequency": 0.1597315985434311
+          },
+          {
+            "bin_low": 0.2,
+            "bin_high": 0.30000000000000004,
+            "count": 66772,
+            "mean_confidence": 0.25507056852269827,
+            "empirical_frequency": 0.25506200203678187
+          },
+          {
+            "bin_low": 0.30000000000000004,
+            "bin_high": 0.4,
+            "count": 81118,
+            "mean_confidence": 0.3437482951387457,
+            "empirical_frequency": 0.3315170492369141
+          },
+          {
+            "bin_low": 0.4,
+            "bin_high": 0.5,
+            "count": 29944,
+            "mean_confidence": 0.44221609916748,
+            "empirical_frequency": 0.42085225754742184
+          },
+          {
+            "bin_low": 0.5,
+            "bin_high": 0.6000000000000001,
+            "count": 13520,
+            "mean_confidence": 0.5442489981651306,
+            "empirical_frequency": 0.5214497041420119
+          },
+          {
+            "bin_low": 0.6000000000000001,
+            "bin_high": 0.7000000000000001,
+            "count": 6605,
+            "mean_confidence": 0.6440127681909773,
+            "empirical_frequency": 0.6096896290688872
+          },
+          {
+            "bin_low": 0.7000000000000001,
+            "bin_high": 0.8,
+            "count": 3092,
+            "mean_confidence": 0.7442921906863887,
+            "empirical_frequency": 0.7034282018111255
+          },
+          {
+            "bin_low": 0.8,
+            "bin_high": 0.9,
+            "count": 1407,
+            "mean_confidence": 0.8442536294248482,
+            "empirical_frequency": 0.783226723525231
+          },
+          {
+            "bin_low": 0.9,
+            "bin_high": 1.0,
+            "count": 751,
+            "mean_confidence": 0.9473850884228032,
+            "empirical_frequency": 0.8308921438082557
+          }
+        ]
+      },
+      "opponent_before": {
+        "ece_10_bin": 0.013392983684695874,
+        "component_predictions": 506880,
+        "bins": [
+          {
+            "bin_low": 0.0,
+            "bin_high": 0.1,
+            "count": 248664,
+            "mean_confidence": 0.016320694821537175,
+            "empirical_frequency": 0.024864877907537882
+          },
+          {
+            "bin_low": 0.1,
+            "bin_high": 0.2,
+            "count": 58030,
+            "mean_confidence": 0.15155854626254914,
+            "empirical_frequency": 0.1775633293124246
+          },
+          {
+            "bin_low": 0.2,
+            "bin_high": 0.30000000000000004,
+            "count": 79730,
+            "mean_confidence": 0.25353362486710235,
+            "empirical_frequency": 0.2742756804214223
+          },
+          {
+            "bin_low": 0.30000000000000004,
+            "bin_high": 0.4,
+            "count": 83816,
+            "mean_confidence": 0.3425122902019169,
+            "empirical_frequency": 0.3400424739906462
+          },
+          {
+            "bin_low": 0.4,
+            "bin_high": 0.5,
+            "count": 22724,
+            "mean_confidence": 0.4400582554510961,
+            "empirical_frequency": 0.41132723112128144
+          },
+          {
+            "bin_low": 0.5,
+            "bin_high": 0.6000000000000001,
+            "count": 7981,
+            "mean_confidence": 0.5429707555794175,
+            "empirical_frequency": 0.5120912166395188
+          },
+          {
+            "bin_low": 0.6000000000000001,
+            "bin_high": 0.7000000000000001,
+            "count": 3215,
+            "mean_confidence": 0.6419706205743282,
+            "empirical_frequency": 0.6006220839813374
+          },
+          {
+            "bin_low": 0.7000000000000001,
+            "bin_high": 0.8,
+            "count": 1351,
+            "mean_confidence": 0.7437457238013087,
+            "empirical_frequency": 0.6698741672834937
+          },
+          {
+            "bin_low": 0.8,
+            "bin_high": 0.9,
+            "count": 764,
+            "mean_confidence": 0.8480209858005584,
+            "empirical_frequency": 0.7342931937172775
+          },
+          {
+            "bin_low": 0.9,
+            "bin_high": 1.0,
+            "count": 605,
+            "mean_confidence": 0.945810931576185,
+            "empirical_frequency": 0.8214876033057851
+          }
+        ]
+      },
+      "opponent_after": {
+        "ece_10_bin": 0.005071867204392816,
+        "component_predictions": 506880,
+        "bins": [
+          {
+            "bin_low": 0.0,
+            "bin_high": 0.1,
+            "count": 250674,
+            "mean_confidence": 0.014730640230069742,
+            "empirical_frequency": 0.017552677980165472
+          },
+          {
+            "bin_low": 0.1,
+            "bin_high": 0.2,
+            "count": 53848,
+            "mean_confidence": 0.15175553605313544,
+            "empirical_frequency": 0.16338582677165353
+          },
+          {
+            "bin_low": 0.2,
+            "bin_high": 0.30000000000000004,
+            "count": 75513,
+            "mean_confidence": 0.25366807758161675,
+            "empirical_frequency": 0.2600479387655106
+          },
+          {
+            "bin_low": 0.30000000000000004,
+            "bin_high": 0.4,
+            "count": 78749,
+            "mean_confidence": 0.3435116641304891,
+            "empirical_frequency": 0.3435091239253832
+          },
+          {
+            "bin_low": 0.4,
+            "bin_high": 0.5,
+            "count": 27122,
+            "mean_confidence": 0.4415822186388543,
+            "empirical_frequency": 0.4300567804734164
+          },
+          {
+            "bin_low": 0.5,
+            "bin_high": 0.6000000000000001,
+            "count": 11501,
+            "mean_confidence": 0.5435898288023305,
+            "empirical_frequency": 0.5390835579514824
+          },
+          {
+            "bin_low": 0.6000000000000001,
+            "bin_high": 0.7000000000000001,
+            "count": 5099,
+            "mean_confidence": 0.6431912672732433,
+            "empirical_frequency": 0.6252206314963719
+          },
+          {
+            "bin_low": 0.7000000000000001,
+            "bin_high": 0.8,
+            "count": 2328,
+            "mean_confidence": 0.7438321913435697,
+            "empirical_frequency": 0.7014604810996563
+          },
+          {
+            "bin_low": 0.8,
+            "bin_high": 0.9,
+            "count": 1237,
+            "mean_confidence": 0.8460390916637769,
+            "empirical_frequency": 0.7502021018593371
+          },
+          {
+            "bin_low": 0.9,
+            "bin_high": 1.0,
+            "count": 809,
+            "mean_confidence": 0.9480131547000117,
+            "empirical_frequency": 0.8467243510506799
+          }
+        ]
+      }
+    }
+  }
+}

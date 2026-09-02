@@ -1,0 +1,119 @@
+{
+  "schema_version": "daps-sl-vs-sl-sl-direct-crossplay-v1",
+  "run": 43,
+  "checkpoint_round": 100,
+  "deals": 20000,
+  "seed": 1611583527,
+  "device": "cpu",
+  "sign_convention": "positive IMP means DAPS+SL beats SL+SL",
+  "artifacts": {
+    "daps": {
+      "path": "results\\seed43_44_round120_actor_timeline_v1\\actor_only\\seed43\\strict_c\\seed43_strict_c_round100_actor_only.pt",
+      "sha256": "f63e1d444c96bfe4914b670cbac79568eab0c03e7b575d1334e2fe19a2fb6623"
+    },
+    "sl": {
+      "path": "results\\sl_base.pt",
+      "sha256": "9abe781bf6e3ab8b546c99bc03aaaf0d0fa867c06fe278fd77a484f3e8329d2e"
+    }
+  },
+  "seat_assignments": {
+    "daps_first": {
+      "daps_first": true,
+      "self_check_all_zero": true,
+      "overall": {
+        "mean_imp": 0.32085,
+        "std_imp": 5.110020635285601,
+        "standard_error": 0.036133302432136374,
+        "ci_low": 0.2500287272330127,
+        "ci_high": 0.3916712727669873,
+        "wins": 4499,
+        "losses": 3721,
+        "ties": 11780
+      },
+      "competitive": {
+        "mean_imp": 0.3817775887731235,
+        "std_imp": 5.212915264859846,
+        "standard_error": 0.0537499640838818,
+        "ci_low": 0.2764276591687152,
+        "ci_high": 0.4871275183775318,
+        "wins": 2340,
+        "losses": 1965,
+        "ties": 5101
+      },
+      "non_competitive": {
+        "mean_imp": 0.09855289421157684,
+        "std_imp": 4.305897582150458,
+        "standard_error": 0.04809332918266732,
+        "ci_low": 0.004289969013548889,
+        "ci_high": 0.1928158194096048,
+        "wins": 1119,
+        "losses": 970,
+        "ties": 5927
+      },
+      "mixed": {
+        "mean_imp": 0.7897595034910784,
+        "std_imp": 6.739283870708023,
+        "standard_error": 0.1327309777242228,
+        "ci_low": 0.5296067871516017,
+        "ci_high": 1.049912219830555,
+        "wins": 1040,
+        "losses": 786,
+        "ties": 752
+      }
+    },
+    "daps_second": {
+      "daps_first": false,
+      "self_check_all_zero": true,
+      "overall": {
+        "mean_imp": 0.3456,
+        "std_imp": 5.179334118889778,
+        "standard_error": 0.03662342277497814,
+        "ci_low": 0.27381809136104285,
+        "ci_high": 0.4173819086389572,
+        "wins": 4608,
+        "losses": 3652,
+        "ties": 11740
+      },
+      "competitive": {
+        "mean_imp": 0.36029569316477394,
+        "std_imp": 5.348172517321539,
+        "standard_error": 0.055356867898679905,
+        "ci_low": 0.2517962320833613,
+        "ci_high": 0.46879515424618656,
+        "wins": 2409,
+        "losses": 1939,
+        "ties": 4986
+      },
+      "non_competitive": {
+        "mean_imp": 0.110924772400575,
+        "std_imp": 4.417735524490046,
+        "standard_error": 0.048351337525261,
+        "ci_low": 0.016156150851063436,
+        "ci_high": 0.20569339395008657,
+        "wins": 1197,
+        "losses": 1009,
+        "ties": 6142
+      },
+      "mixed": {
+        "mean_imp": 1.131578947368421,
+        "std_imp": 6.723302144222636,
+        "standard_error": 0.13964516805292643,
+        "ci_low": 0.8578744179846852,
+        "ci_high": 1.4052834767521567,
+        "wins": 1002,
+        "losses": 704,
+        "ties": 612
+      }
+    }
+  },
+  "primary_balanced": {
+    "mean_imp": 0.333225,
+    "std_imp": 3.824049524667974,
+    "standard_error": 0.02704011350485918,
+    "ci_low": 0.280226377530476,
+    "ci_high": 0.38622362246952396,
+    "wins": 6625,
+    "losses": 5390,
+    "ties": 7985
+  }
+}

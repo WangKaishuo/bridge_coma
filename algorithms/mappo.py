@@ -26,7 +26,7 @@ from algorithms.ppo import PPOConfig, RolloutBuffer
 class MAPPOConfig(PPOConfig):
     """See the formal README for the current behavior contract."""
     hidden_dim:         int   = 1024
-    obs_dim:            int   = OBS_DIM   # 480 (P104)
+    obs_dim:            int   = OBS_DIM
     actor_belief_conditioned: bool = False
     actor_belief_hidden_dim: Optional[int] = None
 

@@ -1,4 +1,4 @@
-"""Run the unrestricted complete-auction Bridge-COMA main experiment.
+"""Run the unrestricted complete-auction MARL Dual Audience main experiment.
 
 This entry point is deliberately separate from ``subgame_validation.py`` so a
 formal run cannot accidentally inherit the controlled 1H-1S distribution.

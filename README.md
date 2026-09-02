@@ -1,23 +1,30 @@
-# Bridge-COMA
+# MARL Dual Audience
 
-Bridge-COMA studies whether auxiliary information rewards can improve
-communication learning in competitive contract-bridge bidding. This public
-release contains the source code used by the thesis experiments, one compact
-results workbook, and twelve inference-only round-100 models distributed as
-GitHub Release assets.
+This repository provides code and pretrained models for multi-agent
+reinforcement learning in bridge bidding, studying how bids convey information
+to both teammates and opponents. It includes training and evaluation tools for
+comparing task-only rewards with teammate information gains and opponent
+information penalties.
+
+It accompanies the MSc dissertation *Auditing Dual-Audience Reward Shaping:
+Reward Semantics, Proxy Movement, and Task Performance in Multi-Agent
+Reinforcement Learning* (K. Wang, University of Bristol, 2026), which reports
+the results these artefacts come from and states what they do and do not
+establish. This README covers how to run the code; the dissertation covers what
+the numbers mean.
 
 ## What is included
 
 ```text
 algorithms/     PPO, MAPPO, and behavioral-cloning components
-dri/            receiver-information reward components used by the trainer
+data/           512-deal DDS sample and the two supervised checkpoints
 env/            bridge auction state and legal-action rules
 experiments/    training, evaluation, model export, and inspection entry points
-networks/       policy, value, belief, and Task-Q networks
+networks/       policy, value, belief, and archived Task-Q networks
 subgames/       complete-auction environment and self-play trainer
 utils/          scoring, DDS loading, features, statistics, and FSP utilities
-models/         model manifest and download instructions
-results/        bridge_coma_results.xlsx
+models/         twelve inference-only models and their manifest
+results/        workbook, formal matrices, and supplementary diagnostics
 ```
 
 Development tests, debugging scripts, server controllers, training logs,
@@ -25,12 +32,15 @@ optimizer states, and experiment chronology are intentionally excluded.
 
 ## Methods and historical labels
 
-| Public name | Historical label | Reward definition |
-|---|---|---|
-| Task-only | A | terminal duplicate-IMP task reward |
-| Team-BG | B | task reward plus teammate belief gain |
-| DUAL-local | Legacy-C | local teammate gain and opponent leakage penalty |
-| DAPS | Strict-C | actor-time potential-difference formulation |
+| Thesis name | Code/display alias | Historical label | Reward definition |
+|---|---|---|---|
+| TASK | Task-only | A | terminal duplicate-IMP task reward |
+| TEAM | Team-BG | B | task reward plus teammate belief gain |
+| DUAL | DUAL-local | Legacy-C | local teammate gain and opponent leakage penalty |
+| DAPS | DAPS | Strict-C | actor-time potential-difference formulation |
+
+We use **run** for a training replicate and **seed** for random-number
+initialisation. Historical filenames and raw JSON field names are unchanged.
 
 ## Installation
 
@@ -43,26 +53,13 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-OpenSpiel supplies the 571-dimensional bridge auction observation. The
-`endplay` package is needed only to generate new DDS data.
+OpenSpiel supplies the 571-dimensional bridge auction observation. The bundled
+sample does not require DDS generation; `endplay` is needed only when creating
+a new dataset.
 
-## Download and verify the models
+## Verify the models
 
-Download these three assets from the repository's Releases page:
-
-```text
-round100_models_seed42.zip
-round100_models_seed43.zip
-round100_models_seed44.zip
-```
-
-Extract them into the following directories:
-
-```text
-models/round100/seed42/
-models/round100/seed43/
-models/round100/seed44/
-```
+All twelve `.pt` files are stored directly in `models/`.
 
 Each file contains only four actor state dictionaries and the architecture
 metadata needed for inference. It does not contain a critic, optimizer,
@@ -73,12 +70,17 @@ Inspect one model without running an evaluation:
 
 ```bash
 python -m experiments.inspect_model \
-  models/round100/seed42/seed42_a_round100_actor_only.pt
+  models/seed42_a_round100_actor_only.pt
 ```
 
 ## Evaluation data
 
-Evaluation requires a DDS dataset in either of these formats:
+A 512-deal sample is included at `data/sample_dds/dds_0000.npz`. It is large
+enough to run the commands below immediately after installation. It is a smoke
+test for the complete loading and evaluation path, not a replacement for the
+20,000-deal published comparisons.
+
+Evaluation accepts a DDS dataset in either of these formats:
 
 - a compact `.npz` file containing `decks` with shape `(N, 52)` and `tricks`
   with shape `(N, 5, 4)`; or
@@ -86,8 +88,21 @@ Evaluation requires a DDS dataset in either of these formats:
 
 The `decks` array stores the owner of every suit-major card as an integer from
 0 to 3. The `tricks` array stores double-dummy tricks by strain and declarer.
-Datasets are not included because they can be regenerated and are substantially
-larger than the source release.
+The full archived training and evaluation splits are not included because they
+are substantially larger than this source release. A new DDS dataset can be
+generated with, for example:
+
+```bash
+python -m utils.dds_data \
+  --num_samples 10000 \
+  --batch_size 10000 \
+  --num_workers 8 \
+  --output_dir data/generated \
+  --seed_offset 0
+```
+
+Generation time depends strongly on CPU count. The command prints progress and
+the measured elapsed time when it finishes.
 
 ## Run a paired comparison
 
@@ -96,10 +111,10 @@ deals. The reported orientation is the second model minus the first model.
 
 ```bash
 python -m experiments.evaluate_resume_ab \
-  --agent-a models/round100/seed42/seed42_a_round100_actor_only.pt \
-  --agent-b models/round100/seed42/seed42_b_round100_actor_only.pt \
-  --data data/evaluation \
-  --deals 1000 \
+  --agent-a models/seed42_a_round100_actor_only.pt \
+  --agent-b models/seed42_b_round100_actor_only.pt \
+  --data data/sample_dds \
+  --deals 200 \
   --seed 2026072401 \
   --output local_evaluation.json \
   --cpu
@@ -112,12 +127,12 @@ small command completes successfully.
 
 ```bash
 python -m experiments.evaluate_joint_round_robin \
-  --agent Task-only=models/round100/seed42/seed42_a_round100_actor_only.pt \
-  --agent Team-BG=models/round100/seed42/seed42_b_round100_actor_only.pt \
-  --agent DUAL-local=models/round100/seed42/seed42_legacy_c_round100_actor_only.pt \
-  --agent DAPS=models/round100/seed42/seed42_strict_c_round100_actor_only.pt \
-  --data data/evaluation \
-  --deals 1000 \
+  --agent Task-only=models/seed42_a_round100_actor_only.pt \
+  --agent Team-BG=models/seed42_b_round100_actor_only.pt \
+  --agent DUAL-local=models/seed42_legacy_c_round100_actor_only.pt \
+  --agent DAPS=models/seed42_strict_c_round100_actor_only.pt \
+  --data data/sample_dds \
+  --deals 200 \
   --seed 2026072401 \
   --output-dir local_matrix \
   --cpu
@@ -126,31 +141,70 @@ python -m experiments.evaluate_joint_round_robin \
 Every comparison is evaluated on common sampled support. The output records the
 comparison orientation explicitly.
 
-## Read the published results
-
-Open `results/bridge_coma_results.xlsx`. It contains:
-
-- the reported three-seed round-100 comparisons;
-- formula-driven round-120 endpoint matrices and supervised-anchor results;
-- the underlying paired round-120 IMP vectors; and
-- the model file sizes and SHA-256 hashes.
-
-A confidence interval containing zero is inconclusive. It is not evidence that
-two policies are equivalent. Comparisons should normally use policies from the
-same training round and the same evaluation support.
 
 ## Training code
 
-`experiments.main_experiment` is the unrestricted complete-auction training
-entry point. A full training run additionally requires training/evaluation DDS
-data and supervised actor and belief bootstrap checkpoints. Those large
-bootstrap artifacts are not part of this compact thesis release. Run
+`experiments.main_experiment` trains on complete auctions. To run one small
+training round with the bundled DDS sample and supervised checkpoints:
 
 ```bash
-python -m experiments.main_experiment --help
+python -m experiments.main_experiment \
+  --data data/sample_dds \
+  --eval-data data/sample_dds \
+  --quick --rounds 1 --eval-deals 200 --beta 1 \
+  --output-dir local_training \
+  --cpu
 ```
 
-to inspect the complete configuration interface.
+This runs TASK (A), TEAM (B), and DUAL (C). For DAPS, add
+`--train-agents C --info-potential-shaping` and use a separate output directory.
+The full 10M/500k training and evaluation splits are not included. Use
+`python -m experiments.main_experiment --help` for all training options.
+
+## Supervised checkpoints
+
+Two supervised artefacts are included under `data/`, alongside the DDS sample,
+because both are inputs to training rather than outputs of it. Sizes and SHA-256
+hashes are in `data/MANIFEST.csv`:
+
+- `sl_base.pt` — the behavioural-cloning policy used to initialise every arm and
+  retained as the permanent member of each fictitious-self-play pool. It is also
+  the SL partner and opponent in the cross-play comparisons. Default for
+  `--sl-checkpoint`.
+- `sl_base_bca.pt` — the belief network, frozen throughout the formal experiment
+  and used as the judge that scores receiver predictions. Default for
+  `--belief-checkpoint`.
+
+Releasing the judge matters for checking the proxy results. The diagnostic
+records under `results/aligned_proxy_diagnostics/` retain aggregate estimates
+but not the 1,000 per-deal values behind them; with this checkpoint, the
+released actors and a DDS source, those belief-gain scores can be recomputed
+rather than taken on trust.
+
+## Results
+
+Open `results/results.xlsx`. It contains:
+
+- `Round100 Primary`: nine treatment-minus-TASK estimates;
+- `Round100 Pairwise`: all 18 direct within-run contrasts;
+- `Round120 Continuation`: 18 continuation contrasts;
+- `External Crossplay` and `Shared Partner Crossplay`: supplementary
+  interoperability comparisons, including the direct SL control;
+- `Semantic Drift`: 36 descriptive treatment-minus-TASK differences;
+- `Gradient Audit`: eight seat-specific measurements from the round-100 audit;
+- `Aligned Proxy Diagnostics`: 54 endpoint-aligned estimates and intervals;
+- `Evaluation Protocol`: the common formal task-evaluation contract; and
+- `Model Manifest`: model file sizes and SHA-256 hashes.
+
+The six formal matrices use the same 20,000 unique deals sampled without
+replacement, with evaluation seed `1611583527`. Their source summaries,
+sampled indices and compressed per-deal IMP vectors are included under
+`results/unified_joint_evaluation_v1/`. Positive values favour the first named
+policy in a workbook comparison. Confidence intervals use paired-deal standard
+errors and a normal 1.96 multiplier. They are conditional on the fixed policies
+being compared: they are not across-run intervals, and they are not
+multiplicity-adjusted. An interval containing zero is inconclusive, not
+evidence that two policies are equivalent.
 
 ## Reproducibility notes
 
@@ -159,6 +213,5 @@ to inspect the complete configuration interface.
 - The public action space has 38 outputs: Pass, Double, Redouble, and 35 ordered
   contract calls.
 - Model files use action mapping `openspiel_native_52_89_v1`.
-- Round-100 models cover seeds 42, 43, and 44 for all four methods.
+- Round-100 models cover runs 42, 43, and 44 for all four methods.
 - Published model files are inference artifacts, not resumable training files.
-

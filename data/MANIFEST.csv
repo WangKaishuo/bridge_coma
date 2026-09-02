@@ -1,0 +1,3 @@
+file_name,role,bytes,sha256
+sl_base.pt,supervised policy (SL anchor; --sl-checkpoint default),15098117,9ABE781BF6E3AB8B546C99BC03AAAF0D0FA867C06FE278FD77A484F3E8329D2E
+sl_base_bca.pt,frozen judge / belief network (--belief-checkpoint default),6874053,CC11C9A30301135A0FDA8B3C6746849714EE86E8E2E4F41D36D10915646F4D8E

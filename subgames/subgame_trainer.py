@@ -38,7 +38,6 @@ from utils.hand_features import (
 )
 from utils.fsp_pool import FSPPool
 from utils.imp import score_to_imp
-from dri.evidence_removal import remove_target_evidence
 from networks.task_q import (
     ALL_HANDS_ENCODER_SHARED_BRIDGE,
     OBSERVATION_ENCODER_STRUCTURED_AUCTION,
@@ -47,13 +46,14 @@ from networks.task_q import (
     normalize_dd_table_ctde,
     normalize_reference_score_ctde,
 )
-from experiments.dri_task_q_dataset import (
-    CTDE_SEAT_ORDER_ACTING_RELATIVE,
-    build_structured_action_features,
-    normalize_ctde_hands,
-)
 
-# P109: max entries for _encode_for_actor obs/state caches per trainer instance.
+# The archived receiver-help development path is outside this thesis release.
+remove_target_evidence = None
+CTDE_SEAT_ORDER_ACTING_RELATIVE = None
+build_structured_action_features = None
+normalize_ctde_hands = None
+
+# Maximum entries for the per-trainer actor observation and state caches.
 # A rollout batch of 512 deals x ~8 steps x 4 players approximately 16k unique (hands, hist) keys.
 # 32k gives comfortable headroom while staying well under 1 GB memory.
 _OBS_CACHE_MAX = 32_768
@@ -141,7 +141,7 @@ class SubgameConfig:
     fsp_add_interval: int   = 2
     self_play:        bool  = False
 
-    # -- P126: FSP Quality Gate + Weighted SL Sampling ----------------------
+    # -- FSP quality gate and weighted SL sampling --------------------------
     fsp_quality_gate:          bool  = True   # Enable quality gate before pool insertion
     fsp_gate_eval_deals:       int   = 200    # Deals to play vs SL for quality evaluation
     fsp_gate_max_auction_len:  int   = 7      # Reject if median auction length > this (SL median=6)
@@ -149,17 +149,13 @@ class SubgameConfig:
     fsp_sl_sample_prob:        float = 0.30   # Minimum probability of sampling SL permanent member
 
     # -- Belief Net Update ------------------------------------------------
-    # P93: on-policy update (epochs=8, lr=5e-5) - caused catastrophic
-    #   forgetting of pretrain foundation (val_loss 1.76->2.19 in Round 1).
-    # P96: freeze_belief=True by default. With strong KL (lambda=0.5),
-    #   policy stays near SAYC and pretrain Belief Net remains valid.
-    belief_update_epochs: int  = 3            # P95: only used if freeze_belief=False
-    belief_update_lr:     float = 1e-5        # P95: only used if freeze_belief=False
-    freeze_belief:        bool  = True        # P96: frozen by default
+    belief_update_epochs: int  = 3            # Used only if freeze_belief=False
+    belief_update_lr:     float = 1e-5        # Used only if freeze_belief=False
+    freeze_belief:        bool  = True
 
-    # -- EWC for Belief Net (P97) -------------------------------------
-    use_ewc:              bool  = False       # P97: EWC-protected on-policy update
-    ewc_lambda:           float = 100.0       # P97: EWC penalty strength (Fisher normalized, mean penalty)
+    # -- EWC for Belief Net -----------------------------------------------
+    use_ewc:              bool  = False       # Protect on-policy updates with EWC
+    ewc_lambda:           float = 100.0       # Fisher-normalized mean-penalty strength
     ewc_fisher_samples:   int   = 5000        # Samples for Fisher computation
 
     # -- Critic Warmup -------------------------------------------------------
@@ -180,11 +176,11 @@ class SubgameConfig:
     device:              str   = 'cpu'
     early_stop_patience:   int   = 8
     early_stop_vl_delta:   float = 0.15
-    early_stop_enabled:    bool  = False   # P123: disabled - fixed schedule for reproducibility
+    early_stop_enabled:    bool  = False   # Fixed schedule for reproducibility
 
 
 # ==============================================================================
-# Belief Replay Buffer (P84)
+# Belief replay buffer
 # ==============================================================================
 
 class FlatRolloutBuffer:
@@ -435,6 +431,11 @@ class SubgameTrainer:
         self.help_task_q_optimizer = None
         self.help_task_q_samples_seen = 0
         self.help_task_q_updates = 0
+        if config.use_help_bonus and remove_target_evidence is None:
+            raise RuntimeError(
+                "The archived receiver-help development path is not "
+                "included in the thesis release."
+            )
         if config.use_help_bonus and config.help_all_action_q:
             q_config = TaskQConfig(
                 hidden_dim=config.help_task_q_hidden_dim,
@@ -456,7 +457,7 @@ class SubgameTrainer:
         self.reward_stats: RunningStats = reward_stats or RunningStats()
 
         # -- FSP pool -------------------------------------------------------
-        # P126: fsp_pool_size=0 -> unlimited (use 999999 as practical max)
+        # A zero pool size means unlimited; use a large practical maximum.
         _pool_max = config.fsp_pool_size if config.fsp_pool_size > 0 else 999999
         self.fsp_pool = FSPPool(max_size=_pool_max)
 
@@ -600,7 +601,7 @@ class SubgameTrainer:
 
     def _maybe_add_to_fsp(self, round_idx: int):
         """
-        P126: Quality-gated FSP pool insertion.
+        Insert a snapshot into the FSP pool after a quality check.
 
         Every fsp_add_interval rounds, evaluate the current snapshot vs SL
         on a small number of deals. Only add to pool if:
@@ -640,7 +641,7 @@ class SubgameTrainer:
 
     def _fsp_quality_eval(self, sl_sd: dict, num_deals: int) -> tuple:
         """
-        P126: Quick evaluation of current agent vs SL to check for chaos bidding.
+        Quickly evaluate the current agent against SL for unstable bidding.
 
         Plays num_deals deals with current agent (NS) vs SL (sl_sd as EW opponent).
         Measures auction length and doubled contract frequency.
@@ -694,7 +695,7 @@ class SubgameTrainer:
 
     def _apply_fsp_opponent(self):
         """
-        P126: Weighted FSP sampling with SL minimum probability.
+        Sample FSP opponents while enforcing a minimum SL probability.
 
         With probability fsp_sl_sample_prob, always sample the SL permanent
         member. Otherwise, uniform random from the full pool (permanent + FIFO).
@@ -705,7 +706,7 @@ class SubgameTrainer:
             return None
 
         cfg = self.config
-        # P126: weighted sampling - SL permanent member gets guaranteed floor
+        # The permanent SL member receives a guaranteed probability floor.
         if (cfg.fsp_sl_sample_prob > 0
                 and self.fsp_pool._permanent
                 and np.random.rand() < cfg.fsp_sl_sample_prob):
@@ -777,7 +778,7 @@ class SubgameTrainer:
             buf.reset()
 
     # ======================================================================
-    # Dual-table IMP reward (P55)
+    # Dual-table IMP reward
     # ======================================================================
 
     @staticmethod
@@ -909,7 +910,7 @@ class SubgameTrainer:
             parameter.requires_grad_(False)
         print(f"[Belief Pretrain] Done. best_val_loss={best_val:.4f}")
 
-        # -- P97: Compute Fisher Information Matrix for EWC ------------
+        # -- Compute Fisher information matrix for EWC -----------------
         if self.config.use_ewc:
             print(f"[Belief Pretrain] Computing Fisher for EWC "
                   f"(lambda_ewc={self.config.ewc_lambda}, samples={self.config.ewc_fisher_samples})...")
@@ -917,7 +918,7 @@ class SubgameTrainer:
                 obs_all, tp_all, tgt_all,
                 num_samples=self.config.ewc_fisher_samples)
 
-        # -- P97b: Save pretrain data for replay mixing -------------
+        # -- Save pretraining data for replay mixing ------------------
         # Store a subsample of pretrain data to mix into on-policy updates.
         # This directly prevents catastrophic forgetting by keeping pretrain
         # loss in the training objective (data-level protection, not weight-level).
@@ -931,7 +932,7 @@ class SubgameTrainer:
         print(f"[Belief Pretrain] Saved {replay_n} pretrain samples for replay mixing.")
 
     # ======================================================================
-    # On-Policy Belief Update (P93)
+    # On-policy belief update
     # ======================================================================
 
     def update_belief_on_policy(self, episodes: List[List[dict]]) -> Optional[float]:
@@ -980,7 +981,7 @@ class SubgameTrainer:
                     tp[idx].to(self.device),
                     tgt[idx].to(self.device))
 
-                # -- Pretrain replay loss (P97b) --
+                # -- Pretraining replay loss --
                 loss_rp = torch.tensor(0.0, device=self.device)
                 if has_replay:
                     # Sample a batch of pretrain data (same size as on-policy batch)
@@ -996,7 +997,7 @@ class SubgameTrainer:
                         rp['tp'][rp_idx].to(self.device),
                         rp['tgt'][rp_idx].to(self.device))
 
-                # -- Combined loss: 80% on-policy + 20% replay (P97c) --
+                # -- Combined loss: 80% on-policy + 20% replay --
                 # On-policy dominant so belief tracks current policy,
                 # replay minority prevents catastrophic forgetting of pretrain.
                 loss = 0.8 * loss_op + 0.2 * loss_rp if has_replay else loss_op
@@ -1049,13 +1050,13 @@ class SubgameTrainer:
         train_side:       str,
         fsp_sd:           Optional[dict] = None,
         batch_size:       int = 32,
-        skip_dual_table:  bool = False,   # P55: skip swapped-table rollout (critic warmup)
-        use_belief_prior: bool = False,   # P98b: use prior features instead of belief net
+        skip_dual_table:  bool = False,   # Skip swapped-table rollout during critic warmup
+        use_belief_prior: bool = False,   # Use prior features instead of the belief net
     ) -> List[List[dict]]:
         """See the formal README for the current behavior contract."""
         from concurrent.futures import ThreadPoolExecutor
 
-        # P109: clear obs cache at start of each batch to bound memory usage
+        # Clear caches at the start of each batch to bound memory usage.
         self._obs_cache.clear()
         self._obs_state_cache.clear()
         self._prepare_fsp_cache(fsp_sd)
@@ -1072,7 +1073,7 @@ class SubgameTrainer:
         collected = 0
 
         def _reset(i):
-            # P122: randomize vulnerability for each new deal
+            # Randomize vulnerability for each new deal.
             _vul_choices = [(False, False), (True, False),
                             (False, True),  (True, True)]
             _vul = _vul_choices[np.random.randint(4)]
@@ -2646,8 +2647,6 @@ class SubgameTrainer:
             _ir_vals: list = []; _bl_vals: list = []
             ns_metrics: dict = {}; ew_metrics: dict = {}
 
-            # -- (P93: JIT burn-in removed - belief update moved to after PPO) --
-
             health_acc = self._new_auction_health_accumulator()
             belief_eps = []
 
@@ -2759,7 +2758,7 @@ class SubgameTrainer:
                 if m: ew_metrics[p] = m
             ew_timing['ppo'] = _time.time() - started
 
-            # -- Belief Update: frozen (P96) or on-policy (P93/P95) ---------
+            # -- Belief update: frozen or on-policy -------------------------
             _t = _time.time()
             belief_started = _time.time()
             if self.belief_net is not None and not self.config.freeze_belief:
@@ -2802,9 +2801,6 @@ class SubgameTrainer:
             }
             self.log.append(log_entry)
             self._print_log(log_entry)
-
-            # P110: Per-round H2H removed - too noisy (500-deal IMP stdapproximately9).
-            # All statistical evaluation is deferred to Stage 3 (5000 deals).
 
             should_stop = False
             if self.config.early_stop_enabled:
